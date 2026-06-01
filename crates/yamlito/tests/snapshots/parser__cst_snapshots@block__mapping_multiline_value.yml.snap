@@ -1,0 +1,24 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/block/mapping_multiline_value.yml
+---
+STREAM@0..50
+  DOCUMENT@0..49
+    BLOCK_MAPPING@0..49
+      BLOCK_MAPPING_ENTRY@0..36
+        SCALAR@0..11
+          PLAIN_SCALAR@0..11 "description"
+        COLON@11..12 ":"
+        WHITESPACE@12..13 " "
+        SCALAR@13..36
+          LITERAL_SCALAR@13..36 "|\n  line one\n  line two"
+      NEWLINE@36..37 "\n"
+      BLOCK_MAPPING_ENTRY@37..49
+        SCALAR@37..42
+          PLAIN_SCALAR@37..42 "title"
+        COLON@42..43 ":"
+        WHITESPACE@43..44 " "
+        SCALAR@44..49
+          PLAIN_SCALAR@44..49 "short"
+  NEWLINE@49..50 "\n"

@@ -1,0 +1,29 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/flow/sequence_multiline.yml
+---
+STREAM@0..29
+  DOCUMENT@0..28
+    FLOW_SEQUENCE@0..28
+      L_BRACKET@0..1 "["
+      NEWLINE@1..2 "\n"
+      WHITESPACE@2..4 "  "
+      FLOW_SEQUENCE_ENTRY@4..9
+        SCALAR@4..9
+          PLAIN_SCALAR@4..9 "alpha"
+      COMMA@9..10 ","
+      NEWLINE@10..11 "\n"
+      WHITESPACE@11..13 "  "
+      FLOW_SEQUENCE_ENTRY@13..17
+        SCALAR@13..17
+          PLAIN_SCALAR@13..17 "beta"
+      COMMA@17..18 ","
+      NEWLINE@18..19 "\n"
+      WHITESPACE@19..21 "  "
+      FLOW_SEQUENCE_ENTRY@21..27
+        SCALAR@21..26
+          PLAIN_SCALAR@21..26 "gamma"
+        NEWLINE@26..27 "\n"
+      R_BRACKET@27..28 "]"
+  NEWLINE@28..29 "\n"

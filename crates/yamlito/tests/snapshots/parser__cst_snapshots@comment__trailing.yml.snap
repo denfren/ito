@@ -1,0 +1,18 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/comment/trailing.yml
+---
+STREAM@0..30
+  DOCUMENT@0..29
+    BLOCK_MAPPING@0..29
+      BLOCK_MAPPING_ENTRY@0..29
+        SCALAR@0..3
+          PLAIN_SCALAR@0..3 "key"
+        COLON@3..4 ":"
+        WHITESPACE@4..5 " "
+        SCALAR@5..10
+          PLAIN_SCALAR@5..10 "value"
+        WHITESPACE@10..11 " "
+        COMMENT@11..29 "# trailing comment"
+  NEWLINE@29..30 "\n"

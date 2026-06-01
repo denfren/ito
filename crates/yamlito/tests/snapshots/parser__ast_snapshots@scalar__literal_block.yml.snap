@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/literal_block.yml
+---
+Stream
+  Document
+    Scalar [literal] "|\n  line one\n  line two\n"
+      decoded="line one\nline two\n" value=String("line one\nline two\n")

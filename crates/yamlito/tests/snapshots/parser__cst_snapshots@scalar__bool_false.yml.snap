@@ -1,0 +1,10 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/scalar/bool_false.yml
+---
+STREAM@0..6
+  DOCUMENT@0..5
+    SCALAR@0..5
+      PLAIN_SCALAR@0..5 "false"
+  NEWLINE@5..6 "\n"

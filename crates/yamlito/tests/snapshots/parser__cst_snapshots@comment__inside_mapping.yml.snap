@@ -1,0 +1,49 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/comment/inside_mapping.yml
+---
+STREAM@0..95
+  DOCUMENT@0..94
+    BLOCK_MAPPING@0..94
+      BLOCK_MAPPING_ENTRY@0..94
+        SCALAR@0..6
+          PLAIN_SCALAR@0..6 "server"
+        COLON@6..7 ":"
+        NEWLINE@7..8 "\n"
+        WHITESPACE@8..10 "  "
+        COMMENT@10..22 "# host group"
+        NEWLINE@22..23 "\n"
+        BLOCK_MAPPING@23..94
+          BLOCK_MAPPING_ENTRY@23..40
+            WHITESPACE@23..25 "  "
+            SCALAR@25..29
+              PLAIN_SCALAR@25..29 "host"
+            COLON@29..30 ":"
+            WHITESPACE@30..31 " "
+            SCALAR@31..40
+              PLAIN_SCALAR@31..40 "localhost"
+          NEWLINE@40..41 "\n"
+          BLOCK_MAPPING_ENTRY@41..68
+            WHITESPACE@41..43 "  "
+            SCALAR@43..47
+              PLAIN_SCALAR@43..47 "port"
+            COLON@47..48 ":"
+            WHITESPACE@48..49 " "
+            SCALAR@49..53
+              PLAIN_SCALAR@49..53 "8080"
+            WHITESPACE@53..54 " "
+            COMMENT@54..68 "# default port"
+          NEWLINE@68..69 "\n"
+          WHITESPACE@69..71 "  "
+          COMMENT@71..82 "# tls group"
+          NEWLINE@82..83 "\n"
+          BLOCK_MAPPING_ENTRY@83..94
+            WHITESPACE@83..85 "  "
+            SCALAR@85..88
+              PLAIN_SCALAR@85..88 "tls"
+            COLON@88..89 ":"
+            WHITESPACE@89..90 " "
+            SCALAR@90..94
+              PLAIN_SCALAR@90..94 "true"
+  NEWLINE@94..95 "\n"

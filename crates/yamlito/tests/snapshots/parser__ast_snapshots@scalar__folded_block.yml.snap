@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/folded_block.yml
+---
+Stream
+  Document
+    Scalar [folded] ">\n  folded\n  scalar\n"
+      decoded="folded scalar\n" value=String("folded scalar\n")

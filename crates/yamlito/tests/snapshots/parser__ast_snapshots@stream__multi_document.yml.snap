@@ -1,0 +1,33 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/stream/multi_document.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "first"
+            decoded="first" value=String("first")
+        Value
+          Scalar [plain] "document"
+            decoded="document" value=String("document")
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "second"
+            decoded="second" value=String("second")
+        Value
+          Scalar [plain] "document"
+            decoded="document" value=String("document")
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "third"
+            decoded="third" value=String("third")
+        Value
+          Scalar [plain] "document"
+            decoded="document" value=String("document")

@@ -1,0 +1,14 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/flow/sequence_simple.yml
+---
+Stream
+  Document
+    FlowSequence (3 entries)
+      Scalar [plain] "one"
+        decoded="one" value=String("one")
+      Scalar [plain] "two"
+        decoded="two" value=String("two")
+      Scalar [plain] "three"
+        decoded="three" value=String("three")

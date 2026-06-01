@@ -1,0 +1,29 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/flow/mapping_multiline.yml
+---
+Stream
+  Document
+    FlowMapping (3 entries)
+      Entry
+        Key
+          Scalar [plain] "host"
+            decoded="host" value=String("host")
+        Value
+          Scalar [plain] "localhost"
+            decoded="localhost" value=String("localhost")
+      Entry
+        Key
+          Scalar [plain] "port"
+            decoded="port" value=String("port")
+        Value
+          Scalar [plain] "8080"
+            decoded="8080" value=Int(8080)
+      Entry
+        Key
+          Scalar [plain] "tls"
+            decoded="tls" value=String("tls")
+        Value
+          Scalar [plain] "true"
+            decoded="true" value=Bool(true)

@@ -1,0 +1,33 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/block/mapping_deeply_nested.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "a"
+            decoded="a" value=String("a")
+        Value
+          BlockMapping (1 entries)
+            Entry
+              Key
+                Scalar [plain] "b"
+                  decoded="b" value=String("b")
+              Value
+                BlockMapping (1 entries)
+                  Entry
+                    Key
+                      Scalar [plain] "c"
+                        decoded="c" value=String("c")
+                    Value
+                      BlockMapping (1 entries)
+                        Entry
+                          Key
+                            Scalar [plain] "d"
+                              decoded="d" value=String("d")
+                          Value
+                            Scalar [plain] "leaf"
+                              decoded="leaf" value=String("leaf")

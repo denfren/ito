@@ -1,0 +1,24 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block/empty_sequence_entry.yml
+---
+STREAM@0..10
+  DOCUMENT@0..9
+    BLOCK_SEQUENCE@0..9
+      BLOCK_SEQUENCE_ENTRY@0..3
+        DASH@0..1 "-"
+        WHITESPACE@1..2 " "
+        SCALAR@2..3
+          PLAIN_SCALAR@2..3 "1"
+      NEWLINE@3..4 "\n"
+      BLOCK_SEQUENCE_ENTRY@4..5
+        DASH@4..5 "-"
+        NULL_SCALAR@5..5
+      NEWLINE@5..6 "\n"
+      BLOCK_SEQUENCE_ENTRY@6..9
+        DASH@6..7 "-"
+        WHITESPACE@7..8 " "
+        SCALAR@8..9
+          PLAIN_SCALAR@8..9 "3"
+  NEWLINE@9..10 "\n"

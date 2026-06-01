@@ -1,0 +1,24 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/flow/sequence_simple.yml
+---
+STREAM@0..18
+  DOCUMENT@0..17
+    FLOW_SEQUENCE@0..17
+      L_BRACKET@0..1 "["
+      FLOW_SEQUENCE_ENTRY@1..4
+        SCALAR@1..4
+          PLAIN_SCALAR@1..4 "one"
+      COMMA@4..5 ","
+      WHITESPACE@5..6 " "
+      FLOW_SEQUENCE_ENTRY@6..9
+        SCALAR@6..9
+          PLAIN_SCALAR@6..9 "two"
+      COMMA@9..10 ","
+      WHITESPACE@10..11 " "
+      FLOW_SEQUENCE_ENTRY@11..16
+        SCALAR@11..16
+          PLAIN_SCALAR@11..16 "three"
+      R_BRACKET@16..17 "]"
+  NEWLINE@17..18 "\n"

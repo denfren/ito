@@ -1,0 +1,18 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/stream/single_with_header.yml
+---
+STREAM@0..15
+  DOCUMENT@0..14
+    DIRECTIVES_END@0..3 "---"
+    NEWLINE@3..4 "\n"
+    BLOCK_MAPPING@4..14
+      BLOCK_MAPPING_ENTRY@4..14
+        SCALAR@4..7
+          PLAIN_SCALAR@4..7 "key"
+        COLON@7..8 ":"
+        WHITESPACE@8..9 " "
+        SCALAR@9..14
+          PLAIN_SCALAR@9..14 "value"
+  NEWLINE@14..15 "\n"

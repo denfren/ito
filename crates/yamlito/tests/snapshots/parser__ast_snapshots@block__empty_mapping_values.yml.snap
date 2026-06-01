@@ -1,0 +1,27 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block/empty_mapping_values.yml
+---
+Stream
+  Document
+    BlockMapping (3 entries)
+      Entry
+        Key
+          Scalar [plain] "a"
+            decoded="a" value=String("a")
+        Value
+          Null
+      Entry
+        Key
+          Scalar [plain] "b"
+            decoded="b" value=String("b")
+        Value
+          Scalar [plain] "1"
+            decoded="1" value=Int(1)
+      Entry
+        Key
+          Scalar [plain] "c"
+            decoded="c" value=String("c")
+        Value
+          Null

@@ -1,0 +1,36 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/flow/mapping_with_sequence_value.yml
+---
+STREAM@0..29
+  DOCUMENT@0..28
+    FLOW_MAPPING@0..28
+      L_BRACE@0..1 "{"
+      FLOW_MAPPING_ENTRY@1..17
+        SCALAR@1..5
+          PLAIN_SCALAR@1..5 "tags"
+        COLON@5..6 ":"
+        WHITESPACE@6..7 " "
+        FLOW_SEQUENCE@7..17
+          L_BRACKET@7..8 "["
+          FLOW_SEQUENCE_ENTRY@8..11
+            SCALAR@8..11
+              PLAIN_SCALAR@8..11 "web"
+          COMMA@11..12 ","
+          WHITESPACE@12..13 " "
+          FLOW_SEQUENCE_ENTRY@13..16
+            SCALAR@13..16
+              PLAIN_SCALAR@13..16 "api"
+          R_BRACKET@16..17 "]"
+      COMMA@17..18 ","
+      WHITESPACE@18..19 " "
+      FLOW_MAPPING_ENTRY@19..27
+        SCALAR@19..24
+          PLAIN_SCALAR@19..24 "count"
+        COLON@24..25 ":"
+        WHITESPACE@25..26 " "
+        SCALAR@26..27
+          PLAIN_SCALAR@26..27 "2"
+      R_BRACE@27..28 "}"
+  NEWLINE@28..29 "\n"

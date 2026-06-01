@@ -1,0 +1,42 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/block/sequence_nested.yml
+---
+STREAM@0..24
+  DOCUMENT@0..23
+    BLOCK_SEQUENCE@0..23
+      BLOCK_SEQUENCE_ENTRY@0..11
+        DASH@0..1 "-"
+        WHITESPACE@1..2 " "
+        BLOCK_SEQUENCE@2..11
+          BLOCK_SEQUENCE_ENTRY@2..5
+            DASH@2..3 "-"
+            WHITESPACE@3..4 " "
+            SCALAR@4..5
+              PLAIN_SCALAR@4..5 "a"
+          NEWLINE@5..6 "\n"
+          BLOCK_SEQUENCE_ENTRY@6..11
+            WHITESPACE@6..8 "  "
+            DASH@8..9 "-"
+            WHITESPACE@9..10 " "
+            SCALAR@10..11
+              PLAIN_SCALAR@10..11 "b"
+      NEWLINE@11..12 "\n"
+      BLOCK_SEQUENCE_ENTRY@12..23
+        DASH@12..13 "-"
+        WHITESPACE@13..14 " "
+        BLOCK_SEQUENCE@14..23
+          BLOCK_SEQUENCE_ENTRY@14..17
+            DASH@14..15 "-"
+            WHITESPACE@15..16 " "
+            SCALAR@16..17
+              PLAIN_SCALAR@16..17 "c"
+          NEWLINE@17..18 "\n"
+          BLOCK_SEQUENCE_ENTRY@18..23
+            WHITESPACE@18..20 "  "
+            DASH@20..21 "-"
+            WHITESPACE@21..22 " "
+            SCALAR@22..23
+              PLAIN_SCALAR@22..23 "d"
+  NEWLINE@23..24 "\n"

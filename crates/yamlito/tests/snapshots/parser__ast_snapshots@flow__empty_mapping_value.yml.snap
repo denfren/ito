@@ -1,0 +1,21 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/flow/empty_mapping_value.yml
+---
+Stream
+  Document
+    FlowMapping (2 entries)
+      Entry
+        Key
+          Scalar [plain] "a"
+            decoded="a" value=String("a")
+        Value
+          Null
+      Entry
+        Key
+          Scalar [plain] "b"
+            decoded="b" value=String("b")
+        Value
+          Scalar [plain] "2"
+            decoded="2" value=Int(2)

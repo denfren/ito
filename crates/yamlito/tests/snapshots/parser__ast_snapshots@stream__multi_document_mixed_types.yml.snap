@@ -1,0 +1,24 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/stream/multi_document_mixed_types.yml
+---
+Stream
+  Document
+    BlockSequence (2 entries)
+      Scalar [plain] "one"
+        decoded="one" value=String("one")
+      Scalar [plain] "two"
+        decoded="two" value=String("two")
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "key"
+            decoded="key" value=String("key")
+        Value
+          Scalar [plain] "value"
+            decoded="value" value=String("value")
+  Document
+    Scalar [plain] "scalar only"
+      decoded="scalar only" value=String("scalar only")

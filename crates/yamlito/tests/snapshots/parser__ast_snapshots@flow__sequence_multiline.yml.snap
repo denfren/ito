@@ -1,0 +1,14 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/flow/sequence_multiline.yml
+---
+Stream
+  Document
+    FlowSequence (3 entries)
+      Scalar [plain] "alpha"
+        decoded="alpha" value=String("alpha")
+      Scalar [plain] "beta"
+        decoded="beta" value=String("beta")
+      Scalar [plain] "gamma"
+        decoded="gamma" value=String("gamma")

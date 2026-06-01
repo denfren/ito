@@ -1,0 +1,6 @@
+items:
+  # before first
+  - one
+  # between
+  - two
+  - three # inline on last

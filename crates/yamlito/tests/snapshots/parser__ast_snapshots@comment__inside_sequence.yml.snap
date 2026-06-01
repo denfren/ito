@@ -1,0 +1,20 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/comment/inside_sequence.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "items"
+            decoded="items" value=String("items")
+        Value
+          BlockSequence (3 entries)
+            Scalar [plain] "one"
+              decoded="one" value=String("one")
+            Scalar [plain] "two"
+              decoded="two" value=String("two")
+            Scalar [plain] "three"
+              decoded="three" value=String("three")

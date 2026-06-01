@@ -1,0 +1,10 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/scalar/integer.yml
+---
+STREAM@0..3
+  DOCUMENT@0..2
+    SCALAR@0..2
+      PLAIN_SCALAR@0..2 "42"
+  NEWLINE@2..3 "\n"

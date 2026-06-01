@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/bool_true.yml
+---
+Stream
+  Document
+    Scalar [plain] "true"
+      decoded="true" value=Bool(true)

@@ -1,0 +1,26 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/flow/empty_mapping_value.yml
+---
+STREAM@0..12
+  DOCUMENT@0..11
+    FLOW_MAPPING@0..11
+      L_BRACE@0..1 "{"
+      FLOW_MAPPING_ENTRY@1..4
+        SCALAR@1..2
+          PLAIN_SCALAR@1..2 "a"
+        COLON@2..3 ":"
+        WHITESPACE@3..4 " "
+        NULL_SCALAR@4..4
+      COMMA@4..5 ","
+      WHITESPACE@5..6 " "
+      FLOW_MAPPING_ENTRY@6..10
+        SCALAR@6..7
+          PLAIN_SCALAR@6..7 "b"
+        COLON@7..8 ":"
+        WHITESPACE@8..9 " "
+        SCALAR@9..10
+          PLAIN_SCALAR@9..10 "2"
+      R_BRACE@10..11 "}"
+  NEWLINE@11..12 "\n"

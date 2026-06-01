@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/plain.yml
+---
+Stream
+  Document
+    Scalar [plain] "hello world"
+      decoded="hello world" value=String("hello world")

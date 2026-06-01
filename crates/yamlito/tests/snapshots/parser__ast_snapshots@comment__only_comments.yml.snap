@@ -1,0 +1,6 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/comment/only_comments.yml
+---
+Stream

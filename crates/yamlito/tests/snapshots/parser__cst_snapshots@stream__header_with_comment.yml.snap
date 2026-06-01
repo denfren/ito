@@ -1,0 +1,20 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/stream/header_with_comment.yml
+---
+STREAM@0..34
+  COMMENT@0..18 "# preamble comment"
+  NEWLINE@18..19 "\n"
+  DOCUMENT@19..33
+    DIRECTIVES_END@19..22 "---"
+    NEWLINE@22..23 "\n"
+    BLOCK_MAPPING@23..33
+      BLOCK_MAPPING_ENTRY@23..33
+        SCALAR@23..26
+          PLAIN_SCALAR@23..26 "key"
+        COLON@26..27 ":"
+        WHITESPACE@27..28 " "
+        SCALAR@28..33
+          PLAIN_SCALAR@28..33 "value"
+  NEWLINE@33..34 "\n"

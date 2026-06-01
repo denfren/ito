@@ -1,0 +1,34 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/stream/multi_document_with_comments.yml
+---
+STREAM@0..43
+  COMMENT@0..11 "# first doc"
+  NEWLINE@11..12 "\n"
+  DOCUMENT@12..34
+    DIRECTIVES_END@12..15 "---"
+    NEWLINE@15..16 "\n"
+    BLOCK_MAPPING@16..34
+      BLOCK_MAPPING_ENTRY@16..20
+        SCALAR@16..17
+          PLAIN_SCALAR@16..17 "a"
+        COLON@17..18 ":"
+        WHITESPACE@18..19 " "
+        SCALAR@19..20
+          PLAIN_SCALAR@19..20 "1"
+      NEWLINE@20..21 "\n"
+      COMMENT@21..33 "# second doc"
+      NEWLINE@33..34 "\n"
+  DOCUMENT@34..42
+    DIRECTIVES_END@34..37 "---"
+    NEWLINE@37..38 "\n"
+    BLOCK_MAPPING@38..42
+      BLOCK_MAPPING_ENTRY@38..42
+        SCALAR@38..39
+          PLAIN_SCALAR@38..39 "b"
+        COLON@39..40 ":"
+        WHITESPACE@40..41 " "
+        SCALAR@41..42
+          PLAIN_SCALAR@41..42 "2"
+  NEWLINE@42..43 "\n"

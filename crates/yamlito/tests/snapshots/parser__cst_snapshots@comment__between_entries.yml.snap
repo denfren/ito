@@ -1,0 +1,26 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/comment/between_entries.yml
+---
+STREAM@0..37
+  DOCUMENT@0..36
+    BLOCK_MAPPING@0..36
+      BLOCK_MAPPING_ENTRY@0..8
+        SCALAR@0..5
+          PLAIN_SCALAR@0..5 "first"
+        COLON@5..6 ":"
+        WHITESPACE@6..7 " "
+        SCALAR@7..8
+          PLAIN_SCALAR@7..8 "1"
+      NEWLINE@8..9 "\n"
+      COMMENT@9..26 "# between entries"
+      NEWLINE@26..27 "\n"
+      BLOCK_MAPPING_ENTRY@27..36
+        SCALAR@27..33
+          PLAIN_SCALAR@27..33 "second"
+        COLON@33..34 ":"
+        WHITESPACE@34..35 " "
+        SCALAR@35..36
+          PLAIN_SCALAR@35..36 "2"
+  NEWLINE@36..37 "\n"

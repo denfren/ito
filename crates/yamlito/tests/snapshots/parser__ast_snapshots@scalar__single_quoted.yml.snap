@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/single_quoted.yml
+---
+Stream
+  Document
+    Scalar [single] "'it''s a single-quoted scalar'"
+      decoded="it's a single-quoted scalar" value=String("it's a single-quoted scalar")

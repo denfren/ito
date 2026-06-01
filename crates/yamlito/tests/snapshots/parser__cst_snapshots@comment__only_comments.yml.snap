@@ -1,0 +1,10 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/comment/only_comments.yml
+---
+STREAM@0..46
+  COMMENT@0..28 "# this file is only comments"
+  NEWLINE@28..29 "\n"
+  COMMENT@29..45 "# no actual data"
+  NEWLINE@45..46 "\n"

@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/integer.yml
+---
+Stream
+  Document
+    Scalar [plain] "42"
+      decoded="42" value=Int(42)

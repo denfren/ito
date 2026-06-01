@@ -1,0 +1,21 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/flow/mapping_nested.yml
+---
+Stream
+  Document
+    FlowMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "outer"
+            decoded="outer" value=String("outer")
+        Value
+          FlowMapping (1 entries)
+            Entry
+              Key
+                Scalar [plain] "inner"
+                  decoded="inner" value=String("inner")
+              Value
+                Scalar [plain] "value"
+                  decoded="value" value=String("value")

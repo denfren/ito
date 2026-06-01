@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/scalar/folded_block.yml
+---
+STREAM@0..20
+  DOCUMENT@0..20
+    SCALAR@0..20
+      FOLDED_SCALAR@0..20 ">\n  folded\n  scalar\n"

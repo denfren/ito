@@ -1,0 +1,37 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/block/mapping_deeply_nested.yml
+---
+STREAM@0..29
+  DOCUMENT@0..28
+    BLOCK_MAPPING@0..28
+      BLOCK_MAPPING_ENTRY@0..28
+        SCALAR@0..1
+          PLAIN_SCALAR@0..1 "a"
+        COLON@1..2 ":"
+        NEWLINE@2..3 "\n"
+        BLOCK_MAPPING@3..28
+          BLOCK_MAPPING_ENTRY@3..28
+            WHITESPACE@3..5 "  "
+            SCALAR@5..6
+              PLAIN_SCALAR@5..6 "b"
+            COLON@6..7 ":"
+            NEWLINE@7..8 "\n"
+            BLOCK_MAPPING@8..28
+              BLOCK_MAPPING_ENTRY@8..28
+                WHITESPACE@8..12 "    "
+                SCALAR@12..13
+                  PLAIN_SCALAR@12..13 "c"
+                COLON@13..14 ":"
+                NEWLINE@14..15 "\n"
+                BLOCK_MAPPING@15..28
+                  BLOCK_MAPPING_ENTRY@15..28
+                    WHITESPACE@15..21 "      "
+                    SCALAR@21..22
+                      PLAIN_SCALAR@21..22 "d"
+                    COLON@22..23 ":"
+                    WHITESPACE@23..24 " "
+                    SCALAR@24..28
+                      PLAIN_SCALAR@24..28 "leaf"
+  NEWLINE@28..29 "\n"

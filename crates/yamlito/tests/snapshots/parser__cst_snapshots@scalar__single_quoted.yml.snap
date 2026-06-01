@@ -1,0 +1,10 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/scalar/single_quoted.yml
+---
+STREAM@0..31
+  DOCUMENT@0..30
+    SCALAR@0..30
+      SINGLE_QUOTED_SCALAR@0..30 "'it''s a single-quoted scalar'"
+  NEWLINE@30..31 "\n"

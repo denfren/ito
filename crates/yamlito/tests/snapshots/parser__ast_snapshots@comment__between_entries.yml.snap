@@ -1,0 +1,22 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/comment/between_entries.yml
+---
+Stream
+  Document
+    BlockMapping (2 entries)
+      Entry
+        Key
+          Scalar [plain] "first"
+            decoded="first" value=String("first")
+        Value
+          Scalar [plain] "1"
+            decoded="1" value=Int(1)
+      Entry
+        Key
+          Scalar [plain] "second"
+            decoded="second" value=String("second")
+        Value
+          Scalar [plain] "2"
+            decoded="2" value=Int(2)

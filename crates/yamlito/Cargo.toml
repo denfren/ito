@@ -1,0 +1,22 @@
+[package]
+name = "yamlito"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/denfren/ito"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+annotate-snippets.workspace = true
+globset.workspace = true
+num_enum.workspace = true
+rhai.workspace = true
+rowan.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+pretty_assertions.workspace = true
+serde_json.workspace = true

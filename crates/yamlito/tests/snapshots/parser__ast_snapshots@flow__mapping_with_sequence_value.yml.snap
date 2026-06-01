@@ -1,0 +1,25 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/flow/mapping_with_sequence_value.yml
+---
+Stream
+  Document
+    FlowMapping (2 entries)
+      Entry
+        Key
+          Scalar [plain] "tags"
+            decoded="tags" value=String("tags")
+        Value
+          FlowSequence (2 entries)
+            Scalar [plain] "web"
+              decoded="web" value=String("web")
+            Scalar [plain] "api"
+              decoded="api" value=String("api")
+      Entry
+        Key
+          Scalar [plain] "count"
+            decoded="count" value=String("count")
+        Value
+          Scalar [plain] "2"
+            decoded="2" value=Int(2)

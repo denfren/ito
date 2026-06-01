@@ -1,0 +1,86 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/block/mixed_nested.yml
+---
+STREAM@0..113
+  DOCUMENT@0..112
+    BLOCK_MAPPING@0..112
+      BLOCK_MAPPING_ENTRY@0..112
+        SCALAR@0..6
+          PLAIN_SCALAR@0..6 "config"
+        COLON@6..7 ":"
+        NEWLINE@7..8 "\n"
+        BLOCK_MAPPING@8..112
+          BLOCK_MAPPING_ENTRY@8..84
+            WHITESPACE@8..10 "  "
+            SCALAR@10..17
+              PLAIN_SCALAR@10..17 "servers"
+            COLON@17..18 ":"
+            NEWLINE@18..19 "\n"
+            BLOCK_SEQUENCE@19..84
+              BLOCK_SEQUENCE_ENTRY@19..51
+                WHITESPACE@19..23 "    "
+                DASH@23..24 "-"
+                WHITESPACE@24..25 " "
+                BLOCK_MAPPING@25..51
+                  BLOCK_MAPPING_ENTRY@25..36
+                    SCALAR@25..29
+                      PLAIN_SCALAR@25..29 "host"
+                    COLON@29..30 ":"
+                    WHITESPACE@30..31 " "
+                    SCALAR@31..36
+                      PLAIN_SCALAR@31..36 "alpha"
+                  NEWLINE@36..37 "\n"
+                  BLOCK_MAPPING_ENTRY@37..51
+                    WHITESPACE@37..43 "      "
+                    SCALAR@43..47
+                      PLAIN_SCALAR@43..47 "port"
+                    COLON@47..48 ":"
+                    WHITESPACE@48..49 " "
+                    SCALAR@49..51
+                      PLAIN_SCALAR@49..51 "80"
+              NEWLINE@51..52 "\n"
+              BLOCK_SEQUENCE_ENTRY@52..84
+                WHITESPACE@52..56 "    "
+                DASH@56..57 "-"
+                WHITESPACE@57..58 " "
+                BLOCK_MAPPING@58..84
+                  BLOCK_MAPPING_ENTRY@58..68
+                    SCALAR@58..62
+                      PLAIN_SCALAR@58..62 "host"
+                    COLON@62..63 ":"
+                    WHITESPACE@63..64 " "
+                    SCALAR@64..68
+                      PLAIN_SCALAR@64..68 "beta"
+                  NEWLINE@68..69 "\n"
+                  BLOCK_MAPPING_ENTRY@69..84
+                    WHITESPACE@69..75 "      "
+                    SCALAR@75..79
+                      PLAIN_SCALAR@75..79 "port"
+                    COLON@79..80 ":"
+                    WHITESPACE@80..81 " "
+                    SCALAR@81..84
+                      PLAIN_SCALAR@81..84 "443"
+          NEWLINE@84..85 "\n"
+          BLOCK_MAPPING_ENTRY@85..112
+            WHITESPACE@85..87 "  "
+            SCALAR@87..91
+              PLAIN_SCALAR@87..91 "tags"
+            COLON@91..92 ":"
+            NEWLINE@92..93 "\n"
+            BLOCK_SEQUENCE@93..112
+              BLOCK_SEQUENCE_ENTRY@93..102
+                WHITESPACE@93..97 "    "
+                DASH@97..98 "-"
+                WHITESPACE@98..99 " "
+                SCALAR@99..102
+                  PLAIN_SCALAR@99..102 "web"
+              NEWLINE@102..103 "\n"
+              BLOCK_SEQUENCE_ENTRY@103..112
+                WHITESPACE@103..107 "    "
+                DASH@107..108 "-"
+                WHITESPACE@108..109 " "
+                SCALAR@109..112
+                  PLAIN_SCALAR@109..112 "api"
+  NEWLINE@112..113 "\n"

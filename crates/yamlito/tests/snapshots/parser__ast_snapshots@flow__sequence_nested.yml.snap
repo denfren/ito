@@ -1,0 +1,18 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/flow/sequence_nested.yml
+---
+Stream
+  Document
+    FlowSequence (2 entries)
+      FlowSequence (2 entries)
+        Scalar [plain] "1"
+          decoded="1" value=Int(1)
+        Scalar [plain] "2"
+          decoded="2" value=Int(2)
+      FlowSequence (2 entries)
+        Scalar [plain] "3"
+          decoded="3" value=Int(3)
+        Scalar [plain] "4"
+          decoded="4" value=Int(4)

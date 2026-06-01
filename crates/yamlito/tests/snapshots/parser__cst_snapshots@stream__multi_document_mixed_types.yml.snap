@@ -1,0 +1,40 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/stream/multi_document_mixed_types.yml
+---
+STREAM@0..47
+  DOCUMENT@0..15
+    DIRECTIVES_END@0..3 "---"
+    NEWLINE@3..4 "\n"
+    BLOCK_SEQUENCE@4..15
+      BLOCK_SEQUENCE_ENTRY@4..9
+        DASH@4..5 "-"
+        WHITESPACE@5..6 " "
+        SCALAR@6..9
+          PLAIN_SCALAR@6..9 "one"
+      NEWLINE@9..10 "\n"
+      BLOCK_SEQUENCE_ENTRY@10..15
+        DASH@10..11 "-"
+        WHITESPACE@11..12 " "
+        SCALAR@12..15
+          PLAIN_SCALAR@12..15 "two"
+  NEWLINE@15..16 "\n"
+  DOCUMENT@16..31
+    DIRECTIVES_END@16..19 "---"
+    NEWLINE@19..20 "\n"
+    BLOCK_MAPPING@20..31
+      BLOCK_MAPPING_ENTRY@20..30
+        SCALAR@20..23
+          PLAIN_SCALAR@20..23 "key"
+        COLON@23..24 ":"
+        WHITESPACE@24..25 " "
+        SCALAR@25..30
+          PLAIN_SCALAR@25..30 "value"
+      NEWLINE@30..31 "\n"
+  DOCUMENT@31..46
+    DIRECTIVES_END@31..34 "---"
+    NEWLINE@34..35 "\n"
+    SCALAR@35..46
+      PLAIN_SCALAR@35..46 "scalar only"
+  NEWLINE@46..47 "\n"

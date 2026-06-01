@@ -1,0 +1,60 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/block/mixed_nested.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "config"
+            decoded="config" value=String("config")
+        Value
+          BlockMapping (2 entries)
+            Entry
+              Key
+                Scalar [plain] "servers"
+                  decoded="servers" value=String("servers")
+              Value
+                BlockSequence (2 entries)
+                  BlockMapping (2 entries)
+                    Entry
+                      Key
+                        Scalar [plain] "host"
+                          decoded="host" value=String("host")
+                      Value
+                        Scalar [plain] "alpha"
+                          decoded="alpha" value=String("alpha")
+                    Entry
+                      Key
+                        Scalar [plain] "port"
+                          decoded="port" value=String("port")
+                      Value
+                        Scalar [plain] "80"
+                          decoded="80" value=Int(80)
+                  BlockMapping (2 entries)
+                    Entry
+                      Key
+                        Scalar [plain] "host"
+                          decoded="host" value=String("host")
+                      Value
+                        Scalar [plain] "beta"
+                          decoded="beta" value=String("beta")
+                    Entry
+                      Key
+                        Scalar [plain] "port"
+                          decoded="port" value=String("port")
+                      Value
+                        Scalar [plain] "443"
+                          decoded="443" value=Int(443)
+            Entry
+              Key
+                Scalar [plain] "tags"
+                  decoded="tags" value=String("tags")
+              Value
+                BlockSequence (2 entries)
+                  Scalar [plain] "web"
+                    decoded="web" value=String("web")
+                  Scalar [plain] "api"
+                    decoded="api" value=String("api")

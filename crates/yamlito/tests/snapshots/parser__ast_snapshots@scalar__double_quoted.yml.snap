@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/double_quoted.yml
+---
+Stream
+  Document
+    Scalar [double] "\"line\\nbreak\\ttab\""
+      decoded="line\nbreak\ttab" value=String("line\nbreak\ttab")

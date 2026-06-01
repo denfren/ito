@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/scalar/float.yml
+---
+Stream
+  Document
+    Scalar [plain] "3.14"
+      decoded="3.14" value=Float(3.14)

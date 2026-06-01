@@ -1,0 +1,9 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/scalar/literal_block.yml
+---
+STREAM@0..24
+  DOCUMENT@0..24
+    SCALAR@0..24
+      LITERAL_SCALAR@0..24 "|\n  line one\n  line two\n"

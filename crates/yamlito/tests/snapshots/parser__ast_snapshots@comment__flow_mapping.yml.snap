@@ -1,0 +1,15 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/comment/flow_mapping.yml
+---
+Stream
+  Document
+    FlowMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "a"
+            decoded="a" value=String("a")
+        Value
+          Scalar [plain] "1"
+            decoded="1" value=Int(1)

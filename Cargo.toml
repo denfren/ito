@@ -1,0 +1,33 @@
+[workspace]
+members = ["ito", "crates/yamlito"]
+resolver = "3"
+
+[workspace.dependencies]
+annotate-snippets = "0.12.16"
+clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4.6"
+globset = "0.4"
+hcl-rs = "0.19"
+minijinja = { version = "2", features = ["custom_syntax", "loader"] }
+num_enum = "0.7"
+rhai = { version = "1.25.1", features = ["serde"] }
+rowan = "0.16"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wait-timeout = "0.2"
+similar = "3.1.1"
+termimad = "0.34.1"
+thiserror = "2"
+toml = "1.1.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+yamlito = { path = "crates/yamlito" }
+insta = { version = "1", features = ["glob"] }
+pretty_assertions = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+

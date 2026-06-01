@@ -1,0 +1,13 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block/empty_sequence_entry.yml
+---
+Stream
+  Document
+    BlockSequence (3 entries)
+      Scalar [plain] "1"
+        decoded="1" value=Int(1)
+      Null
+      Scalar [plain] "3"
+        decoded="3" value=Int(3)

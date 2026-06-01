@@ -1,0 +1,18 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/block/sequence_nested.yml
+---
+Stream
+  Document
+    BlockSequence (2 entries)
+      BlockSequence (2 entries)
+        Scalar [plain] "a"
+          decoded="a" value=String("a")
+        Scalar [plain] "b"
+          decoded="b" value=String("b")
+      BlockSequence (2 entries)
+        Scalar [plain] "c"
+          decoded="c" value=String("c")
+        Scalar [plain] "d"
+          decoded="d" value=String("d")

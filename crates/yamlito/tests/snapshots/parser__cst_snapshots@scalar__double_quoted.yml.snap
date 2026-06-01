@@ -1,0 +1,10 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::cst_string(&tree)"
+input_file: tests/yaml/scalar/double_quoted.yml
+---
+STREAM@0..19
+  DOCUMENT@0..18
+    SCALAR@0..18
+      DOUBLE_QUOTED_SCALAR@0..18 "\"line\\nbreak\\ttab\""
+  NEWLINE@18..19 "\n"

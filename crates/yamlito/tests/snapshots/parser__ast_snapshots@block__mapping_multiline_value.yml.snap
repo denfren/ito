@@ -1,0 +1,22 @@
+---
+source: tests/parser.rs
+expression: "ito::debug::ast_string(&tree)"
+input_file: tests/yaml/block/mapping_multiline_value.yml
+---
+Stream
+  Document
+    BlockMapping (2 entries)
+      Entry
+        Key
+          Scalar [plain] "description"
+            decoded="description" value=String("description")
+        Value
+          Scalar [literal] "|\n  line one\n  line two"
+            decoded="line one\nline two" value=String("line one\nline two")
+      Entry
+        Key
+          Scalar [plain] "title"
+            decoded="title" value=String("title")
+        Value
+          Scalar [plain] "short"
+            decoded="short" value=String("short")
