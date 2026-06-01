@@ -615,6 +615,7 @@ dependencies = [
  "globset",
  "hcl-rs",
  "minijinja",
+ "regex",
  "rhai",
  "semver",
  "serde_json",

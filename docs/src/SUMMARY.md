@@ -9,6 +9,7 @@ The rhai modules provided by `ito`.
 
 - [fs — virtual filesystem](modules/fs.md)
 - [path — path manipulation](modules/path.md)
+- [re — regular expressions](modules/re.md)
 - [json — JSON](modules/json.md)
 - [toml — TOML](modules/toml.md)
 - [yaml — YAML](modules/yaml.md)

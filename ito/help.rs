@@ -39,6 +39,12 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/modules/path.md"),
     },
     Topic {
+        name: "re",
+        title: "re — regular expressions",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/re.md"),
+    },
+    Topic {
         name: "json",
         title: "json — JSON",
         group: Group::Module,

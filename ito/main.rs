@@ -123,6 +123,7 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
     ito::scripting::vfs::register(&mut rhai, &vfs, run.unsafe_fs_flush, run.output.dry_run);
     ito::scripting::json::register(&mut rhai);
     ito::scripting::path::register(&mut rhai);
+    ito::scripting::re::register(&mut rhai);
     ito::scripting::toml::register(&mut rhai);
     ito::scripting::yaml::register(&mut rhai);
     ito::scripting::hcl::register(&mut rhai);

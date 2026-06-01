@@ -22,6 +22,7 @@ clap_complete.workspace = true
 globset.workspace = true
 hcl-rs.workspace = true
 minijinja.workspace = true
+regex.workspace = true
 rhai.workspace = true
 semver.workspace = true
 serde_json.workspace = true

@@ -10,6 +10,7 @@ globset = "0.4"
 hcl-rs = "0.19"
 minijinja = { version = "2", features = ["custom_syntax", "loader"] }
 num_enum = "0.7"
+regex = "1"
 rhai = { version = "1.25.1", features = ["serde"] }
 rowan = "0.16"
 semver = "1"

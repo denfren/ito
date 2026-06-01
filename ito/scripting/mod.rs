@@ -11,6 +11,7 @@ pub mod j2;
 pub mod json;
 pub mod path;
 pub mod pathmap;
+pub mod re;
 pub mod string;
 pub mod toml;
 pub mod version;
