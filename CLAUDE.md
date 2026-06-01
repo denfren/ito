@@ -15,11 +15,19 @@
   `feat`/`fix`/`docs` surface in the changelog.
 - The changelog lives at `CHANGELOG.md` (repo root, Keep a Changelog
   format) and is **generated** from commit history by
-  [`git-cliff`](https://git-cliff.org/) — do not hand-edit it. Config is
-  `cliff.toml`. Regenerate with `git cliff -o CHANGELOG.md`; on release
-  bump `ito/Cargo.toml` `version`, tag `vX.Y.Z`, then regenerate.
-  `ito/help.rs` `include_str!`s the result for the `ito help changelog`
-  topic, so the cliff template stays Keep-a-Changelog-shaped.
+  [`git-cliff`](https://git-cliff.org/) — do not hand-edit it. 
+
+### Release steps
+
+To cut a release `vX.Y.Z`, in order:
+
+1. `git cliff --tag vX.Y.Z -o CHANGELOG.md` — regenerate the changelog
+   as if the new version were already current (renders the unreleased
+   commits under the `vX.Y.Z` heading).
+2. Bump `version` in `ito/Cargo.toml` to `X.Y.Z`.
+3. `cargo build` — updates `Cargo.lock` with the new version.
+4. Commit (`chore(release): vX.Y.Z`) and tag `vX.Y.Z`.
+5. Ask before pushing the commit and tag.
 
 ### Documentation to update on surface changes
 
