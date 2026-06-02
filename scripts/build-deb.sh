@@ -46,5 +46,5 @@ for TARGET in "${TARGETS[@]}"; do
         aarch64-*) DEB_ARCH="arm64" ;;
         *)         DEB_ARCH="$TARGET" ;;
     esac
-    cp target/debian/ito_*_"$DEB_ARCH".deb target/distrib/ito-"$TARGET".deb
+    cp target/"$TARGET"/debian/ito_*_"$DEB_ARCH".deb target/distrib/ito-"$TARGET".deb
 done
