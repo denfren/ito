@@ -46,5 +46,9 @@ for TARGET in "${TARGETS[@]}"; do
         aarch64-*) DEB_ARCH="arm64" ;;
         *)         DEB_ARCH="$TARGET" ;;
     esac
+    echo "--- deb output for $TARGET ---"
+    find target/"$TARGET"/debian target/debian -name "*.deb" 2>/dev/null | xargs ls -lh 2>/dev/null || true
     cp target/"$TARGET"/debian/ito_*_"$DEB_ARCH".deb target/distrib/ito-"$TARGET".deb
+    echo "--- copied to distrib ---"
+    ls -lh target/distrib/ito-"$TARGET".deb
 done
