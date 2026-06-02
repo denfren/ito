@@ -2,6 +2,7 @@
 name = "ito"
 version = "0.1.2"
 edition = "2024"
+authors = ["Dennis Frenken", "Scopevisio Devops GmbH"]
 description = "A Rhai script runner with a small standard library for inspecting and generating config files"
 homepage = "https://github.com/denfren/ito"
 repository = "https://github.com/denfren/ito"
