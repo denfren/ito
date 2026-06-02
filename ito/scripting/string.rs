@@ -44,9 +44,9 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "join",
-        |arr: &mut Array, sep: ImmutableString| -> ImmutableString {
-            arr.iter()
-                .map(|v| v.clone().into_string().unwrap_or_default())
+        |arr: Array, sep: ImmutableString| -> ImmutableString {
+            arr.into_iter()
+                .map(|v| v.into_string().unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(sep.as_str())
                 .into()
