@@ -15,3 +15,7 @@ tap = "denfren/homebrew-tap"
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+
+[[dist.extra-artifacts]]
+build = ["./scripts/build-deb.sh"]
+artifacts = ["target/distrib/ito-x86_64-unknown-linux-gnu.deb", "target/distrib/ito-aarch64-unknown-linux-gnu.deb"]
