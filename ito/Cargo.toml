@@ -1,6 +1,6 @@
 [package]
 name = "ito"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A Rhai script runner with a small standard library for inspecting and generating config files"
 homepage = "https://github.com/denfren/ito"
