@@ -38,17 +38,6 @@ for TARGET in "${TARGETS[@]}"; do
     if [[ "$TARGET" == aarch64-* ]]; then
         EXTRA_FLAGS="--no-strip"
     fi
-    cargo deb --no-build --target "$TARGET" -p ito $EXTRA_FLAGS
-
-    # map Rust target triple to Debian arch name for unambiguous copy
-    case "$TARGET" in
-        x86_64-*)  DEB_ARCH="amd64" ;;
-        aarch64-*) DEB_ARCH="arm64" ;;
-        *)         DEB_ARCH="$TARGET" ;;
-    esac
-    echo "--- deb output for $TARGET ---"
-    find target/"$TARGET"/debian target/debian -name "*.deb" 2>/dev/null | xargs ls -lh 2>/dev/null || true
-    cp target/"$TARGET"/debian/ito_*_"$DEB_ARCH".deb target/distrib/ito-"$TARGET".deb
-    echo "--- copied to distrib ---"
-    ls -lh target/distrib/ito-"$TARGET".deb
+    cargo deb --no-build --target "$TARGET" -p ito $EXTRA_FLAGS \
+        --output "target/distrib/ito-${TARGET}.deb"
 done
