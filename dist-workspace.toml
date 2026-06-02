@@ -18,4 +18,4 @@ publish-jobs = ["homebrew"]
 
 [[dist.extra-artifacts]]
 build = ["./scripts/build-deb.sh"]
-artifacts = ["target/distrib/ito-x86_64-unknown-linux-gnu.deb", "target/distrib/ito-aarch64-unknown-linux-gnu.deb"]
+artifacts = ["target/deb/ito-x86_64-unknown-linux-gnu.deb", "target/deb/ito-aarch64-unknown-linux-gnu.deb"]

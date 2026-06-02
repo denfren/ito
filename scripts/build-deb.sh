@@ -38,6 +38,7 @@ for TARGET in "${TARGETS[@]}"; do
     if [[ "$TARGET" == aarch64-* ]]; then
         EXTRA_FLAGS="--no-strip"
     fi
+    mkdir -p target/deb
     cargo deb --no-build --target "$TARGET" -p ito $EXTRA_FLAGS \
-        --output "target/distrib/ito-${TARGET}.deb"
+        --output "target/deb/ito-${TARGET}.deb"
 done
