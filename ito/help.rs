@@ -27,6 +27,12 @@ pub struct Topic {
 
 pub static TOPICS: &[Topic] = &[
     Topic {
+        name: "string",
+        title: "string — string methods",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/string.md"),
+    },
+    Topic {
         name: "fs",
         title: "fs — virtual filesystem",
         group: Group::Module,

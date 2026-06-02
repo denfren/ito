@@ -7,6 +7,7 @@
 
 The rhai modules provided by `ito`.
 
+- [string — string methods](modules/string.md)
 - [fs — virtual filesystem](modules/fs.md)
 - [path — path manipulation](modules/path.md)
 - [re — regular expressions](modules/re.md)

@@ -5,10 +5,11 @@
 //! in most other languages). We override each — same param types win —
 //! so they still mutate in place *and* return the resulting string,
 //! enabling assignment and chaining. The covered methods are `trim`,
-//! `make_upper`, `make_lower`, `clear`, `truncate`, `crop`, `set`,
-//! `pad`, `remove`, and `replace` (each with all their overloads).
+//! `trim_start`, `trim_end`, `make_upper`, `make_lower`, `clear`,
+//! `truncate`, `crop`, `set`, `pad`, `remove`, and `replace` (each with
+//! all their overloads). `join` is added to arrays as a method.
 
-use rhai::{Engine, ImmutableString};
+use rhai::{Array, Engine, ImmutableString};
 
 pub fn register(engine: &mut Engine) {
     engine.register_fn("trim", |s: &mut ImmutableString| -> ImmutableString {
@@ -18,6 +19,39 @@ pub fn register(engine: &mut Engine) {
         }
         s.clone()
     });
+
+    engine.register_fn(
+        "trim_start",
+        |s: &mut ImmutableString| -> ImmutableString {
+            let trimmed = s.trim_start();
+            if trimmed != s.as_str() {
+                *s = trimmed.into();
+            }
+            s.clone()
+        },
+    );
+
+    engine.register_fn(
+        "trim_end",
+        |s: &mut ImmutableString| -> ImmutableString {
+            let trimmed = s.trim_end();
+            if trimmed != s.as_str() {
+                *s = trimmed.into();
+            }
+            s.clone()
+        },
+    );
+
+    engine.register_fn(
+        "join",
+        |arr: &mut Array, sep: ImmutableString| -> ImmutableString {
+            arr.iter()
+                .map(|v| v.clone().into_string().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(sep.as_str())
+                .into()
+        },
+    );
 
     engine.register_fn("make_upper", |s: &mut ImmutableString| -> ImmutableString {
         let upper = s.to_uppercase();
