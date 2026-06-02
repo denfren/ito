@@ -28,9 +28,21 @@ pub struct Topic {
 pub static TOPICS: &[Topic] = &[
     Topic {
         name: "string",
-        title: "string — string methods",
+        title: "string — strings",
         group: Group::Module,
         body: include_str!("../docs/src/modules/string.md"),
+    },
+    Topic {
+        name: "array",
+        title: "array — arrays",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/array.md"),
+    },
+    Topic {
+        name: "map",
+        title: "map — object maps",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/map.md"),
     },
     Topic {
         name: "fs",
@@ -93,6 +105,12 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/modules/ito.md"),
     },
     Topic {
+        name: "ito-vs-rhai",
+        title: "ito vs vanilla Rhai",
+        group: Group::Other,
+        body: include_str!("../docs/src/ito-vs-rhai.md"),
+    },
+    Topic {
         name: "args",
         title: "args — injected globals",
         group: Group::Other,
@@ -115,12 +133,6 @@ pub static TOPICS: &[Topic] = &[
         title: "Functions",
         group: Group::Language,
         body: include_str!("../docs/src/rhai/functions.md"),
-    },
-    Topic {
-        name: "strings-arrays-maps",
-        title: "Strings, arrays, maps",
-        group: Group::Language,
-        body: include_str!("../docs/src/rhai/strings-arrays-maps.md"),
     },
     Topic {
         name: "closures",

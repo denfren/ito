@@ -1,13 +1,16 @@
 # Summary
 
 - [Introduction](intro.md)
+- [ito vs vanilla Rhai](ito-vs-rhai.md)
 - [args — injected globals](args.md)
 
 # Modules
 
 The rhai modules provided by `ito`.
 
-- [string — string methods](modules/string.md)
+- [string — strings](modules/string.md)
+- [array — arrays](modules/array.md)
+- [map — object maps](modules/map.md)
 - [fs — virtual filesystem](modules/fs.md)
 - [path — path manipulation](modules/path.md)
 - [re — regular expressions](modules/re.md)
@@ -28,7 +31,6 @@ To get familiar with the language, try the [Playground](https://rhai.rs/playgrou
 - [Operators](rhai/operators.md)
 - [Control flow](rhai/control-flow.md)
 - [Functions](rhai/functions.md)
-- [Strings, arrays, maps](rhai/strings-arrays-maps.md)
 - [Closures](rhai/closures.md)
 - [Imports](rhai/imports.md)
 
