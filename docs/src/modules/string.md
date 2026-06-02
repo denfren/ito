@@ -1,9 +1,11 @@
 # `string` — strings
 
-Strings are Rhai built-ins. ito patches the mutating methods so they
-also **return the resulting string**, enabling assignment and chaining
-while still mutating in place. Methods marked *(ito)* are new or
-patched; the rest are standard Rhai.
+Strings are Rhai built-ins. ito adds `to_*` and `make_*` variants for
+common string transformations:
+
+- **`to_*`** — pure: returns a new string, never mutates the receiver.
+- **`make_*`** — mutates the string in place **and** returns the result
+  (useful for chaining).
 
 ## Literals and interpolation
 
@@ -13,7 +15,7 @@ let t = `hello ${s}`;     // backtick strings interpolate ${…}
 let u = `1 + 2 = ${1 + 2}`;
 ```
 
-## Common built-in methods
+## Built-in methods (standard Rhai)
 
 | Method | Effect |
 | --- | --- |
@@ -27,33 +29,68 @@ let u = `1 + 2 = ${1 + 2}`;
 | `s.index_of(sub)` | Index of first occurrence, or `-1`. |
 | `s.sub_string(start, len)` | Substring copy. |
 | `s.split(sep)` | Split on separator; returns array of strings. |
+| `s.replace(from, to)` | Return copy with all `<from>` replaced by `<to>`. |
 
-## ito-patched mutating methods
+## ito string methods
 
-These mutate `s` in place **and** return the result (Rhai's originals
-return unit).
+### Trim
 
 | Method | Effect |
 | --- | --- |
-| `s.trim()` | Strip leading and trailing whitespace. *(ito)* |
-| `s.trim_start()` | Strip leading whitespace only. *(ito)* |
-| `s.trim_end()` | Strip trailing whitespace only. *(ito)* |
-| `s.make_upper()` | Convert to uppercase in place. *(ito)* |
-| `s.make_lower()` | Convert to lowercase in place. *(ito)* |
-| `s.clear()` | Set to `""`. *(ito)* |
-| `s.truncate(len)` | Keep the first `<len>` characters. *(ito)* |
-| `s.crop(start)` | Keep from `<start>` to end (negative counts from end). *(ito)* |
-| `s.crop(start, len)` | Keep `<len>` characters from `<start>`. *(ito)* |
-| `s.set(index, ch)` | Replace character at `<index>` with `<ch>` (negative counts from end). *(ito)* |
-| `s.pad(len, fill)` | Right-pad to `<len>` characters using `<fill>` (char or string). *(ito)* |
-| `s.remove(sub)` | Remove all occurrences of `<sub>` (char or string). *(ito)* |
-| `s.replace(from, to)` | Replace all occurrences of `<from>` with `<to>` (char or string on both sides). *(ito)* |
+| `s.to_trimmed()` | Strip leading and trailing whitespace; return copy. *(ito)* |
+| `s.to_trimmed_start()` | Strip leading whitespace; return copy. *(ito)* |
+| `s.to_trimmed_end()` | Strip trailing whitespace; return copy. *(ito)* |
+| `s.make_trimmed()` | Strip leading and trailing whitespace in place; return `s`. *(ito)* |
+| `s.make_trimmed_start()` | Strip leading whitespace in place; return `s`. *(ito)* |
+| `s.make_trimmed_end()` | Strip trailing whitespace in place; return `s`. *(ito)* |
+
+### Case
+
+| Method | Effect |
+| --- | --- |
+| `s.make_upper()` | Convert to uppercase in place; return `s`. *(ito)* |
+| `s.make_lower()` | Convert to lowercase in place; return `s`. *(ito)* |
+
+### Modify
+
+| Method | Effect |
+| --- | --- |
+| `s.to_cleared()` | Return `""`. *(ito)* |
+| `s.make_cleared()` | Set `s` to `""`; return `s`. *(ito)* |
+| `s.to_truncated(len)` | Return copy keeping the first `<len>` characters. *(ito)* |
+| `s.make_truncated(len)` | Truncate in place; return `s`. *(ito)* |
+| `s.to_cropped(start)` | Return copy from `<start>` to end (negative counts from end). *(ito)* |
+| `s.to_cropped(start, len)` | Return copy of `<len>` characters from `<start>`. *(ito)* |
+| `s.make_cropped(start)` | Crop in place; return `s`. *(ito)* |
+| `s.make_cropped(start, len)` | Crop in place; return `s`. *(ito)* |
+| `s.to_set(index, ch)` | Return copy with character at `<index>` replaced by `<ch>` (negative counts from end). *(ito)* |
+| `s.make_set(index, ch)` | Replace character at `<index>` in place; return `s`. *(ito)* |
+| `s.to_padded(len, fill)` | Return copy right-padded to `<len>` characters using `<fill>` (char or string). *(ito)* |
+| `s.make_padded(len, fill)` | Pad in place; return `s`. *(ito)* |
+| `s.to_removed(sub)` | Return copy with all occurrences of `<sub>` (char or string) removed. *(ito)* |
+| `s.make_removed(sub)` | Remove all occurrences in place; return `s`. *(ito)* |
+| `s.to_replaced(from, to)` | Return copy with all `<from>` replaced by `<to>` (char or string on both sides). *(ito)* |
+| `s.make_replaced(from, to)` | Replace all occurrences in place; return `s`. *(ito)* |
+
+## Array method
+
+| Method | Effect |
+| --- | --- |
+| `arr.join(sep)` | Concatenate string elements separated by `<sep>`; return result. *(ito)* |
+
+## Examples
 
 ```rhai
-"  hello  ".trim()         // "hello"
-"  hello  ".trim_start()   // "hello  "
-"  hello  ".trim_end()     // "  hello"
+// pure — s is unchanged
+let t = "  hello  ".to_trimmed();     // "hello"
+let u = "hello world".to_removed('o'); // "hell wrld"
 
+// mutating — s is updated, chaining works
 let s = "  hello  ";
-let t = s.trim();          // s is mutated; t == "hello"
+s.make_trimmed();                       // s == "hello"
+
+let t = "hello".make_upper();          // t == "HELLO", "hello" variable is mutated
+
+// array join
+["a", "b", "c"].join(", ")             // "a, b, c"
 ```

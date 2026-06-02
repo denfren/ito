@@ -26,37 +26,32 @@ prefix:
 | [`proc`](modules/proc.md) | Process execution (`--unsafe-proc` required) |
 | [`ito`](modules/ito.md) | Runtime guards (`ito::assert`, …) |
 
-## Base-type patches
+## Base-type additions
 
-ito patches Rhai's built-in **string** and **array** types directly —
-no import needed, they work as plain method calls on any string or array
-value.
-
-### String — patched (return-value fix)
-
-Rhai's built-in string mutators return unit. ito overrides them so they
-**also return the resulting string**, enabling assignment and chaining:
-
-| Method | Change |
-| --- | --- |
-| `s.trim()` | Now returns `s` after mutating. |
-| `s.make_upper()` | Now returns `s` after mutating. |
-| `s.make_lower()` | Now returns `s` after mutating. |
-| `s.clear()` | Now returns `s` after mutating. |
-| `s.truncate(len)` | Now returns `s` after mutating. |
-| `s.crop(start)` | Now returns `s` after mutating. |
-| `s.crop(start, len)` | Now returns `s` after mutating. |
-| `s.set(index, ch)` | Now returns `s` after mutating. |
-| `s.pad(len, fill)` | Now returns `s` after mutating. |
-| `s.remove(sub)` | Now returns `s` after mutating. |
-| `s.replace(from, to)` | Now returns `s` after mutating. |
+ito adds methods to Rhai's built-in **string** and **array** types
+directly — no import needed, they work as plain method calls on any
+string or array value.
 
 ### String — added
 
-| Method | What it does |
-| --- | --- |
-| `s.trim_start()` | Strip leading whitespace; return result. |
-| `s.trim_end()` | Strip trailing whitespace; return result. |
+ito does not override Rhai's built-in string methods. Instead it adds
+explicit `to_*` (pure, returns a new string) and `make_*` (mutates in
+place, returns the result) variants for each operation. See
+[`string`](modules/string.md) for the full list.
+
+Summary:
+
+| Operation | Pure (`to_*`) | Mutating (`make_*`) |
+| --- | --- | --- |
+| Trim | `to_trimmed()`, `to_trimmed_start()`, `to_trimmed_end()` | `make_trimmed()`, … |
+| Case | — (Rhai has `to_upper`/`to_lower`) | `make_upper()`, `make_lower()` |
+| Clear | `to_cleared()` | `make_cleared()` |
+| Truncate | `to_truncated(len)` | `make_truncated(len)` |
+| Crop | `to_cropped(start[, len])` | `make_cropped(start[, len])` |
+| Set char | `to_set(idx, ch)` | `make_set(idx, ch)` |
+| Pad | `to_padded(len, fill)` | `make_padded(len, fill)` |
+| Remove | `to_removed(sub)` | `make_removed(sub)` |
+| Replace | `to_replaced(from, to)` | `make_replaced(from, to)` |
 
 ### Array — added
 
