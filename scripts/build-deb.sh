@@ -12,7 +12,7 @@ TARGETS=(
 )
 
 for TARGET in "${TARGETS[@]}"; do
-    TARBALL=$(ls "$DISTRIB"/ito-*-"$TARGET".tar.gz 2>/dev/null | head -1)
+    TARBALL=$(ls "$DISTRIB"/ito-*"$TARGET"*.tar.* 2>/dev/null | grep -v '\.sha256$' | head -1)
     if [[ -z "$TARBALL" ]]; then
         echo "No tarball found for $TARGET, skipping"
         continue
@@ -21,7 +21,7 @@ for TARGET in "${TARGETS[@]}"; do
     DEST="target/$TARGET/dist"
     mkdir -p "$DEST"
 
-    tar -xzf "$TARBALL" -C "$DEST" --strip-components=1
+    tar -xf "$TARBALL" -C "$DEST" --strip-components=1
 
     # cargo deb expects the binary at target/<target>/release/<bin>
     RELEASE_DIR="target/$TARGET/release"
@@ -30,6 +30,11 @@ for TARGET in "${TARGETS[@]}"; do
 
     cargo deb --no-build --target "$TARGET" -p ito
 
-    # copy to a fixed name so extra-artifacts paths are stable
-    cp target/"$TARGET"/debian/ito_*_*.deb target/distrib/ito-"$TARGET".deb
+    # map Rust target triple to Debian arch name for unambiguous copy
+    case "$TARGET" in
+        x86_64-*)  DEB_ARCH="amd64" ;;
+        aarch64-*) DEB_ARCH="arm64" ;;
+        *)         DEB_ARCH="$TARGET" ;;
+    esac
+    cp target/debian/ito_*_"$DEB_ARCH".deb target/distrib/ito-"$TARGET".deb
 done
