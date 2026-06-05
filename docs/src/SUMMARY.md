@@ -2,6 +2,7 @@
 
 - [Introduction](intro.md)
 - [ito vs vanilla Rhai](ito-vs-rhai.md)
+- [Method naming conventions](conventions.md)
 - [args — injected globals](args.md)
 
 # Modules

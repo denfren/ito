@@ -8,15 +8,16 @@
 //!   chainable setters, then `.template(template_text, data)` renders
 //!   with those options applied.
 //!
-//! Configurable options (all chainable, returning the same handle):
-//!   - `.undefined("lenient" | "chainable" | "strict")` — how undefined
-//!     variables behave (default `"lenient"`; `"strict"` raises an
-//!     error).
-//!   - `.trim_blocks(bool)`, `.lstrip_blocks(bool)`,
-//!     `.keep_trailing_newline(bool)` — whitespace control.
-//!   - `.syntax(block_start, block_end, var_start, var_end,
+//! Configurable options (all chainable: each `with_*` setter mutates the
+//! handle and returns it):
+//!   - `.with_undefined("lenient" | "chainable" | "strict")` — how
+//!     undefined variables behave (default `"lenient"`; `"strict"` raises
+//!     an error).
+//!   - `.with_trim_blocks(bool)`, `.with_lstrip_blocks(bool)`,
+//!     `.with_keep_trailing_newline(bool)` — whitespace control.
+//!   - `.with_syntax(block_start, block_end, var_start, var_end,
 //!     comment_start, comment_end)` — custom delimiters.
-//!   - `.include_root(path)` — enable `{% include %}`/`{% extends %}`,
+//!   - `.with_include_root(path)` — enable `{% include %}`/`{% extends %}`,
 //!     loading templates from the given VFS directory. Without this,
 //!     includes are disabled. Loading is restricted to the VFS root:
 //!     `..` escapes are rejected.
@@ -168,7 +169,8 @@ pub fn register(engine: &mut Engine, vfs: &Vfs) {
 
     engine.register_static_module("j2", module.into());
 
-    // Chainable setters (each returns the same handle).
+    // Chainable setters (each mutates and returns the same handle, so they
+    // take the `with_*` prefix).
     macro_rules! flag_setter {
         ($name:literal, $field:ident) => {
             engine.register_fn($name, |e: &mut J2Engine, yes: bool| {
@@ -177,13 +179,13 @@ pub fn register(engine: &mut Engine, vfs: &Vfs) {
             });
         };
     }
-    flag_setter!("trim_blocks", trim_blocks);
-    flag_setter!("lstrip_blocks", lstrip_blocks);
-    flag_setter!("keep_trailing_newline", keep_trailing_newline);
+    flag_setter!("with_trim_blocks", trim_blocks);
+    flag_setter!("with_lstrip_blocks", lstrip_blocks);
+    flag_setter!("with_keep_trailing_newline", keep_trailing_newline);
 
-    // .undefined("lenient" | "chainable" | "strict")
+    // .with_undefined("lenient" | "chainable" | "strict")
     engine.register_fn(
-        "undefined",
+        "with_undefined",
         |e: &mut J2Engine, mode: ImmutableString| -> Result<J2Engine, Box<EvalAltResult>> {
             let behavior = match mode.as_str() {
                 "lenient" => UndefinedBehavior::Lenient,
@@ -201,7 +203,7 @@ pub fn register(engine: &mut Engine, vfs: &Vfs) {
     );
 
     engine.register_fn(
-        "syntax",
+        "with_syntax",
         |e: &mut J2Engine,
          block_start: ImmutableString,
          block_end: ImmutableString,
@@ -219,7 +221,7 @@ pub fn register(engine: &mut Engine, vfs: &Vfs) {
     );
 
     engine.register_fn(
-        "include_root",
+        "with_include_root",
         |e: &mut J2Engine, path: ImmutableString| -> Result<J2Engine, Box<EvalAltResult>> {
             let real = e.vfs.resolve(&path)?;
             e.options.borrow_mut().include_root = Some(real);

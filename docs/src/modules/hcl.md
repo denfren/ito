@@ -14,18 +14,20 @@
 not necessarily round-trip.
 
 The builder is fluent. `HclBody` and `HclBlock` both expose chainable
-`.attribute(key, value)`, `.block(child)`, and `.with_comment(text)`;
-blocks additionally have `.label(text)`. `body.to_string()` renders the
-document.
+`.with_attribute(key, value)`, `.with_block(child)`, and
+`.with_comment(text)`; blocks additionally have `.with_label(text)`.
+These are `with_*` methods: each mutates the builder and returns it for
+chaining (see [Method naming conventions](../conventions.md)).
+`body.to_string()` renders the document.
 
 ```rhai
-let inner = hcl::block("tags").attribute("Env", "prod");
-let res   = hcl::block("resource").label("aws_instance").label("web")
-              .attribute("ami", "ami-123")
-              .block(inner);
+let inner = hcl::block("tags").with_attribute("Env", "prod");
+let res   = hcl::block("resource").with_label("aws_instance").with_label("web")
+              .with_attribute("ami", "ami-123")
+              .with_block(inner);
 let doc   = hcl::builder()
-              .attribute("region", "us-east-1")
-              .block(res);
+              .with_attribute("region", "us-east-1")
+              .with_block(res);
 fs::write("/main.tf", doc.to_string());
 ```
 
@@ -36,10 +38,10 @@ emit a bare keyword, traversal, or function call instead, wrap it with
 identifier):
 
 ```rhai
-let v = hcl::block("variable").label("infra_env")
-          .attribute("type", hcl::expr("string"))   // type = string
-          .attribute("default", "dev");              // default = "dev"
-fs::write("/variables.tf", hcl::builder().block(v).to_string());
+let v = hcl::block("variable").with_label("infra_env")
+          .with_attribute("type", hcl::expr("string"))   // type = string
+          .with_attribute("default", "dev");              // default = "dev"
+fs::write("/variables.tf", hcl::builder().with_block(v).to_string());
 ```
 
 `hcl::expr` parses arbitrary expressions (`var.region`, `max(1, 2)`,
@@ -62,10 +64,10 @@ Placement depends on builder state:
 - otherwise → comments the most-recently-added item.
 
 ```rhai
-let v = hcl::block("variable").label("aws_account_id")
-          .attribute("type", hcl::expr("string"));
+let v = hcl::block("variable").with_label("aws_account_id")
+          .with_attribute("type", hcl::expr("string"));
 let doc = hcl::builder()
-            .block(v)
+            .with_block(v)
             .with_comment("# tflint-ignore: terraform_unused_declarations");
 fs::write("/variables.tf", doc.to_string());
 ```
@@ -180,10 +182,10 @@ position:
 ```rhai
 let h = hcl::edit(fs::read("/main.tf"));
 // Append a new block to the document.
-h.add(hcl::block("output").label("id").attribute("value", hcl::expr("aws_instance.web.id")));
+h.add(hcl::block("output").with_label("id").with_attribute("value", hcl::expr("aws_instance.web.id")));
 // Replace an existing block wholesale.
 h.block("resource", "aws_instance", "web")
-  .write(hcl::block("resource").label("aws_instance").label("web").attribute("ami", "ami-456"));
+  .write(hcl::block("resource").with_label("aws_instance").with_label("web").with_attribute("ami", "ami-456"));
 fs::write("/main.tf", h.to_string());
 ```
 

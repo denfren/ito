@@ -7,6 +7,10 @@ common string transformations:
 - **`make_*`** — mutates the string in place **and** returns the result
   (useful for chaining).
 
+These follow ito's stdlib-wide prefix convention; the builder prefix
+`with_*` rounds out the family. See
+[Method naming conventions](../conventions.md) for the full picture.
+
 ## Literals and interpolation
 
 ```rhai

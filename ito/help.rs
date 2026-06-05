@@ -111,6 +111,12 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/ito-vs-rhai.md"),
     },
     Topic {
+        name: "conventions",
+        title: "conventions — method naming (to_*/make_*/with_*)",
+        group: Group::Other,
+        body: include_str!("../docs/src/conventions.md"),
+    },
+    Topic {
         name: "args",
         title: "args — injected globals",
         group: Group::Other,

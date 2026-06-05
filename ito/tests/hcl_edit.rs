@@ -257,7 +257,7 @@ fn add_attribute_to_block_is_indented() {
 fn add_block_to_document() {
     let out = eval_string(&format!(
         "{DOC}\n\
-         h.add(hcl::block(\"output\").label(\"id\").attribute(\"value\", \"x\"));\n\
+         h.add(hcl::block(\"output\").with_label(\"id\").with_attribute(\"value\", \"x\"));\n\
          h.to_string()"
     ));
     assert!(out.contains("output \"id\" {"), "got:\n{out}");
@@ -268,8 +268,8 @@ fn add_block_to_document() {
 fn add_nested_block_with_child_is_indented() {
     let out = eval_string(&format!(
         "{DOC}\n\
-         let inner = hcl::block(\"lifecycle\").attribute(\"create\", true);\n\
-         let b = hcl::block(\"ebs\").attribute(\"size\", 100).block(inner);\n\
+         let inner = hcl::block(\"lifecycle\").with_attribute(\"create\", true);\n\
+         let b = hcl::block(\"ebs\").with_attribute(\"size\", 100).with_block(inner);\n\
          h.block(\"resource\",\"aws_instance\",\"web\").add(b);\n\
          h.to_string()"
     ));
@@ -283,7 +283,7 @@ fn add_nested_block_with_child_is_indented() {
 fn write_replaces_block() {
     let out = eval_string(&format!(
         "{DOC}\n\
-         let r = hcl::block(\"resource\").label(\"aws_instance\").label(\"web\").attribute(\"ami\", \"new\");\n\
+         let r = hcl::block(\"resource\").with_label(\"aws_instance\").with_label(\"web\").with_attribute(\"ami\", \"new\");\n\
          h.block(\"resource\",\"aws_instance\",\"web\").write(r);\n\
          h.to_string()"
     ));

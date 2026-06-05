@@ -385,16 +385,17 @@ pub fn register(engine: &mut Engine) {
     engine.register_type_with_name::<ProcTask>("ProcTask");
     engine.register_type_with_name::<ProcRunner>("ProcRunner");
 
-    // --- ProcTask builder methods ---
+    // --- ProcTask builder methods (chainable: mutate and return the same
+    // handle, so they take the `with_*` prefix) ---
 
-    // .timeout(secs) -> ProcTask
-    engine.register_fn("timeout", |task: &mut ProcTask, secs: rhai::INT| {
+    // .with_timeout(secs) -> ProcTask
+    engine.register_fn("with_timeout", |task: &mut ProcTask, secs: rhai::INT| {
         task.timeout_secs = secs.max(0) as u64;
         task.clone()
     });
 
-    // .data(map) -> ProcTask
-    engine.register_fn("data", |task: &mut ProcTask, map: Map| {
+    // .with_data(map) -> ProcTask
+    engine.register_fn("with_data", |task: &mut ProcTask, map: Map| {
         task.data = map;
         task.clone()
     });
@@ -403,55 +404,56 @@ pub fn register(engine: &mut Engine) {
     // /dev/null) and absent from the result map. These opt in per stream,
     // choosing text (UTF-8 lossy string) or blob (raw bytes) decoding.
 
-    // .capture() -> ProcTask  (both streams as text)
-    engine.register_fn("capture", |task: &mut ProcTask| {
+    // .with_capture() -> ProcTask  (both streams as text)
+    engine.register_fn("with_capture", |task: &mut ProcTask| {
         task.capture_stdout = Capture::Text;
         task.capture_stderr = Capture::Text;
         task.clone()
     });
 
-    // .capture_stdout() -> ProcTask  (stdout as text)
-    engine.register_fn("capture_stdout", |task: &mut ProcTask| {
+    // .with_capture_stdout() -> ProcTask  (stdout as text)
+    engine.register_fn("with_capture_stdout", |task: &mut ProcTask| {
         task.capture_stdout = Capture::Text;
         task.clone()
     });
 
-    // .capture_stderr() -> ProcTask  (stderr as text)
-    engine.register_fn("capture_stderr", |task: &mut ProcTask| {
+    // .with_capture_stderr() -> ProcTask  (stderr as text)
+    engine.register_fn("with_capture_stderr", |task: &mut ProcTask| {
         task.capture_stderr = Capture::Text;
         task.clone()
     });
 
-    // .capture_blob() -> ProcTask  (both streams as raw bytes)
-    engine.register_fn("capture_blob", |task: &mut ProcTask| {
+    // .with_capture_blob() -> ProcTask  (both streams as raw bytes)
+    engine.register_fn("with_capture_blob", |task: &mut ProcTask| {
         task.capture_stdout = Capture::Blob;
         task.capture_stderr = Capture::Blob;
         task.clone()
     });
 
-    // .capture_stdout_blob() -> ProcTask  (stdout as raw bytes)
-    engine.register_fn("capture_stdout_blob", |task: &mut ProcTask| {
+    // .with_capture_stdout_blob() -> ProcTask  (stdout as raw bytes)
+    engine.register_fn("with_capture_stdout_blob", |task: &mut ProcTask| {
         task.capture_stdout = Capture::Blob;
         task.clone()
     });
 
-    // .capture_stderr_blob() -> ProcTask  (stderr as raw bytes)
-    engine.register_fn("capture_stderr_blob", |task: &mut ProcTask| {
+    // .with_capture_stderr_blob() -> ProcTask  (stderr as raw bytes)
+    engine.register_fn("with_capture_stderr_blob", |task: &mut ProcTask| {
         task.capture_stderr = Capture::Blob;
         task.clone()
     });
 
-    // --- ProcRunner builder methods ---
+    // --- ProcRunner builder methods (chainable: mutate and return the same
+    // handle, so they take the `with_*` prefix) ---
 
-    // .job(task) -> ProcRunner
-    engine.register_fn("job", |runner: &mut ProcRunner, task: ProcTask| {
+    // .with_job(task) -> ProcRunner
+    engine.register_fn("with_job", |runner: &mut ProcRunner, task: ProcTask| {
         runner.state.borrow_mut().jobs.push(task);
         runner.clone()
     });
 
-    // .job([tasks]) -> ProcRunner
+    // .with_job([tasks]) -> ProcRunner
     engine.register_fn(
-        "job",
+        "with_job",
         |runner: &mut ProcRunner, tasks: Array| -> RhaiResult<ProcRunner> {
             let mut state = runner.state.borrow_mut();
             for d in tasks {
@@ -465,32 +467,32 @@ pub fn register(engine: &mut Engine) {
         },
     );
 
-    // .concurrency(n) -> ProcRunner
-    engine.register_fn("concurrency", |runner: &mut ProcRunner, n: rhai::INT| {
+    // .with_concurrency(n) -> ProcRunner
+    engine.register_fn("with_concurrency", |runner: &mut ProcRunner, n: rhai::INT| {
         runner.state.borrow_mut().concurrency = n.max(1) as usize;
         runner.clone()
     });
 
-    // .on_result(|result| {}) -> ProcRunner
-    engine.register_fn("on_result", |runner: &mut ProcRunner, cb: FnPtr| {
+    // .with_on_result(|result| {}) -> ProcRunner
+    engine.register_fn("with_on_result", |runner: &mut ProcRunner, cb: FnPtr| {
         runner.state.borrow_mut().on_result = Some(cb);
         runner.clone()
     });
 
-    // .fail_fast() -> ProcRunner  (halt on first non-zero exit)
-    engine.register_fn("fail_fast", |runner: &mut ProcRunner| {
+    // .with_fail_fast() -> ProcRunner  (halt on first non-zero exit)
+    engine.register_fn("with_fail_fast", |runner: &mut ProcRunner| {
         runner.state.borrow_mut().fail_fast = FailFast::OnNonZero;
         runner.clone()
     });
 
-    // .fail_fast(|result| bool) -> ProcRunner  (halt when lambda returns false)
-    engine.register_fn("fail_fast", |runner: &mut ProcRunner, pred: FnPtr| {
+    // .with_fail_fast(|result| bool) -> ProcRunner  (halt when lambda returns false)
+    engine.register_fn("with_fail_fast", |runner: &mut ProcRunner, pred: FnPtr| {
         runner.state.borrow_mut().fail_fast = FailFast::Custom(pred);
         runner.clone()
     });
 
-    // .timeout(secs) -> ProcRunner  (batch-level timeout)
-    engine.register_fn("timeout", |runner: &mut ProcRunner, secs: rhai::INT| {
+    // .with_timeout(secs) -> ProcRunner  (batch-level timeout)
+    engine.register_fn("with_timeout", |runner: &mut ProcRunner, secs: rhai::INT| {
         runner.state.borrow_mut().batch_timeout_secs = secs.max(0) as u64;
         runner.clone()
     });

@@ -10,8 +10,9 @@
 //! Building:
 //! - `hcl::builder()` starts a body (the top-level document).
 //! - `hcl::block(ident)` starts a block.
-//! - Both expose chainable `.attribute(key, value)` and `.block(child)`;
-//!   blocks additionally have `.label(text)`.
+//! - Both expose chainable `.with_attribute(key, value)` and
+//!   `.with_block(child)`; blocks additionally have `.with_label(text)`.
+//!   These `with_*` methods mutate the builder and return it for chaining.
 //! - `body.to_string()` renders the document as HCL text.
 //!
 //! Builders carry shared (`Rc<RefCell<..>>`) state, so they behave like
@@ -357,9 +358,10 @@ pub fn register(engine: &mut Engine) {
 
     register_edit_methods(engine);
 
-    // Body methods (chainable: return the same handle).
+    // Body builder methods (chainable: mutate and return the same handle,
+    // so they take the `with_*` prefix).
     engine.register_fn(
-        "attribute",
+        "with_attribute",
         |body: &mut HclBody,
          key: ImmutableString,
          value: Dynamic|
@@ -369,7 +371,7 @@ pub fn register(engine: &mut Engine) {
         },
     );
     engine.register_fn(
-        "block",
+        "with_block",
         |body: &mut HclBody, block: HclBlock| -> Result<HclBody, Box<EvalAltResult>> {
             body.add_block(&block)?;
             Ok(body.clone())
@@ -387,13 +389,17 @@ pub fn register(engine: &mut Engine) {
         |body: &mut HclBody| -> Result<String, Box<EvalAltResult>> { body.render(0) },
     );
 
-    // Block methods (chainable: return the same handle).
-    engine.register_fn("label", |block: &mut HclBlock, label: ImmutableString| {
-        block.labels.borrow_mut().push(label.to_string());
-        block.clone()
-    });
+    // Block builder methods (chainable: mutate and return the same handle,
+    // so they take the `with_*` prefix).
     engine.register_fn(
-        "attribute",
+        "with_label",
+        |block: &mut HclBlock, label: ImmutableString| {
+            block.labels.borrow_mut().push(label.to_string());
+            block.clone()
+        },
+    );
+    engine.register_fn(
+        "with_attribute",
         |block: &mut HclBlock,
          key: ImmutableString,
          value: Dynamic|
@@ -403,7 +409,7 @@ pub fn register(engine: &mut Engine) {
         },
     );
     engine.register_fn(
-        "block",
+        "with_block",
         |block: &mut HclBlock, child: HclBlock| -> Result<HclBlock, Box<EvalAltResult>> {
             block.body.add_block(&child)?;
             Ok(block.clone())
