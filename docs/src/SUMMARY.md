@@ -25,15 +25,9 @@ The rhai modules provided by `ito`.
 
 # Rhai language
 
-Full documentation of the language can be found at [rhai.rs/book](https://rhai.rs/book/language/values-and-types.html) (_Scripting Language_ section)
-
-To get familiar with the language, try the [Playground](https://rhai.rs/playground/stable/). Note that the playground does not include `ito` provided modules.
-
 - [Operators](rhai/operators.md)
 - [Control flow](rhai/control-flow.md)
 - [Functions](rhai/functions.md)
 - [Closures](rhai/closures.md)
 - [Imports](rhai/imports.md)
-
----
 

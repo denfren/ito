@@ -1,5 +1,11 @@
 # Operators
 
+Full documentation of the language can be found at
+[rhai.rs/book](https://rhai.rs/book/language/values-and-types.html) (the
+_Scripting Language_ section). To get familiar with it, try the
+[Playground](https://rhai.rs/playground/stable/) — note the playground
+does not include `ito`'s provided modules.
+
 Rhai's operators cover the usual ground; the notes below are the ones
 that come up most in `ito` scripts.
 
