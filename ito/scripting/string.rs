@@ -62,10 +62,9 @@ pub fn register(engine: &mut Engine) {
 
     // --- trim_end ---
 
-    engine.register_fn(
-        "to_trimmed_end",
-        |s: ImmutableString| -> ImmutableString { s.trim_end().into() },
-    );
+    engine.register_fn("to_trimmed_end", |s: ImmutableString| -> ImmutableString {
+        s.trim_end().into()
+    });
 
     engine.register_fn(
         "make_trimmed_end",
@@ -98,10 +97,12 @@ pub fn register(engine: &mut Engine) {
         "".into()
     });
 
-    engine.register_fn("make_cleared", |s: &mut ImmutableString| -> ImmutableString {
-        *s = "".into();
-        s.clone()
-    });
+    engine.register_fn(
+        "make_cleared",
+        |s: &mut ImmutableString| {
+            *s = "".into();
+        },
+    );
 
     // --- truncate ---
 
@@ -144,9 +145,7 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_cropped",
-        |s: &mut ImmutableString, start: i64| -> ImmutableString {
-            crop_range(s, start, None)
-        },
+        |s: &mut ImmutableString, start: i64| crop_range(s, start, None),
     );
 
     engine.register_fn(
@@ -213,9 +212,7 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "to_removed",
-        |s: ImmutableString, ch: char| -> ImmutableString {
-            s.replace(&ch.to_string(), "").into()
-        },
+        |s: ImmutableString, ch: char| -> ImmutableString { s.replace(&ch.to_string(), "").into() },
     );
 
     engine.register_fn(
@@ -231,9 +228,7 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_removed",
-        |s: &mut ImmutableString, ch: char| -> ImmutableString {
-            remove_all(s, &ch.to_string())
-        },
+        |s: &mut ImmutableString, ch: char| remove_all(s, &ch.to_string()),
     );
 
     engine.register_fn(
