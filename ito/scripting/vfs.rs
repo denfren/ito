@@ -207,8 +207,17 @@ impl GlobFilter {
     }
 }
 
+/// A filesystem entry's basename is "hidden" if it starts with a dot
+/// (the Unix dotfile convention), e.g. `.git`, `.terraform`.
+fn is_hidden(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
 /// Walk `dir` recursively, collecting every regular file. Symlinks are
-/// skipped so containment under `root` survives.
+/// skipped so containment under `root` survives. Hidden files are
+/// skipped and hidden directories are not descended into (`fs::glob`
+/// never traverses hidden entries; use `fs::finder(..).hidden()` for
+/// that).
 fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -217,6 +226,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
+            continue;
+        }
+        if path.file_name().is_some_and(is_hidden) {
             continue;
         }
         if ft.is_dir() {
@@ -242,8 +254,10 @@ struct Entry {
 
 /// Walk `dir` recursively, recording both files and directories along
 /// with their depth (direct children of the walk root are depth 1).
-/// Symlinks are skipped so containment under `root` survives.
-fn walk_entries(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
+/// Symlinks are skipped so containment under `root` survives. When
+/// `include_hidden` is false, hidden entries are skipped and hidden
+/// directories are not descended into.
+fn walk_entries(root: &Path, dir: &Path, depth: usize, include_hidden: bool, out: &mut Vec<Entry>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -251,6 +265,9 @@ fn walk_entries(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
+            continue;
+        }
+        if !include_hidden && path.file_name().is_some_and(is_hidden) {
             continue;
         }
         let Ok(canonical) = path.canonicalize() else {
@@ -265,7 +282,7 @@ fn walk_entries(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
                 is_dir: true,
                 depth,
             });
-            walk_entries(root, &path, depth + 1, out);
+            walk_entries(root, &path, depth + 1, include_hidden, out);
         } else if ft.is_file() {
             out.push(Entry {
                 path: canonical,
@@ -306,6 +323,9 @@ impl DepthBound {
 struct FinderState {
     type_filter: TypeFilter,
     depth: DepthBound,
+    /// Include hidden entries (dotfiles and dot-directories). Off by
+    /// default, matching `fd`; flipped on by `.hidden()`.
+    include_hidden: bool,
     /// Positive glob filters (the seed plus any `.glob()`/`.name()`).
     globs: Vec<GlobFilter>,
     /// Negated glob filters (`.not_glob()`/`.not_name()`).
@@ -327,7 +347,7 @@ impl Finder {
         let state = self.state.borrow();
         let root = self.vfs.mapper.root();
         let mut entries: Vec<Entry> = Vec::new();
-        walk_entries(root, root, 1, &mut entries);
+        walk_entries(root, root, 1, state.include_hidden, &mut entries);
 
         let mut out: Vec<String> = Vec::new();
         for entry in &entries {
@@ -391,6 +411,13 @@ fn register_finder(engine: &mut Engine) {
     });
     engine.register_fn("dirs", |f: &mut Finder| {
         f.state.borrow_mut().type_filter = TypeFilter::Dir;
+        f.clone()
+    });
+
+    // .hidden(): include hidden entries (dotfiles and dot-directories),
+    // which are excluded by default.
+    engine.register_fn("hidden", |f: &mut Finder| {
+        f.state.borrow_mut().include_hidden = true;
         f.clone()
     });
 
@@ -477,7 +504,9 @@ pub fn register(engine: &mut Engine, vfs: &Vfs, allow_flush: bool, dry_run: bool
 
     // fs::glob(pattern) -> [String]
     // `pattern` is a script-visible absolute glob (e.g. "/**/*.txt").
-    // Matches regular files under the root. Sorted.
+    // Matches regular files under the root. Sorted. Hidden files and
+    // dot-directories are always excluded; use `fs::finder(..).hidden()`
+    // to include them.
     let v = vfs.clone();
     module.set_native_fn(
         "glob",
@@ -503,8 +532,9 @@ pub fn register(engine: &mut Engine, vfs: &Vfs, allow_flush: bool, dry_run: bool
     // Start an `fd`-like search. `glob` seeds the candidate set, scanned
     // from the VFS root: a leading `/` (or any `/`/`**`) matches the full
     // path, otherwise the bare name at any depth. Chain `.files()`,
-    // `.dirs()`, `.ext()`, `.glob()`/`.name()`, `.not_*()`, `.depth()` to
-    // narrow (all AND together), then `.find()` for a sorted array.
+    // `.dirs()`, `.ext()`, `.glob()`/`.name()`, `.not_*()`, `.depth()`,
+    // `.hidden()` to narrow (all AND together), then `.find()` for a
+    // sorted array. Hidden entries are excluded unless `.hidden()` is set.
     let v = vfs.clone();
     module.set_native_fn("finder", move |glob: ImmutableString| -> Result<Finder> {
         let seed = GlobFilter::new(&glob)?;

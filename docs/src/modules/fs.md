@@ -9,7 +9,7 @@ an error.
 | Function | Effect |
 | --- | --- |
 | `fs::list(dir)` | Sorted array of entries (files and dirs) directly under `dir`, as absolute paths. |
-| `fs::glob(pattern)` | Sorted array of regular files matching a glob, in one shot. Brace expansion and all [`globset`](https://docs.rs/globset) syntax supported. |
+| `fs::glob(pattern)` | Sorted array of regular files matching a glob, in one shot. Brace expansion and all [`globset`](https://docs.rs/globset) syntax supported. Hidden files and dot-directories are always excluded. |
 | `fs::finder(glob)` | Start an `fd`-like search (chainable, see below). |
 
 `fs::glob` is the one-shot form: give it a single full-path glob and get
@@ -22,6 +22,10 @@ fs::glob("/**/*.toml")            // every .toml file, anywhere
 fs::glob("/**/Cargo.toml")        // every Cargo.toml, anywhere
 fs::glob("/src/**/*.{rs,toml}")   // .rs or .toml under /src
 ```
+
+Hidden files (dotfiles) and dot-directories like `.git`/`.terraform`
+are always excluded, matching `fd`. `fs::glob` has no opt-in for them;
+to traverse hidden entries reach for `fs::finder(..).hidden()` (below).
 
 For anything beyond a single glob — combining several filters,
 restricting by depth, matching directories, or excluding a subtree —
@@ -50,14 +54,16 @@ auto-detected:
   e.g. `"*.rs"` finds every `*.rs` file under the root.
 
 Chain any of the filters below to narrow the result; **all filters must
-match** (logical AND). Hidden files are always included; symlinks are
-skipped. `.find()` runs the walk and returns a sorted array of
+match** (logical AND). Hidden files and dot-directories are **excluded
+by default** (like `fd`); call `.hidden()` to include them. Symlinks are
+always skipped. `.find()` runs the walk and returns a sorted array of
 script-visible paths.
 
 | Method | Effect |
 | --- | --- |
 | `.files()` | Keep only regular files. |
 | `.dirs()` | Keep only directories. |
+| `.hidden()` | Include hidden entries (dotfiles, dot-directories), which are excluded by default. |
 | `.ext(e)` | Keep entries whose name ends in `.e` (bare extension, no dot). |
 | `.glob(g)` | Additional glob filter (same basename/path auto-detection as the seed). |
 | `.name(n)` | Alias for `.glob(n)`; reads as "the file or directory name". |
@@ -78,15 +84,17 @@ fs::finder("/AWS/**/*.tf")
   .not_glob("/**/.terraform/**")
   .find()
 
-// *.rs sources, two or three levels deep, outside the .hidden tree
+// *.rs sources, two or three levels deep (dot-dirs skipped by default)
 fs::finder("*.rs")
   .files()
   .depth(2..=3)
-  .not_glob("/.hidden/**")
   .find()
 
 // directories named "node_modules" anywhere
 fs::finder("node_modules").dirs().find()
+
+// include dotfiles/dot-dirs: every .yml, .git tree and all
+fs::finder("*.yml").files().hidden().find()
 ```
 
 The seed can target the full path (leading `/`, or any `/`/`**`) or a
