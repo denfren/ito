@@ -120,7 +120,8 @@ fn remove_label_addressed_block() {
 fn remove_nth_block_with_same_labels() {
     // Two blocks share ident+labels; remove() at nth=1 drops only the
     // second, keeping the first.
-    let src = "let h = hcl::edit(`variable \"x\" {\n  v = 1\n}\n\nvariable \"x\" {\n  v = 2\n}\n`);\n";
+    let src =
+        "let h = hcl::edit(`variable \"x\" {\n  v = 1\n}\n\nvariable \"x\" {\n  v = 2\n}\n`);\n";
     let out = eval_string(&format!(
         "{src}\
          h.block(\"variable\",\"x\",1).remove();\n\
@@ -162,8 +163,7 @@ fn write_raw_expr_and_ident() {
 fn read_raw_handles_computed_expressions() {
     // A computed expression (`var.fallback`) cannot `.read()` as a value
     // but `.read_raw()` returns it verbatim and round-trips into `add`.
-    let src =
-        "let h = hcl::edit(`variable \"x\" {\n  type = list(string)\n  default = var.fallback\n}\n`);\n";
+    let src = "let h = hcl::edit(`variable \"x\" {\n  type = list(string)\n  default = var.fallback\n}\n`);\n";
 
     // try_read on a computed expr is ().
     let unit: Dynamic = eval(&format!(
@@ -225,9 +225,7 @@ fn label_globs() {
         "{DOC}\nh.block_count(\"resource\", [\"aws_instance\", \"*\"])"
     ));
     assert_eq!(star, 2);
-    let star_star: i64 = eval(&format!(
-        "{DOC}\nh.block_count(\"resource\", [\"**\"])"
-    ));
+    let star_star: i64 = eval(&format!("{DOC}\nh.block_count(\"resource\", [\"**\"])"));
     assert_eq!(star_star, 2);
     // First label exact, then anything: still both.
     let prefix: i64 = eval(&format!(
@@ -250,7 +248,10 @@ fn add_attribute_to_block_is_indented() {
          h.block(\"resource\",\"aws_instance\",\"db\").add(\"monitoring\", true);\n\
          h.to_string()"
     ));
-    assert!(out.contains("\n  monitoring = true"), "not indented:\n{out}");
+    assert!(
+        out.contains("\n  monitoring = true"),
+        "not indented:\n{out}"
+    );
 }
 
 #[test]
@@ -261,7 +262,10 @@ fn add_block_to_document() {
          h.to_string()"
     ));
     assert!(out.contains("output \"id\" {"), "got:\n{out}");
-    assert!(out.contains("\n  value = \"x\""), "inner not indented:\n{out}");
+    assert!(
+        out.contains("\n  value = \"x\""),
+        "inner not indented:\n{out}"
+    );
 }
 
 #[test]
@@ -273,10 +277,22 @@ fn add_nested_block_with_child_is_indented() {
          h.block(\"resource\",\"aws_instance\",\"web\").add(b);\n\
          h.to_string()"
     ));
-    assert!(out.contains("\n  ebs {"), "outer block not indented:\n{out}");
-    assert!(out.contains("\n    size = 100"), "attr not indented:\n{out}");
-    assert!(out.contains("\n    lifecycle {"), "child not indented:\n{out}");
-    assert!(out.contains("\n      create = true"), "grandchild not indented:\n{out}");
+    assert!(
+        out.contains("\n  ebs {"),
+        "outer block not indented:\n{out}"
+    );
+    assert!(
+        out.contains("\n    size = 100"),
+        "attr not indented:\n{out}"
+    );
+    assert!(
+        out.contains("\n    lifecycle {"),
+        "child not indented:\n{out}"
+    );
+    assert!(
+        out.contains("\n      create = true"),
+        "grandchild not indented:\n{out}"
+    );
 }
 
 #[test]
@@ -288,7 +304,10 @@ fn write_replaces_block() {
          h.to_string()"
     ));
     assert!(out.contains(r#"ami = "new""#), "got:\n{out}");
-    assert!(!out.contains("count = 2"), "old body should be gone:\n{out}");
+    assert!(
+        !out.contains("count = 2"),
+        "old body should be gone:\n{out}"
+    );
     // The sibling db block survives.
     assert!(out.contains(r#""db""#), "sibling lost:\n{out}");
 }

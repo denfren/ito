@@ -66,10 +66,12 @@ impl PathMapper {
     /// Build a mapper rooted at `root`, which must exist (it is
     /// canonicalized so containment checks are reliable).
     pub fn new(root: &Path) -> Result<Self> {
-        let canonical = root.canonicalize().map_err(|source| PathError::Canonicalize {
-            path: root.to_path_buf(),
-            source,
-        })?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|source| PathError::Canonicalize {
+                path: root.to_path_buf(),
+                source,
+            })?;
         if !canonical.is_dir() {
             return Err(PathError::NotADirectory(canonical));
         }

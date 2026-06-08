@@ -32,7 +32,8 @@ type Result<T> = std::result::Result<T, Box<EvalAltResult>>;
 
 /// Compile `pattern`, mapping a syntax error to a script runtime error.
 fn compile(pattern: &str) -> Result<Regex> {
-    Regex::new(pattern).map_err(|e| -> Box<EvalAltResult> { format!("re: invalid pattern: {e}").into() })
+    Regex::new(pattern)
+        .map_err(|e| -> Box<EvalAltResult> { format!("re: invalid pattern: {e}").into() })
 }
 
 /// Build a capture map for `caps`: `"0"` is the whole match, numbered
@@ -108,15 +109,27 @@ pub fn register(engine: &mut Engine) {
 
     module.set_native_fn(
         "replace",
-        |pattern: ImmutableString, text: ImmutableString, rep: ImmutableString| -> Result<ImmutableString> {
-            Ok(compile(&pattern)?.replace(&text, rep.as_str()).into_owned().into())
+        |pattern: ImmutableString,
+         text: ImmutableString,
+         rep: ImmutableString|
+         -> Result<ImmutableString> {
+            Ok(compile(&pattern)?
+                .replace(&text, rep.as_str())
+                .into_owned()
+                .into())
         },
     );
 
     module.set_native_fn(
         "replace_all",
-        |pattern: ImmutableString, text: ImmutableString, rep: ImmutableString| -> Result<ImmutableString> {
-            Ok(compile(&pattern)?.replace_all(&text, rep.as_str()).into_owned().into())
+        |pattern: ImmutableString,
+         text: ImmutableString,
+         rep: ImmutableString|
+         -> Result<ImmutableString> {
+            Ok(compile(&pattern)?
+                .replace_all(&text, rep.as_str())
+                .into_owned()
+                .into())
         },
     );
 
@@ -166,15 +179,20 @@ mod tests {
     #[test]
     fn find() {
         assert_eq!(eval_string(r#"re::find("\\d+", "a12b34")"#), "12");
-        assert!(engine()
-            .eval::<Dynamic>(r#"re::find("\\d+", "abc")"#)
-            .expect("eval")
-            .is_unit());
+        assert!(
+            engine()
+                .eval::<Dynamic>(r#"re::find("\\d+", "abc")"#)
+                .expect("eval")
+                .is_unit()
+        );
     }
 
     #[test]
     fn find_all() {
-        assert_eq!(eval_strings(r#"re::find_all("\\d+", "a12b34")"#), ["12", "34"]);
+        assert_eq!(
+            eval_strings(r#"re::find_all("\\d+", "a12b34")"#),
+            ["12", "34"]
+        );
         assert!(eval_strings(r#"re::find_all("\\d+", "abc")"#).is_empty());
     }
 
@@ -191,10 +209,12 @@ mod tests {
 
     #[test]
     fn captures_no_match_is_unit() {
-        assert!(engine()
-            .eval::<Dynamic>(r#"re::captures("\\d+", "abc")"#)
-            .expect("eval")
-            .is_unit());
+        assert!(
+            engine()
+                .eval::<Dynamic>(r#"re::captures("\\d+", "abc")"#)
+                .expect("eval")
+                .is_unit()
+        );
     }
 
     #[test]
@@ -208,7 +228,10 @@ mod tests {
     #[test]
     fn replace_first_and_all() {
         assert_eq!(eval_string(r#"re::replace("\\d", "a1b2", "X")"#), "aXb2");
-        assert_eq!(eval_string(r#"re::replace_all("\\d", "a1b2", "X")"#), "aXbX");
+        assert_eq!(
+            eval_string(r#"re::replace_all("\\d", "a1b2", "X")"#),
+            "aXbX"
+        );
     }
 
     #[test]
@@ -221,7 +244,10 @@ mod tests {
 
     #[test]
     fn split() {
-        assert_eq!(eval_strings(r#"re::split(",\\s*", "a, b,c")"#), ["a", "b", "c"]);
+        assert_eq!(
+            eval_strings(r#"re::split(",\\s*", "a, b,c")"#),
+            ["a", "b", "c"]
+        );
     }
 
     #[test]

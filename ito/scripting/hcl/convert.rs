@@ -65,7 +65,9 @@ pub fn rhai_to_hcl(value: Dynamic) -> Result<Expression, HclError> {
     // verbatim: bridge the lossy value-model `hcl::Expression` into the
     // edit CST `Expression` (lossless conversion provided by `hcl-rs`).
     if value.is::<super::HclExpr>() {
-        return Ok(Expression::from(value.cast::<super::HclExpr>().into_inner()));
+        return Ok(Expression::from(
+            value.cast::<super::HclExpr>().into_inner(),
+        ));
     }
     if value.is_unit() {
         return Ok(Expression::Null(Null.into()));

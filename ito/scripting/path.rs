@@ -181,8 +181,11 @@ fn as_segments(arg: &Dynamic) -> Result<Vec<String>> {
             let s = elem
                 .read_lock::<ImmutableString>()
                 .ok_or_else(|| -> Box<EvalAltResult> {
-                    format!("path: array elements must be strings, got {}", elem.type_name())
-                        .into()
+                    format!(
+                        "path: array elements must be strings, got {}",
+                        elem.type_name()
+                    )
+                    .into()
                 })?;
             out.push(s.to_string());
         }
@@ -218,8 +221,11 @@ fn string_elems(arr: &Array) -> Result<Vec<String>> {
             elem.read_lock::<ImmutableString>()
                 .map(|s| s.to_string())
                 .ok_or_else(|| -> Box<EvalAltResult> {
-                    format!("path: array elements must be strings, got {}", elem.type_name())
-                        .into()
+                    format!(
+                        "path: array elements must be strings, got {}",
+                        elem.type_name()
+                    )
+                    .into()
                 })
         })
         .collect()
@@ -252,9 +258,10 @@ pub fn register(engine: &mut Engine) {
         let dyns: Vec<&Dynamic> = parts.iter().collect();
         join_args(&dyns)
     });
-    module.set_native_fn("join", |a: Dynamic, b: Dynamic| -> Result<ImmutableString> {
-        join_args(&[&a, &b])
-    });
+    module.set_native_fn(
+        "join",
+        |a: Dynamic, b: Dynamic| -> Result<ImmutableString> { join_args(&[&a, &b]) },
+    );
 
     // path::product(a, b) -> [String]  (each of a/b a string or string array)
     // Cartesian product of the two axes, each combination joined into a
@@ -470,7 +477,10 @@ mod tests {
         assert_eq!(eval_string(r#"path::join("/a","b")"#), "/a/b");
         assert_eq!(eval_string(r#"path::join("/a",["b","c"])"#), "/a/b/c");
         assert_eq!(eval_string(r#"path::join(["/a","b"],"c")"#), "/a/b/c");
-        assert_eq!(eval_string(r#"path::join(["/a","b"],["c","d"])"#), "/a/b/c/d");
+        assert_eq!(
+            eval_string(r#"path::join(["/a","b"],["c","d"])"#),
+            "/a/b/c/d"
+        );
     }
 
     #[test]
@@ -479,18 +489,27 @@ mod tests {
             eval_strings(r#"path::product(["/a","/b"],["x","y"])"#),
             ["/a/x", "/a/y", "/b/x", "/b/y"]
         );
-        assert_eq!(eval_strings(r#"path::product("/a",["x","y"])"#), ["/a/x", "/a/y"]);
+        assert_eq!(
+            eval_strings(r#"path::product("/a",["x","y"])"#),
+            ["/a/x", "/a/y"]
+        );
         assert!(eval_strings(r#"path::product([],["x"])"#).is_empty());
     }
 
     #[test]
     fn elementwise_overloads() {
-        assert_eq!(eval_strings(r#"path::parent(["/a/b","/c/d.txt"])"#), ["/a", "/c"]);
+        assert_eq!(
+            eval_strings(r#"path::parent(["/a/b","/c/d.txt"])"#),
+            ["/a", "/c"]
+        );
         assert_eq!(
             eval_strings(r#"path::file_name(["/a/b","/c/d.txt"])"#),
             ["b", "d.txt"]
         );
-        assert_eq!(eval_strings(r#"path::extension(["/c/d.txt","/x"])"#), ["txt", ""]);
+        assert_eq!(
+            eval_strings(r#"path::extension(["/c/d.txt","/x"])"#),
+            ["txt", ""]
+        );
         assert_eq!(eval_strings(r#"path::stem(["/c/d.txt"])"#), ["d"]);
     }
 

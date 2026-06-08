@@ -442,13 +442,20 @@ fn register_edit_methods(engine: &mut Engine) {
     engine.register_fn("block", |h: &mut HclDoc, ident: &str, l1: &str| {
         h.traverse_block(ident.into(), vec![l1.into()], None)
     });
-    engine.register_fn("block", |h: &mut HclDoc, ident: &str, l1: &str, l2: &str| {
-        h.traverse_block(ident.into(), vec![l1.into(), l2.into()], None)
-    });
+    engine.register_fn(
+        "block",
+        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str| {
+            h.traverse_block(ident.into(), vec![l1.into(), l2.into()], None)
+        },
+    );
     engine.register_fn(
         "block",
         |h: &mut HclDoc, ident: &str, nth: i64| -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(ident.into(), HclDoc::any_labels(), Some(HclDoc::check_nth(nth)?)))
+            Ok(h.traverse_block(
+                ident.into(),
+                HclDoc::any_labels(),
+                Some(HclDoc::check_nth(nth)?),
+            ))
         },
     );
     engine.register_fn(
@@ -653,9 +660,12 @@ fn register_edit_methods(engine: &mut Engine) {
         },
     );
     engine.register_fn("try_block_count", HclDoc::rhai_try_block_count);
-    engine.register_fn("try_block_count", |h: &mut HclDoc, ident: &str| -> Dynamic {
-        h.rhai_try_block_count(ident, HclDoc::any_labels_array())
-    });
+    engine.register_fn(
+        "try_block_count",
+        |h: &mut HclDoc, ident: &str| -> Dynamic {
+            h.rhai_try_block_count(ident, HclDoc::any_labels_array())
+        },
+    );
     engine.register_fn(
         "try_block_count",
         |h: &mut HclDoc, ident: &str, l1: &str| -> Dynamic {

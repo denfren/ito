@@ -10,14 +10,20 @@ use std::fmt::{Debug, Formatter};
 /// A single step in a navigation path built up by traversal calls.
 #[derive(Clone)]
 pub enum Segment {
-    Text { text: String },
-    Index { index: usize },
+    Text {
+        text: String,
+    },
+    Index {
+        index: usize,
+    },
     Block {
         ident: String,
         labels: Vec<String>,
         nth: Option<usize>,
     },
-    Attr { key: String },
+    Attr {
+        key: String,
+    },
 }
 
 /// Match a block's labels against a label pattern.

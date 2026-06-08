@@ -22,9 +22,7 @@ impl VisitPath {
         root: &mut Body,
     ) -> Result<(Target<'_>, Segment), HclError> {
         let seg = path.pop().ok_or(HclError::NotOnRoot)?;
-        Self { path, visited: 0 }
-            .visit_body(root)
-            .map(|t| (t, seg))
+        Self { path, visited: 0 }.visit_body(root).map(|t| (t, seg))
     }
 
     fn next(&self) -> Option<Segment> {

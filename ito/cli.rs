@@ -121,14 +121,14 @@ pub struct RunArgs {
     #[arg(
         long = "unsafe-proc",
         help_heading = "Run control",
-        help = "Register the `proc` module, allowing the script to execute arbitrary processes. Off by default (safe sandbox).",
+        help = "Register the `proc` module, allowing the script to execute arbitrary processes. Off by default (safe sandbox)."
     )]
     pub unsafe_proc: bool,
 
     #[arg(
         long = "unsafe-fs-flush",
         help_heading = "Run control",
-        help = "Allow the script to call `fs::flush()`, writing buffered changes to disk mid-run. Off by default (safe sandbox).",
+        help = "Allow the script to call `fs::flush()`, writing buffered changes to disk mid-run. Off by default (safe sandbox)."
     )]
     pub unsafe_fs_flush: bool,
 

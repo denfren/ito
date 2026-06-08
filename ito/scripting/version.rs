@@ -38,8 +38,9 @@ pub fn register(engine: &mut Engine, current: &'static str) {
 /// verbatim. `semver`'s `VersionReq` defaults a bare version to caret
 /// already, so we only need to pass it through.
 fn check(req: &str, current: &str) -> Result<(), String> {
-    let version = semver::Version::parse(current)
-        .map_err(|e| format!("ito::version_check: internal: bad running version {current:?}: {e}"))?;
+    let version = semver::Version::parse(current).map_err(|e| {
+        format!("ito::version_check: internal: bad running version {current:?}: {e}")
+    })?;
     let requirement = semver::VersionReq::parse(req).map_err(|e| {
         format!("ito::version_check: {req:?} is not a valid version requirement: {e}")
     })?;

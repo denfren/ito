@@ -67,7 +67,11 @@ impl ImportResolver {
     /// always `false` in a module, since a module is never the entry point)
     /// are constant-folded into the module's bodies and visible inside its
     /// functions, not just the entry script's top-level scope.
-    pub(crate) fn new(entry_base: &Path, root: &PathMapper, module_globals: Scope<'static>) -> Self {
+    pub(crate) fn new(
+        entry_base: &Path,
+        root: &PathMapper,
+        module_globals: Scope<'static>,
+    ) -> Self {
         let sandbox = root.contained(entry_base).then(|| root.clone());
         let mut inner = FileModuleResolver::new();
         inner.set_scope(module_globals);

@@ -7,8 +7,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hcl::edit::structure::{Attribute, Body, Structure};
 use hcl::edit::expr::{Expression, ObjectKey};
+use hcl::edit::structure::{Attribute, Body, Structure};
 use hcl::edit::{Decorate, Ident};
 use rhai::{Dynamic, EvalAltResult, Position};
 
@@ -180,8 +180,7 @@ impl HclDoc {
             let builder = value.cast::<super::HclBlock>();
             let mut root = self.root.borrow_mut();
             let path_depth = self.path.len();
-            let (target, segment) =
-                visit::VisitPath::find_parent(self.path.clone(), &mut root)?;
+            let (target, segment) = visit::VisitPath::find_parent(self.path.clone(), &mut root)?;
             let Segment::Block { ident, labels, nth } = &segment else {
                 return Err(HclError::InvalidType {
                     expected: "Block segment",
@@ -489,8 +488,7 @@ impl HclDoc {
     /// already there. For an empty body, fall back to two spaces per nesting
     /// level (`depth`).
     fn body_indent(body: &Body, depth: usize) -> String {
-        Self::structure_indent(body.iter().last().cloned())
-            .unwrap_or_else(|| "  ".repeat(depth))
+        Self::structure_indent(body.iter().last().cloned()).unwrap_or_else(|| "  ".repeat(depth))
     }
 
     /// Build an `hcl::block(…)` builder into an edit-CST block laid out at
@@ -522,7 +520,10 @@ impl HclDoc {
         match target {
             Target::Body(body) => {
                 let indent = Self::body_indent(body, depth);
-                body.push(Self::indented(Attribute::new(Ident::new_sanitized(key), value), &indent));
+                body.push(Self::indented(
+                    Attribute::new(Ident::new_sanitized(key), value),
+                    &indent,
+                ));
                 Ok(())
             }
             Target::Block(block) => {

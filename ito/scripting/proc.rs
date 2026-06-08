@@ -12,7 +12,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rhai::{Array, Dynamic, Engine, EvalAltResult, FnPtr, ImmutableString, Map, Module, NativeCallContext};
+use rhai::{
+    Array, Dynamic, Engine, EvalAltResult, FnPtr, ImmutableString, Map, Module, NativeCallContext,
+};
 use serde_json::Value as JsonValue;
 use wait_timeout::ChildExt;
 
@@ -146,9 +148,9 @@ impl TaskResult {
     fn into_map(self) -> RhaiResult<Map> {
         let data_dyn: Dynamic = rhai::serde::to_dynamic(self.data_json)?;
         let mut m = Map::new();
-        m.insert("ok".into(),        Dynamic::from(self.ok));
+        m.insert("ok".into(), Dynamic::from(self.ok));
         m.insert("exit_code".into(), Dynamic::from(self.exit_code));
-        m.insert("data".into(),      data_dyn);
+        m.insert("data".into(), data_dyn);
         m.insert("timed_out".into(), Dynamic::from(self.timed_out));
         insert_stream(&mut m, "stdout", self.stdout, self.capture_stdout);
         insert_stream(&mut m, "stderr", self.stderr, self.capture_stderr);
@@ -163,7 +165,10 @@ fn insert_stream(m: &mut Map, key: &str, bytes: Vec<u8>, mode: Capture) {
     match mode {
         Capture::Drop => {}
         Capture::Text => {
-            m.insert(key.into(), Dynamic::from(String::from_utf8_lossy(&bytes).into_owned()));
+            m.insert(
+                key.into(),
+                Dynamic::from(String::from_utf8_lossy(&bytes).into_owned()),
+            );
         }
         Capture::Blob => {
             m.insert(key.into(), Dynamic::from_blob(bytes));
@@ -354,9 +359,10 @@ fn runner_run(ctx: &NativeCallContext, runner: &mut ProcRunner) -> RhaiResult<Ar
         // Evaluate fail_fast predicate.
         let should_halt = match &fail_fast {
             FailFast::Never => false,
-            FailFast::OnNonZero => {
-                !result_map.get("ok").and_then(|d| d.as_bool().ok()).unwrap_or(false)
-            }
+            FailFast::OnNonZero => !result_map
+                .get("ok")
+                .and_then(|d| d.as_bool().ok())
+                .unwrap_or(false),
             FailFast::Custom(pred) => {
                 // Predicate returns true = continue, false = halt.
                 !pred.call_within_context::<bool>(ctx, (Dynamic::from(result_map.clone()),))?
@@ -457,9 +463,11 @@ pub fn register(engine: &mut Engine) {
         |runner: &mut ProcRunner, tasks: Array| -> RhaiResult<ProcRunner> {
             let mut state = runner.state.borrow_mut();
             for d in tasks {
-                let t = d.try_cast::<ProcTask>().ok_or_else(|| -> Box<EvalAltResult> {
-                    "proc: runner.job: array elements must be ProcTask values".into()
-                })?;
+                let t = d
+                    .try_cast::<ProcTask>()
+                    .ok_or_else(|| -> Box<EvalAltResult> {
+                        "proc: runner.job: array elements must be ProcTask values".into()
+                    })?;
                 state.jobs.push(t);
             }
             drop(state);
@@ -468,10 +476,13 @@ pub fn register(engine: &mut Engine) {
     );
 
     // .with_concurrency(n) -> ProcRunner
-    engine.register_fn("with_concurrency", |runner: &mut ProcRunner, n: rhai::INT| {
-        runner.state.borrow_mut().concurrency = n.max(1) as usize;
-        runner.clone()
-    });
+    engine.register_fn(
+        "with_concurrency",
+        |runner: &mut ProcRunner, n: rhai::INT| {
+            runner.state.borrow_mut().concurrency = n.max(1) as usize;
+            runner.clone()
+        },
+    );
 
     // .with_on_result(|result| {}) -> ProcRunner
     engine.register_fn("with_on_result", |runner: &mut ProcRunner, cb: FnPtr| {
@@ -492,10 +503,13 @@ pub fn register(engine: &mut Engine) {
     });
 
     // .with_timeout(secs) -> ProcRunner  (batch-level timeout)
-    engine.register_fn("with_timeout", |runner: &mut ProcRunner, secs: rhai::INT| {
-        runner.state.borrow_mut().batch_timeout_secs = secs.max(0) as u64;
-        runner.clone()
-    });
+    engine.register_fn(
+        "with_timeout",
+        |runner: &mut ProcRunner, secs: rhai::INT| {
+            runner.state.borrow_mut().batch_timeout_secs = secs.max(0) as u64;
+            runner.clone()
+        },
+    );
 
     // .run() -> Array  (NativeCallContext for FnPtr callbacks)
     engine.register_fn(
@@ -525,8 +539,9 @@ pub fn register(engine: &mut Engine) {
         let strs: Vec<String> = argv
             .into_iter()
             .map(|d| {
-                d.into_string()
-                    .map_err(|_| -> Box<EvalAltResult> { "proc::task: argv elements must be strings".into() })
+                d.into_string().map_err(|_| -> Box<EvalAltResult> {
+                    "proc::task: argv elements must be strings".into()
+                })
             })
             .collect::<RhaiResult<Vec<String>>>()?;
         Ok(ProcTask::new(strs[0].clone(), strs[1..].to_vec()))
