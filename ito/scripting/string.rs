@@ -5,11 +5,11 @@
 //! variants for each operation:
 //!
 //! - `to_*` — pure: returns the result as a new string, never mutates the receiver.
-//! - `make_*` — mutates the string in place AND returns the result for chaining.
+//! - `make_*` — mutates the string in place and returns nothing.
 //!
 //! Rhai already provides `to_upper`/`to_lower` (pure copies) and
-//! `make_upper`/`make_lower` (mutate+unit) — ito keeps `make_upper`/`make_lower`
-//! but fixes their return type to `ImmutableString` so they fit the pattern.
+//! `make_upper`/`make_lower` (mutate, return unit) — ito keeps the
+//! `make_upper`/`make_lower` unit semantics and adds the rest to match.
 //!
 //! `join` is added to arrays as a method (no Rhai built-in for it).
 
@@ -37,10 +37,8 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_trimmed",
-        |s: &mut ImmutableString| -> ImmutableString {
-            let trimmed = s.trim().into();
-            *s = trimmed;
-            s.clone()
+        |s: &mut ImmutableString| {
+            *s = s.trim().into();
         },
     );
 
@@ -53,10 +51,8 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_trimmed_start",
-        |s: &mut ImmutableString| -> ImmutableString {
-            let trimmed = s.trim_start().into();
-            *s = trimmed;
-            s.clone()
+        |s: &mut ImmutableString| {
+            *s = s.trim_start().into();
         },
     );
 
@@ -68,27 +64,21 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_trimmed_end",
-        |s: &mut ImmutableString| -> ImmutableString {
-            let trimmed = s.trim_end().into();
-            *s = trimmed;
-            s.clone()
+        |s: &mut ImmutableString| {
+            *s = s.trim_end().into();
         },
     );
 
     // --- upper (Rhai has `to_upper`; we add `make_upper` returning the string) ---
 
-    engine.register_fn("make_upper", |s: &mut ImmutableString| -> ImmutableString {
-        let upper: ImmutableString = s.to_uppercase().into();
-        *s = upper;
-        s.clone()
+    engine.register_fn("make_upper", |s: &mut ImmutableString| {
+        *s = s.to_uppercase().into();
     });
 
     // --- lower (Rhai has `to_lower`; we add `make_lower` returning the string) ---
 
-    engine.register_fn("make_lower", |s: &mut ImmutableString| -> ImmutableString {
-        let lower: ImmutableString = s.to_lowercase().into();
-        *s = lower;
-        s.clone()
+    engine.register_fn("make_lower", |s: &mut ImmutableString| {
+        *s = s.to_lowercase().into();
     });
 
     // --- clear ---
@@ -116,10 +106,9 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_truncated",
-        |s: &mut ImmutableString, len: i64| -> ImmutableString {
+        |s: &mut ImmutableString, len: i64| {
             let len = len.max(0) as usize;
             *s = s.chars().take(len).collect::<String>().into();
-            s.clone()
         },
     );
 
@@ -150,9 +139,7 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_cropped",
-        |s: &mut ImmutableString, start: i64, len: i64| -> ImmutableString {
-            crop_range(s, start, Some(len))
-        },
+        |s: &mut ImmutableString, start: i64, len: i64| crop_range(s, start, Some(len)),
     );
 
     // --- set ---
@@ -168,10 +155,7 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_set",
-        |s: &mut ImmutableString, index: i64, ch: char| -> ImmutableString {
-            set_char(s, index, ch);
-            s.clone()
-        },
+        |s: &mut ImmutableString, index: i64, ch: char| set_char(s, index, ch),
     );
 
     // --- pad ---
@@ -196,16 +180,12 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_padded",
-        |s: &mut ImmutableString, len: i64, ch: char| -> ImmutableString {
-            pad_with(s, len, &ch.to_string())
-        },
+        |s: &mut ImmutableString, len: i64, ch: char| pad_with(s, len, &ch.to_string()),
     );
 
     engine.register_fn(
         "make_padded",
-        |s: &mut ImmutableString, len: i64, pad: ImmutableString| -> ImmutableString {
-            pad_with(s, len, pad.as_str())
-        },
+        |s: &mut ImmutableString, len: i64, pad: ImmutableString| pad_with(s, len, pad.as_str()),
     );
 
     // --- remove ---
@@ -233,9 +213,7 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_removed",
-        |s: &mut ImmutableString, sub: ImmutableString| -> ImmutableString {
-            remove_all(s, sub.as_str())
-        },
+        |s: &mut ImmutableString, sub: ImmutableString| remove_all(s, sub.as_str()),
     );
 
     // --- replace ---
@@ -278,34 +256,34 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn(
         "make_replaced",
-        |s: &mut ImmutableString, from: char, to: char| -> ImmutableString {
+        |s: &mut ImmutableString, from: char, to: char| {
             replace_all(s, &from.to_string(), &to.to_string())
         },
     );
 
     engine.register_fn(
         "make_replaced",
-        |s: &mut ImmutableString, from: char, to: ImmutableString| -> ImmutableString {
+        |s: &mut ImmutableString, from: char, to: ImmutableString| {
             replace_all(s, &from.to_string(), to.as_str())
         },
     );
 
     engine.register_fn(
         "make_replaced",
-        |s: &mut ImmutableString, from: ImmutableString, to: char| -> ImmutableString {
+        |s: &mut ImmutableString, from: ImmutableString, to: char| {
             replace_all(s, from.as_str(), &to.to_string())
         },
     );
 
     engine.register_fn(
         "make_replaced",
-        |s: &mut ImmutableString, from: ImmutableString, to: ImmutableString| -> ImmutableString {
+        |s: &mut ImmutableString, from: ImmutableString, to: ImmutableString| {
             replace_all(s, from.as_str(), to.as_str())
         },
     );
 }
 
-fn crop_range(s: &mut ImmutableString, start: i64, len: Option<i64>) -> ImmutableString {
+fn crop_range(s: &mut ImmutableString, start: i64, len: Option<i64>) {
     let chars: Vec<char> = s.chars().collect();
     let total = chars.len() as i64;
     let start = if start < 0 {
@@ -321,7 +299,6 @@ fn crop_range(s: &mut ImmutableString, start: i64, len: Option<i64>) -> Immutabl
     if cropped != s.as_str() {
         *s = cropped.into();
     }
-    s.clone()
 }
 
 fn set_char(s: &mut ImmutableString, index: i64, ch: char) {
@@ -335,14 +312,14 @@ fn set_char(s: &mut ImmutableString, index: i64, ch: char) {
     }
 }
 
-fn pad_with(s: &mut ImmutableString, len: i64, pad: &str) -> ImmutableString {
+fn pad_with(s: &mut ImmutableString, len: i64, pad: &str) {
     if len <= 0 || pad.is_empty() {
-        return s.clone();
+        return;
     }
     let target = len as usize;
     let mut chars: Vec<char> = s.chars().collect();
     if chars.len() >= target {
-        return s.clone();
+        return;
     }
     let pad_chars: Vec<char> = pad.chars().collect();
     let mut i = 0;
@@ -351,19 +328,16 @@ fn pad_with(s: &mut ImmutableString, len: i64, pad: &str) -> ImmutableString {
         i += 1;
     }
     *s = chars.into_iter().collect::<String>().into();
-    s.clone()
 }
 
-fn remove_all(s: &mut ImmutableString, sub: &str) -> ImmutableString {
+fn remove_all(s: &mut ImmutableString, sub: &str) {
     if !sub.is_empty() && s.contains(sub) {
         *s = s.replace(sub, "").into();
     }
-    s.clone()
 }
 
-fn replace_all(s: &mut ImmutableString, from: &str, to: &str) -> ImmutableString {
+fn replace_all(s: &mut ImmutableString, from: &str, to: &str) {
     if !from.is_empty() && s.contains(from) {
         *s = s.replace(from, to).into();
     }
-    s.clone()
 }

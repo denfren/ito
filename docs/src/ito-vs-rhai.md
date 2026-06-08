@@ -36,7 +36,7 @@ string or array value.
 
 ito does not override Rhai's built-in string methods. Instead it adds
 explicit `to_*` (pure, returns a new string) and `make_*` (mutates in
-place, returns the result) variants for each operation. See
+place, returns nothing) variants for each operation. See
 [`string`](modules/string.md) for the full list.
 
 Summary:

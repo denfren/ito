@@ -4,8 +4,7 @@ Strings are Rhai built-ins. ito adds `to_*` and `make_*` variants for
 common string transformations:
 
 - **`to_*`** — pure: returns a new string, never mutates the receiver.
-- **`make_*`** — mutates the string in place **and** returns the result
-  (useful for chaining).
+- **`make_*`** — mutates the string in place and returns nothing.
 
 These follow ito's stdlib-wide prefix convention; the builder prefix
 `with_*` rounds out the family. See
@@ -44,37 +43,37 @@ let u = `1 + 2 = ${1 + 2}`;
 | `s.to_trimmed()` | Strip leading and trailing whitespace; return copy. *(ito)* |
 | `s.to_trimmed_start()` | Strip leading whitespace; return copy. *(ito)* |
 | `s.to_trimmed_end()` | Strip trailing whitespace; return copy. *(ito)* |
-| `s.make_trimmed()` | Strip leading and trailing whitespace in place; return `s`. *(ito)* |
-| `s.make_trimmed_start()` | Strip leading whitespace in place; return `s`. *(ito)* |
-| `s.make_trimmed_end()` | Strip trailing whitespace in place; return `s`. *(ito)* |
+| `s.make_trimmed()` | Strip leading and trailing whitespace in place. *(ito)* |
+| `s.make_trimmed_start()` | Strip leading whitespace in place. *(ito)* |
+| `s.make_trimmed_end()` | Strip trailing whitespace in place. *(ito)* |
 
 ### Case
 
 | Method | Effect |
 | --- | --- |
-| `s.make_upper()` | Convert to uppercase in place; return `s`. *(ito)* |
-| `s.make_lower()` | Convert to lowercase in place; return `s`. *(ito)* |
+| `s.make_upper()` | Convert to uppercase in place. *(ito)* |
+| `s.make_lower()` | Convert to lowercase in place. *(ito)* |
 
 ### Modify
 
 | Method | Effect |
 | --- | --- |
 | `s.to_cleared()` | Return `""`. *(ito)* |
-| `s.make_cleared()` | Set `s` to `""`; return `s`. *(ito)* |
+| `s.make_cleared()` | Set `s` to `""`. *(ito)* |
 | `s.to_truncated(len)` | Return copy keeping the first `<len>` characters. *(ito)* |
-| `s.make_truncated(len)` | Truncate in place; return `s`. *(ito)* |
+| `s.make_truncated(len)` | Truncate in place. *(ito)* |
 | `s.to_cropped(start)` | Return copy from `<start>` to end (negative counts from end). *(ito)* |
 | `s.to_cropped(start, len)` | Return copy of `<len>` characters from `<start>`. *(ito)* |
-| `s.make_cropped(start)` | Crop in place; return `s`. *(ito)* |
-| `s.make_cropped(start, len)` | Crop in place; return `s`. *(ito)* |
+| `s.make_cropped(start)` | Crop in place. *(ito)* |
+| `s.make_cropped(start, len)` | Crop in place. *(ito)* |
 | `s.to_set(index, ch)` | Return copy with character at `<index>` replaced by `<ch>` (negative counts from end). *(ito)* |
-| `s.make_set(index, ch)` | Replace character at `<index>` in place; return `s`. *(ito)* |
+| `s.make_set(index, ch)` | Replace character at `<index>` in place. *(ito)* |
 | `s.to_padded(len, fill)` | Return copy right-padded to `<len>` characters using `<fill>` (char or string). *(ito)* |
-| `s.make_padded(len, fill)` | Pad in place; return `s`. *(ito)* |
+| `s.make_padded(len, fill)` | Pad in place. *(ito)* |
 | `s.to_removed(sub)` | Return copy with all occurrences of `<sub>` (char or string) removed. *(ito)* |
-| `s.make_removed(sub)` | Remove all occurrences in place; return `s`. *(ito)* |
+| `s.make_removed(sub)` | Remove all occurrences in place. *(ito)* |
 | `s.to_replaced(from, to)` | Return copy with all `<from>` replaced by `<to>` (char or string on both sides). *(ito)* |
-| `s.make_replaced(from, to)` | Replace all occurrences in place; return `s`. *(ito)* |
+| `s.make_replaced(from, to)` | Replace all occurrences in place. *(ito)* |
 
 ## Array method
 
@@ -89,11 +88,10 @@ let u = `1 + 2 = ${1 + 2}`;
 let t = "  hello  ".to_trimmed();     // "hello"
 let u = "hello world".to_removed('o'); // "hell wrld"
 
-// mutating — s is updated, chaining works
+// mutating — s is updated in place, returns nothing
 let s = "  hello  ";
-s.make_trimmed();                       // s == "hello"
-
-let t = "hello".make_upper();          // t == "HELLO", "hello" variable is mutated
+s.make_trimmed();                      // s == "hello"
+s.make_upper();                        // s == "HELLO"
 
 // array join
 ["a", "b", "c"].join(", ")             // "a, b, c"
