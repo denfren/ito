@@ -148,14 +148,28 @@ pub fn register(engine: &mut Engine) {
         "to_set",
         |s: ImmutableString, index: i64, ch: char| -> ImmutableString {
             let mut tmp = s;
-            set_char(&mut tmp, index, ch);
+            set_at(&mut tmp, index, &ch.to_string());
+            tmp
+        },
+    );
+
+    engine.register_fn(
+        "to_set",
+        |s: ImmutableString, index: i64, sub: ImmutableString| -> ImmutableString {
+            let mut tmp = s;
+            set_at(&mut tmp, index, sub.as_str());
             tmp
         },
     );
 
     engine.register_fn(
         "make_set",
-        |s: &mut ImmutableString, index: i64, ch: char| set_char(s, index, ch),
+        |s: &mut ImmutableString, index: i64, ch: char| set_at(s, index, &ch.to_string()),
+    );
+
+    engine.register_fn(
+        "make_set",
+        |s: &mut ImmutableString, index: i64, sub: ImmutableString| set_at(s, index, sub.as_str()),
     );
 
     // --- pad ---
@@ -301,14 +315,15 @@ fn crop_range(s: &mut ImmutableString, start: i64, len: Option<i64>) {
     }
 }
 
-fn set_char(s: &mut ImmutableString, index: i64, ch: char) {
+fn set_at(s: &mut ImmutableString, index: i64, sub: &str) {
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
     let idx = if index < 0 { len + index } else { index };
     if idx >= 0 && idx < len {
-        let mut chars = chars;
-        chars[idx as usize] = ch;
-        *s = chars.into_iter().collect::<String>().into();
+        let mut out: String = chars[..idx as usize].iter().collect();
+        out.push_str(sub);
+        out.extend(chars[idx as usize + 1..].iter());
+        *s = out.into();
     }
 }
 

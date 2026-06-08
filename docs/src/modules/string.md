@@ -66,8 +66,8 @@ let u = `1 + 2 = ${1 + 2}`;
 | `s.to_cropped(start, len)` | Return copy of `<len>` characters from `<start>`. *(ito)* |
 | `s.make_cropped(start)` | Crop in place. *(ito)* |
 | `s.make_cropped(start, len)` | Crop in place. *(ito)* |
-| `s.to_set(index, ch)` | Return copy with character at `<index>` replaced by `<ch>` (negative counts from end). *(ito)* |
-| `s.make_set(index, ch)` | Replace character at `<index>` in place. *(ito)* |
+| `s.to_set(index, ch)` | Return copy with character at `<index>` replaced by `<ch>` (char or string; negative counts from end). *(ito)* |
+| `s.make_set(index, ch)` | Replace character at `<index>` in place (char or string). *(ito)* |
 | `s.to_padded(len, fill)` | Return copy right-padded to `<len>` characters using `<fill>` (char or string). *(ito)* |
 | `s.make_padded(len, fill)` | Pad in place. *(ito)* |
 | `s.to_removed(sub)` | Return copy with all occurrences of `<sub>` (char or string) removed. *(ito)* |
