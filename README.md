@@ -31,7 +31,7 @@ ito exec 'print(toml::parse(fs::read("/Cargo.toml")).package.version)'
   - allow to flush changes during script execution (`--unsafe-fs-flush`)
 - manipulate paths (`path` module)
 - serialize and deserialize some formats (json, yaml, toml, hcl)
-- edit structured files in-place (hcl)
+- edit structured files in-place, preserving layout and comments (hcl, yaml)
 - render Jinja2 templates (`j2` module)
 - execute processes (single & batch) gated by the `--unsafe-proc` flag
 - guard the running `ito` version (`ito::version_check`)
