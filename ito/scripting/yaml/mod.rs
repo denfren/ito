@@ -12,6 +12,12 @@
 //!   separators), returning an array with one value per document.
 //! - `yaml::to_string_multi(values)` serializes an array of values to a
 //!   multi-document stream, separating documents with `---`.
+//! - `yaml::edit(text)` parses into a format-preserving, editable handle
+//!   (a `YamlStream` cursor). Unlike `parse`/`to_string` (lossy), edits
+//!   are surgical — layout and comments survive. See the `edit` submodule.
+
+mod comment;
+mod edit;
 
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Module};
 use yamlito::Yaml;
@@ -53,5 +59,7 @@ pub fn register(engine: &mut Engine) {
             Ok(Yaml::to_multi_string(&docs))
         },
     );
+    edit::register(engine, &mut module);
+
     engine.register_static_module("yaml", module.into());
 }
