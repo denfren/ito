@@ -24,9 +24,11 @@ use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, YamlLang
 
 mod build;
 mod entry;
+mod seq;
 
 pub use build::{GreenElement, mk_node, mk_token};
 pub use entry::{insert_map_entry, remove_map_entry};
+pub use seq::{insert_seq_item, push_seq_item, remove_seq_item};
 
 #[derive(Debug, Clone)]
 pub enum TreeEdit {
