@@ -4,11 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [0.3.1] - 2026-06-10
+## [0.3.2] - 2026-06-10
 
 ### Added
 
 - **yaml:** Add yaml::edit for format-preserving in-place edits
+- **yamlito:** Add sequence cursor insert/push/remove edit API
+- **yamlito:** Continue multiline flow sequence layout on insert/remove
+- **yamlito:** Return live node from sequence item edits
+- **yaml:** Add sequence push/insert/remove to yaml::edit cursor
 
 ### Documentation
 
@@ -69,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release of ito
 
-[0.3.1]: https://github.com/denfren/ito/compare/v0.3.0...v0.3.1
+[0.3.2]: https://github.com/denfren/ito/compare/v0.3.0...v0.3.2
 [0.3.0]: https://github.com/denfren/ito/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/denfren/ito/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/denfren/ito/compare/v0.1.1...v0.1.2
