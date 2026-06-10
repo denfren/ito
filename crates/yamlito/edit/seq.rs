@@ -16,7 +16,12 @@
 //! - **Flow** (`[a, b]`): items are `FLOW_SEQUENCE_ENTRY` nodes between
 //!   `[`/`]`, separated by `,` plus optional WHITESPACE. We sample the
 //!   existing separator so `[a,b]` stays tight and `[a, b]` stays
-//!   spaced.
+//!   spaced. A *regular* one-item-per-line multiline layout
+//!   (`[\n  a,\n  b,\n]`) is also continued — new items keep the detected
+//!   per-item indent, and the trailing-comma-or-not style is preserved.
+//!   Irregular shapes (the first item sharing the `[` line, mismatched
+//!   indents, a stray newline mid-list) fall back to inline spacing
+//!   rather than risk mangling them; the result still reparses.
 //!
 //! A block sequence can never be empty (an empty list is only spelled
 //! `[]` in flow), so removing the *last* block item converts the whole
@@ -35,7 +40,7 @@ use crate::SyntaxTree;
 use crate::builder::Yaml;
 use crate::edit::{GreenElement, TreeEdit, apply_edit, mk_node, mk_token, splice_children_green};
 use crate::syntax::tree_utils::observed_block_col;
-use crate::syntax::{SyntaxKind, SyntaxNode};
+use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 
 /// Insert `value` into the sequence `seq` at item position `index`
 /// (clamped to the item count). Dispatches on the node kind: a
@@ -346,32 +351,153 @@ fn flow_scalar_text(value: &Yaml) -> String {
     }
 }
 
-/// Sample the comma-to-item separator used inside `seq`: whether a
-/// WHITESPACE follows the comma (`[a, b]` vs `[a,b]`). Defaults to a
-/// single space when the sequence has fewer than two items to observe.
-fn flow_separator_ws(seq: &SyntaxNode) -> Option<String> {
-    let children: Vec<_> = seq.children_with_tokens().collect();
-    for (i, el) in children.iter().enumerate() {
-        if matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::COMMA) {
-            // Look at what follows the comma.
-            return match children.get(i + 1) {
-                Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE => {
-                    Some(t.text().to_string())
+/// The separator placed between flow-sequence items, sampled from the
+/// existing layout so new items blend in.
+enum FlowSep {
+    /// Inline, single-line: a comma optionally followed by whitespace
+    /// (`[a, b]` → `", "`; `[a,b]` → `""`).
+    Inline(String),
+    /// One-item-per-line block layout: a comma, then a newline, then the
+    /// per-item indent (`[\n  a,\n  b,\n]` → indent `"  "`).
+    Multiline(String),
+}
+
+impl FlowSep {
+    /// Emit the separator tokens that follow a comma, before the next
+    /// item. The caller supplies the comma itself.
+    fn after_comma(&self) -> Vec<GreenElement> {
+        match self {
+            FlowSep::Inline(ws) if ws.is_empty() => Vec::new(),
+            FlowSep::Inline(ws) => vec![NodeOrToken::Token(mk_token(SyntaxKind::WHITESPACE, ws))],
+            FlowSep::Multiline(indent) => {
+                let mut out = vec![NodeOrToken::Token(mk_token(SyntaxKind::NEWLINE, "\n"))];
+                if !indent.is_empty() {
+                    out.push(NodeOrToken::Token(mk_token(SyntaxKind::WHITESPACE, indent)));
                 }
-                // Multiline (comma then newline) or tight (comma then item):
-                // report no inline whitespace; the caller decides.
-                _ => None,
-            };
+                out
+            }
         }
     }
-    // No existing separator to sample.
-    Some(" ".to_string())
+}
+
+/// Sample the comma-to-item separator used inside `seq`.
+///
+/// - `[a, b]` / `[a,b]` → [`FlowSep::Inline`] reusing the existing
+///   inter-item whitespace.
+/// - `[\n  a,\n  b,\n]` and friends → [`FlowSep::Multiline`] reusing the
+///   detected per-item indent, but only when the layout is *regular*
+///   (every item begins at the start of a line at the same column). Any
+///   irregular multiline shape (e.g. the first item sharing the bracket
+///   line, mismatched indents) falls back to inline so we don't mangle
+///   it.
+/// - single-item / empty list → default `FlowSep::Inline(" ")`.
+fn flow_separator(seq: &SyntaxNode) -> FlowSep {
+    let children: Vec<_> = seq.children_with_tokens().collect();
+
+    // Find the first comma and what immediately follows it.
+    let comma_pos = children
+        .iter()
+        .position(|el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::COMMA));
+
+    if let Some(i) = comma_pos {
+        match children.get(i + 1) {
+            Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE => {
+                return FlowSep::Inline(t.text().to_string());
+            }
+            Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::NEWLINE => {
+                // Looks multiline. Only honour it when the layout is
+                // regular enough to reproduce safely.
+                if let Some(indent) = regular_multiline_indent(&children) {
+                    return FlowSep::Multiline(indent);
+                }
+                return FlowSep::Inline(String::new());
+            }
+            // Comma directly followed by the next item: tight inline.
+            _ => return FlowSep::Inline(String::new()),
+        }
+    }
+
+    // No comma to sample (single-item or empty list). A lone multiline
+    // item (`[\n  a,\n]`) still gives us a regular indent to continue.
+    if let Some(indent) = regular_multiline_indent(&children) {
+        return FlowSep::Multiline(indent);
+    }
+    FlowSep::Inline(" ".to_string())
+}
+
+/// If `seq`'s children describe a regular one-item-per-line layout —
+/// every `FLOW_SEQUENCE_ENTRY` is immediately preceded by a NEWLINE then
+/// a WHITESPACE of one shared width (or directly by a NEWLINE at column
+/// 0) — return that indent. Otherwise `None`.
+///
+/// "Regular" deliberately excludes the case where the first item shares
+/// the `[` line (`[a,\n b]`): that item has no leading NEWLINE, so it
+/// fails the check and we leave the weird layout alone.
+fn regular_multiline_indent(children: &[SyntaxElement]) -> Option<String> {
+    let mut indent: Option<String> = None;
+    let mut saw_item = false;
+    for (i, el) in children.iter().enumerate() {
+        let NodeOrToken::Node(n) = el else { continue };
+        if n.kind() != SyntaxKind::FLOW_SEQUENCE_ENTRY {
+            continue;
+        }
+        saw_item = true;
+        // Determine the indent immediately before this item.
+        let this = match (children.get(i.wrapping_sub(1)), children.get(i.wrapping_sub(2))) {
+            // NEWLINE WHITESPACE ITEM
+            (Some(NodeOrToken::Token(ws)), Some(NodeOrToken::Token(nl)))
+                if i >= 2
+                    && ws.kind() == SyntaxKind::WHITESPACE
+                    && nl.kind() == SyntaxKind::NEWLINE =>
+            {
+                ws.text().to_string()
+            }
+            // NEWLINE ITEM (column 0)
+            (Some(NodeOrToken::Token(nl)), _) if nl.kind() == SyntaxKind::NEWLINE => String::new(),
+            // Anything else (e.g. item right after `[`): irregular.
+            _ => return None,
+        };
+        match &indent {
+            None => indent = Some(this),
+            Some(prev) if *prev == this => {}
+            // Mismatched indents across items: irregular.
+            Some(_) => return None,
+        }
+    }
+    if saw_item { indent } else { None }
+}
+
+/// True when a flow entry node's last token is a NEWLINE — the shape the
+/// parser produces for the final item of a no-trailing-comma multiline
+/// list (`b\n` immediately before `]`).
+fn entry_ends_with_newline(entry: &SyntaxNode) -> bool {
+    matches!(entry.last_token(), Some(t) if t.kind() == SyntaxKind::NEWLINE)
+}
+
+/// Rebuild `entry`'s green with its trailing NEWLINE token stripped.
+/// Caller has already confirmed the entry ends with one (see
+/// [`entry_ends_with_newline`]).
+fn entry_without_trailing_newline(entry: &SyntaxNode) -> rowan::GreenNode {
+    let newline_raw =
+        <crate::syntax::YamlLang as rowan::Language>::kind_to_raw(SyntaxKind::NEWLINE);
+    let mut kept: Vec<GreenElement> = entry
+        .green()
+        .children()
+        .map(|c| match c {
+            rowan::NodeOrToken::Node(n) => NodeOrToken::Node(n.to_owned()),
+            rowan::NodeOrToken::Token(t) => NodeOrToken::Token(t.to_owned()),
+        })
+        .collect();
+    if matches!(kept.last(), Some(NodeOrToken::Token(t)) if t.kind() == newline_raw) {
+        kept.pop();
+    }
+    mk_node(SyntaxKind::FLOW_SEQUENCE_ENTRY, kept)
 }
 
 fn insert_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value: Yaml) {
     let item_green = build_flow_item_green(value);
     let item_indices = item_child_indices(seq, SyntaxKind::FLOW_SEQUENCE_ENTRY);
-    let sep_ws = flow_separator_ws(seq);
+    let sep = flow_separator(seq);
 
     // Locate the closing bracket so an item dropped into an empty `[]`
     // lands just inside it.
@@ -381,7 +507,6 @@ fn insert_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value
         .position(|el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::R_BRACKET));
 
     let comma = || NodeOrToken::Token(mk_token(SyntaxKind::COMMA, ","));
-    let ws = |s: &str| NodeOrToken::Token(mk_token(SyntaxKind::WHITESPACE, s));
 
     if item_indices.is_empty() {
         // Empty `[]` — drop the item just before `]` with no separator.
@@ -398,29 +523,47 @@ fn insert_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value
         return;
     }
 
-    let (splice_at, fragment): (usize, Vec<GreenElement>) = if index >= item_indices.len() {
-        // Append after the last item: `, item` (matching observed sep).
+    let (range, fragment): (std::ops::Range<usize>, Vec<GreenElement>) = if index
+        >= item_indices.len()
+    {
+        // Append after the last item: `,<sep>item` (matching observed
+        // layout). For multiline, this becomes `,\n<indent>item`, and the
+        // item lands before the closing-bracket line.
         let last = *item_indices.last().unwrap();
-        let at = last + 1;
-        let mut frag = vec![comma()];
-        if let Some(s) = &sep_ws {
-            frag.push(ws(s));
+
+        // A no-trailing-comma multiline layout (`[\n  a,\n  b\n]`) keeps
+        // the line-ending NEWLINE *inside* the last entry (`b\n`). Naively
+        // splicing `,...` after the entry would land it past that newline
+        // (`b\n,...`). Detect this and rebuild the tail so the newline
+        // stays the closer: `b` + `,\n  c` + `\n`. This replaces the last
+        // entry rather than inserting after it.
+        if let (FlowSep::Multiline(indent), Some(NodeOrToken::Node(entry))) =
+            (&sep, children.get(last))
+            && entry_ends_with_newline(entry)
+        {
+            let clean = entry_without_trailing_newline(entry);
+            let mut frag = vec![NodeOrToken::Node(clean), comma()];
+            frag.extend(FlowSep::Multiline(indent.clone()).after_comma());
+            frag.push(NodeOrToken::Node(item_green));
+            frag.push(NodeOrToken::Token(mk_token(SyntaxKind::NEWLINE, "\n")));
+            (last..last + 1, frag)
+        } else {
+            let at = last + 1;
+            let mut frag = vec![comma()];
+            frag.extend(sep.after_comma());
+            frag.push(NodeOrToken::Node(item_green));
+            (at..at, frag)
         }
-        frag.push(NodeOrToken::Node(item_green));
-        (at, frag)
     } else {
         // Insert before the item at `index`: `item,<sep>` so the existing
-        // item keeps its position. Any whitespace currently sitting before
-        // `at` belongs to the old item's lead-in and stays put.
+        // item keeps its own leading indent/position.
         let at = item_indices[index];
         let mut frag = vec![NodeOrToken::Node(item_green), comma()];
-        if let Some(s) = &sep_ws {
-            frag.push(ws(s));
-        }
-        (at, frag)
+        frag.extend(sep.after_comma());
+        (at..at, frag)
     };
 
-    let new_green = splice_children_green(seq, splice_at..splice_at, fragment);
+    let new_green = splice_children_green(seq, range, fragment);
     apply_edit(
         tree,
         TreeEdit::ReplaceNode {
@@ -444,30 +587,87 @@ fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
         return;
     };
 
+    // Removing the only item: collapse to a clean `[]`, dropping any
+    // interior trivia (a stray comma/newline would otherwise linger).
+    if item_positions.len() == 1 {
+        let empty = mk_node(
+            SyntaxKind::FLOW_SEQUENCE,
+            [
+                NodeOrToken::Token(mk_token(SyntaxKind::L_BRACKET, "[")),
+                NodeOrToken::Token(mk_token(SyntaxKind::R_BRACKET, "]")),
+            ],
+        );
+        apply_edit(
+            tree,
+            TreeEdit::ReplaceNode {
+                target: seq.clone(),
+                new: empty,
+            },
+        );
+        return;
+    }
+
     let is_comma = |i: usize| {
         matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::COMMA)
     };
     let is_ws = |i: usize| {
         matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE)
     };
+    let is_newline = |i: usize| {
+        matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::NEWLINE)
+    };
+    // A no-trailing-comma multiline last item keeps the closing NEWLINE
+    // inside its own node (`b\n` immediately before `]`).
+    let entry_owns_closing_newline = matches!(
+        children.get(item_idx),
+        Some(NodeOrToken::Node(n)) if entry_ends_with_newline(n)
+    );
+
+    // Multiline when a NEWLINE sits between the brackets — removal then has
+    // to drop a whole line (the item's own indent + its trailing
+    // comma/newline) so no blank indented line is left behind.
+    let multiline = children
+        .iter()
+        .any(|el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::NEWLINE));
 
     let mut start = item_idx;
     let mut end = item_idx + 1;
+    // Replacement spliced in place of the removed range; normally empty,
+    // but the multiline last item may need a NEWLINE kept so `]` stays on
+    // its own line.
+    let mut replacement: Vec<GreenElement> = Vec::new();
 
     if index + 1 < item_positions.len() {
-        // Not the last item: swallow the following `,` and any WHITESPACE
-        // up to (but not including) the next item, so the successor keeps
-        // its position.
-        if is_comma(end) {
-            end += 1;
-        }
-        while is_ws(end) {
-            end += 1;
+        // Not the last item: the successor should slide into this slot.
+        if multiline {
+            // Drop the item's own leading indent and its trailing
+            // `,`+NEWLINE, leaving the next item's indent in place.
+            while start > 0 && is_ws(start - 1) {
+                start -= 1;
+            }
+            if is_comma(end) {
+                end += 1;
+            }
+            if is_newline(end) {
+                end += 1;
+            }
+        } else {
+            // Inline: swallow the following `,` and any WHITESPACE up to the
+            // next item, so the successor keeps its leading spacing.
+            if is_comma(end) {
+                end += 1;
+            }
+            while is_ws(end) {
+                end += 1;
+            }
         }
     } else {
         // Last (but not only) item: swallow the *preceding* `,` and the
-        // whitespace around it, so no dangling comma remains.
+        // whitespace/newline around it, so no dangling separator remains.
         if is_ws(start.saturating_sub(1)) && start > 0 {
+            start -= 1;
+        }
+        if start > 0 && is_newline(start - 1) {
             start -= 1;
         }
         if start > 0 && is_comma(start - 1) {
@@ -477,9 +677,16 @@ fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
         while start > 0 && is_ws(start - 1) {
             start -= 1;
         }
+        // If this item owned the only closing NEWLINE (no-trailing-comma
+        // multiline), removing it would pull `]` up onto the previous
+        // item's line. Keep one NEWLINE so the bracket stays on its own
+        // line, matching the surviving layout.
+        if multiline && entry_owns_closing_newline {
+            replacement.push(NodeOrToken::Token(mk_token(SyntaxKind::NEWLINE, "\n")));
+        }
     }
 
-    let new_green = splice_children_green(seq, start..end, Vec::new());
+    let new_green = splice_children_green(seq, start..end, replacement);
     apply_edit(
         tree,
         TreeEdit::ReplaceNode {
@@ -866,36 +1073,161 @@ mod tests {
         reparse(&tree);
     }
 
-    // ---- flow: multiline ----
+    // ---- flow: multiline layout continuation ----
 
     #[test]
-    fn flow_push_multiline_samples_no_inline_ws() {
-        // Multiline flow: separator is comma+newline, so we report no
-        // inline whitespace and append `,c` after the last item.
+    fn flow_push_multiline_trailing_comma() {
         let mut tree = crate::parse("[\n  a,\n  b,\n]\n").unwrap();
         let seq = flow_seq(&tree);
         push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
-        // The appended item lands tight after `b`; result still reparses.
+        assert_eq!(tree.emit(), "[\n  a,\n  b,\n  c,\n]\n");
         reparse(&tree);
-        let v = Yaml::from_tree(&tree).unwrap();
-        assert_eq!(
-            v,
-            Yaml::Seq(vec![
-                Yaml::Str("a".into()),
-                Yaml::Str("b".into()),
-                Yaml::Str("c".into())
-            ])
-        );
+    }
+
+    #[test]
+    fn flow_push_multiline_no_trailing_comma() {
+        // Last item owns its closing NEWLINE (`b\n`); the appended item
+        // keeps the no-trailing-comma style with `]` on its own line.
+        let mut tree = crate::parse("[\n  a,\n  b\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
+        assert_eq!(tree.emit(), "[\n  a,\n  b,\n  c\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_push_multiline_single_item() {
+        let mut tree = crate::parse("[\n  a,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, Yaml::Str("b".into()));
+        assert_eq!(tree.emit(), "[\n  a,\n  b,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_push_multiline_four_space_indent() {
+        let mut tree = crate::parse("[\n    a,\n    b,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
+        assert_eq!(tree.emit(), "[\n    a,\n    b,\n    c,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_push_multiline_under_key_preserves_indent() {
+        let mut tree = crate::parse("items:\n  [\n    a,\n    b,\n  ]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
+        assert_eq!(tree.emit(), "items:\n  [\n    a,\n    b,\n    c,\n  ]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_insert_front_multiline() {
+        let mut tree = crate::parse("[\n  a,\n  b,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        insert_seq_item(&mut tree, &seq, 0, Yaml::Str("z".into()));
+        assert_eq!(tree.emit(), "[\n  z,\n  a,\n  b,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_insert_middle_multiline() {
+        let mut tree = crate::parse("[\n  a,\n  c,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        insert_seq_item(&mut tree, &seq, 1, Yaml::Str("b".into()));
+        assert_eq!(tree.emit(), "[\n  a,\n  b,\n  c,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_insert_before_last_multiline_no_trailing_comma() {
+        let mut tree = crate::parse("[\n  a,\n  b\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        insert_seq_item(&mut tree, &seq, 1, Yaml::Str("x".into()));
+        assert_eq!(tree.emit(), "[\n  a,\n  x,\n  b\n]\n");
+        reparse(&tree);
     }
 
     #[test]
     fn flow_remove_multiline_first() {
+        let mut tree = crate::parse("[\n  a,\n  b,\n  c,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        remove_seq_item(&mut tree, &seq, 0);
+        assert_eq!(tree.emit(), "[\n  b,\n  c,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_remove_multiline_middle() {
+        let mut tree = crate::parse("[\n  a,\n  b,\n  c,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        remove_seq_item(&mut tree, &seq, 1);
+        assert_eq!(tree.emit(), "[\n  a,\n  c,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_remove_multiline_last_trailing_comma() {
         let mut tree = crate::parse("[\n  a,\n  b,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        remove_seq_item(&mut tree, &seq, 1);
+        assert_eq!(tree.emit(), "[\n  a,\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_remove_multiline_last_no_trailing_comma() {
+        // Removing the newline-owning last item keeps `]` on its own line.
+        let mut tree = crate::parse("[\n  a,\n  b\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        remove_seq_item(&mut tree, &seq, 1);
+        assert_eq!(tree.emit(), "[\n  a\n]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_remove_multiline_only_item_collapses() {
+        let mut tree = crate::parse("[\n  a,\n]\n").unwrap();
+        let seq = flow_seq(&tree);
+        remove_seq_item(&mut tree, &seq, 0);
+        assert_eq!(tree.emit(), "[]\n");
+        reparse(&tree);
+    }
+
+    // ---- flow: stray newline in an otherwise inline list ----
+    //
+    // An irregular layout (the first item shares the `[` line, or only
+    // some items are newline-led) fails the regularity gate, so new items
+    // fall back to inline spacing. The stray newline is left where it is
+    // and every result still reparses.
+
+    #[test]
+    fn flow_push_stray_newline_after_first_comma_falls_back_inline() {
+        let mut tree = crate::parse("[a,\nb, c]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, Yaml::Str("d".into()));
+        assert_eq!(tree.emit(), "[a,\nb, c,d]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_push_leading_newline_only_falls_back_inline() {
+        let mut tree = crate::parse("[\na, b]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
+        assert_eq!(tree.emit(), "[\na, b, c]\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn flow_remove_stray_newline_reparses() {
+        let mut tree = crate::parse("[a,\nb, c]\n").unwrap();
         let seq = flow_seq(&tree);
         remove_seq_item(&mut tree, &seq, 0);
         reparse(&tree);
         let v = Yaml::from_tree(&tree).unwrap();
-        assert_eq!(v, Yaml::Seq(vec![Yaml::Str("b".into())]));
+        assert_eq!(v, Yaml::Seq(vec![Yaml::Str("b".into()), Yaml::Str("c".into())]));
     }
 
     // ---- value fidelity ----
