@@ -1,0 +1,14 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/flow/sequence_plain_multiline.yml
+---
+STREAM@0..6
+  DOCUMENT@0..5
+    FLOW_SEQUENCE@0..5
+      L_BRACKET@0..1 "["
+      FLOW_SEQUENCE_ENTRY@1..4
+        SCALAR@1..4
+          PLAIN_SCALAR@1..4 "a\nb"
+      R_BRACKET@4..5 "]"
+  NEWLINE@5..6 "\n"

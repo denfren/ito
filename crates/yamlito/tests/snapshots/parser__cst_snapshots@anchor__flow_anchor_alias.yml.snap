@@ -1,0 +1,30 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/anchor/flow_anchor_alias.yml
+---
+STREAM@0..17
+  DOCUMENT@0..16
+    FLOW_MAPPING@0..16
+      L_BRACE@0..1 "{"
+      FLOW_MAPPING_ENTRY@1..8
+        SCALAR@1..2
+          PLAIN_SCALAR@1..2 "a"
+        COLON@2..3 ":"
+        WHITESPACE@3..4 " "
+        NODE_PROPERTIES@4..6
+          ANCHOR@4..6 "&v"
+        WHITESPACE@6..7 " "
+        SCALAR@7..8
+          PLAIN_SCALAR@7..8 "1"
+      COMMA@8..9 ","
+      WHITESPACE@9..10 " "
+      FLOW_MAPPING_ENTRY@10..15
+        SCALAR@10..11
+          PLAIN_SCALAR@10..11 "b"
+        COLON@11..12 ":"
+        WHITESPACE@12..13 " "
+        ALIAS_NODE@13..15
+          ALIAS@13..15 "*v"
+      R_BRACE@15..16 "}"
+  NEWLINE@16..17 "\n"

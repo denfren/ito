@@ -1,0 +1,15 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block_scalar/literal_strip.yml
+---
+STREAM@0..31
+  DOCUMENT@0..31
+    BLOCK_MAPPING@0..31
+      BLOCK_MAPPING_ENTRY@0..31
+        SCALAR@0..4
+          PLAIN_SCALAR@0..4 "text"
+        COLON@4..5 ":"
+        WHITESPACE@5..6 " "
+        SCALAR@6..31
+          LITERAL_SCALAR@6..31 "|-\n  line one\n  line two\n"

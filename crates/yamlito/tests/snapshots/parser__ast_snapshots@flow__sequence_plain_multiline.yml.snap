@@ -1,0 +1,10 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/flow/sequence_plain_multiline.yml
+---
+Stream
+  Document
+    FlowSequence (1 entries)
+      Scalar [plain] "a\nb"
+        decoded="a b" value=String("a b")

@@ -1,0 +1,15 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block_scalar/folded_strip.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "text"
+            decoded="text" value=String("text")
+        Value
+          Scalar [folded] ">-\n  folded one\n  folded two\n"
+            decoded="folded one folded two" value=String("folded one folded two")

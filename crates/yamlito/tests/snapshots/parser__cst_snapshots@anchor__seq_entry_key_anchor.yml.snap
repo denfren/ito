@@ -1,0 +1,23 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/anchor/seq_entry_key_anchor.yml
+---
+STREAM@0..10
+  DOCUMENT@0..9
+    BLOCK_SEQUENCE@0..9
+      BLOCK_SEQUENCE_ENTRY@0..9
+        DASH@0..1 "-"
+        WHITESPACE@1..2 " "
+        BLOCK_MAPPING@2..9
+          BLOCK_MAPPING_ENTRY@2..9
+            NODE_PROPERTIES@2..4
+              ANCHOR@2..4 "&a"
+            WHITESPACE@4..5 " "
+            SCALAR@5..6
+              PLAIN_SCALAR@5..6 "k"
+            COLON@6..7 ":"
+            WHITESPACE@7..8 " "
+            SCALAR@8..9
+              PLAIN_SCALAR@8..9 "v"
+  NEWLINE@9..10 "\n"

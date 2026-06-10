@@ -1,0 +1,28 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/stream/bare_document_after_doc_end.yml
+---
+STREAM@0..27
+  DOCUMENT@0..14
+    BLOCK_MAPPING@0..11
+      BLOCK_MAPPING_ENTRY@0..10
+        SCALAR@0..5
+          PLAIN_SCALAR@0..5 "first"
+        COLON@5..6 ":"
+        WHITESPACE@6..7 " "
+        SCALAR@7..10
+          PLAIN_SCALAR@7..10 "doc"
+      NEWLINE@10..11 "\n"
+    DOCUMENT_END@11..14 "..."
+  NEWLINE@14..15 "\n"
+  DOCUMENT@15..26
+    BLOCK_MAPPING@15..26
+      BLOCK_MAPPING_ENTRY@15..26
+        SCALAR@15..21
+          PLAIN_SCALAR@15..21 "second"
+        COLON@21..22 ":"
+        WHITESPACE@22..23 " "
+        SCALAR@23..26
+          PLAIN_SCALAR@23..26 "doc"
+  NEWLINE@26..27 "\n"

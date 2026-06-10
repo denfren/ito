@@ -42,7 +42,7 @@ impl Scalar {
 }
 
 fn decode_plain(raw: &str) -> String {
-    fold_lines(raw.split('\n').map(trim_line_spaces))
+    fold_lines(split_lines(raw).map(trim_line_spaces))
 }
 
 fn decode_single_quoted(raw: &str) -> Result<String, DecodeError> {
@@ -54,7 +54,7 @@ fn decode_single_quoted(raw: &str) -> Result<String, DecodeError> {
         .ok_or(DecodeError::MalformedQuoted)?;
     // Unescape `''` → `'`, then fold lines.
     let unescaped = inner.replace("''", "\x00"); // placeholder to preserve through split
-    let folded = fold_lines(unescaped.split('\n').map(trim_line_spaces));
+    let folded = fold_lines(split_lines(&unescaped).map(trim_line_spaces));
     Ok(folded.replace('\x00', "'"))
 }
 
@@ -78,9 +78,17 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
     let mut pending_newlines: usize = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'\n' {
+        // A raw line break — `\n`, `\r`, or `\r\n` — is normalized to a
+        // single fold break (matching the lexer's NEWLINE handling). The
+        // `\r` escape (`\\r`) is decoded in the escape branch below and is
+        // unaffected.
+        if b == b'\n' || b == b'\r' {
             pending_newlines += 1;
             i += 1;
+            // Consume the `\n` of a `\r\n` pair as part of the same break.
+            if b == b'\r' && i < bytes.len() && bytes[i] == b'\n' {
+                i += 1;
+            }
             // Skip the following line's leading spaces/tabs (indent
             // absorbed by the fold).
             while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
@@ -105,8 +113,12 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
             // the newline + following indent. Per YAML 1.2 only spaces
             // count as indent; a leading tab on the continuation line is
             // content.
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            if i + 1 < bytes.len() && matches!(bytes[i + 1], b'\n' | b'\r') {
                 i += 2;
+                // Consume the `\n` of a `\r\n` line break.
+                if bytes[i - 1] == b'\r' && i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
                 while i < bytes.len() && bytes[i] == b' ' {
                     i += 1;
                 }
@@ -273,8 +285,9 @@ fn decode_block(raw: &str, style: BlockStyle) -> Result<String, DecodeError> {
         return Ok(apply_chomp(String::new(), chomp));
     }
 
-    // Split body into lines, keeping each line's content (no trailing newline).
-    let lines: Vec<&str> = body.split('\n').collect();
+    // Split body into lines, keeping each line's content (no trailing
+    // newline). A trailing `\r` from a CRLF terminator is not content.
+    let lines: Vec<&str> = split_lines(body).collect();
     // `body.split('\n')` yields one extra empty at the end when body ends
     // in `\n`; keep it — it's significant for "trailing newline present".
 
@@ -417,6 +430,17 @@ fn apply_chomp(mut s: String, chomp: Chomp) -> String {
 
 fn trim_line_spaces(line: &str) -> &str {
     line.trim_matches(|c: char| c == ' ' || c == '\t')
+}
+
+/// Split raw scalar text into logical lines, treating `\n`, `\r`, and
+/// `\r\n` uniformly as line terminators (matching the lexer's NEWLINE
+/// handling). Splitting on `\n` alone would leave a trailing `\r` from a
+/// CRLF terminator as content; this strips it so folding sees clean lines.
+fn split_lines(raw: &str) -> impl Iterator<Item = &str> {
+    // Split on `\n` first, then strip a trailing `\r` (CRLF case). Lone
+    // `\r` (old-Mac) terminators are handled by the inner split.
+    raw.split('\n')
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
 }
 
 /// Fold a sequence of trimmed lines per YAML 1.2 line-folding rules used
@@ -759,5 +783,51 @@ mod tests {
     #[test]
     fn folded_strip() {
         assert_eq!(first_scalar("k: >-\n  a\n  b\n").decoded().unwrap(), "a b");
+    }
+
+    // --- CRLF line endings: raw `\r` must not leak into decoded values. ---
+
+    #[test]
+    fn plain_crlf_no_carriage_return() {
+        assert_eq!(first_scalar("k: a\r\n  b\r\n").decoded().unwrap(), "a b");
+    }
+
+    #[test]
+    fn single_quoted_crlf_no_carriage_return() {
+        assert_eq!(
+            first_scalar("k: 'a\r\n  b'\r\n").decoded().unwrap(),
+            "a b"
+        );
+    }
+
+    #[test]
+    fn double_quoted_crlf_no_carriage_return() {
+        assert_eq!(
+            first_scalar("k: \"a\r\n  b\"\r\n").decoded().unwrap(),
+            "a b"
+        );
+    }
+
+    #[test]
+    fn literal_crlf_no_carriage_return() {
+        assert_eq!(
+            first_scalar("k: |\r\n  a\r\n  b\r\n").decoded().unwrap(),
+            "a\nb\n"
+        );
+    }
+
+    #[test]
+    fn folded_crlf_no_carriage_return() {
+        assert_eq!(
+            first_scalar("k: >\r\n  a\r\n  b\r\n").decoded().unwrap(),
+            "a b\n"
+        );
+    }
+
+    #[test]
+    fn double_quoted_escaped_carriage_return_preserved() {
+        // An escaped `\r` is a literal carriage return in the value; only
+        // raw `\r` line-break bytes are normalized away.
+        assert_eq!(first_scalar("\"a\\rb\"\n").decoded().unwrap(), "a\rb");
     }
 }

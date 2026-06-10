@@ -1,0 +1,19 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/tag/local_tag.yml
+---
+STREAM@0..20
+  DOCUMENT@0..19
+    BLOCK_MAPPING@0..19
+      BLOCK_MAPPING_ENTRY@0..19
+        SCALAR@0..5
+          PLAIN_SCALAR@0..5 "value"
+        COLON@5..6 ":"
+        WHITESPACE@6..7 " "
+        NODE_PROPERTIES@7..13
+          TAG@7..13 "!mytag"
+        WHITESPACE@13..14 " "
+        SCALAR@14..19
+          PLAIN_SCALAR@14..19 "hello"
+  NEWLINE@19..20 "\n"

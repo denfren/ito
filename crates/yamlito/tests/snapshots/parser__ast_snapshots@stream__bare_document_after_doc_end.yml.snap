@@ -1,0 +1,24 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/stream/bare_document_after_doc_end.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "first"
+            decoded="first" value=String("first")
+        Value
+          Scalar [plain] "doc"
+            decoded="doc" value=String("doc")
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "second"
+            decoded="second" value=String("second")
+        Value
+          Scalar [plain] "doc"
+            decoded="doc" value=String("doc")

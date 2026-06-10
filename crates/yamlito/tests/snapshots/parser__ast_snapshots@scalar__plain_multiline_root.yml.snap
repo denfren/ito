@@ -1,0 +1,9 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/scalar/plain_multiline_root.yml
+---
+Stream
+  Document
+    Scalar [plain] "this is a long\nplain scalar that folds\nacross three lines"
+      decoded="this is a long plain scalar that folds across three lines" value=String("this is a long plain scalar that folds across three lines")

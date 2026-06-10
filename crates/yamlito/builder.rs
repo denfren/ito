@@ -9,8 +9,8 @@
 //! For surgical, style-preserving construction use the green-node escape
 //! hatch (`edit::mk_node` / `edit::mk_token`) instead.
 
-use crate::ast::value::infer_plain;
 use crate::ast::{AstNode, Node, Stream, Value};
+use crate::quoting::quote_scalar_block;
 use crate::{SyntaxTree, parse};
 
 /// A YAML value to build into a tree. Mapping keys are strings (the only
@@ -250,7 +250,7 @@ fn write_node(node: &Yaml, indent: usize, out: &mut String) {
         Yaml::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Yaml::Int(n) => out.push_str(&n.to_string()),
         Yaml::Float(f) => out.push_str(&format_float(*f)),
-        Yaml::Str(s) => out.push_str(&quote_scalar(s)),
+        Yaml::Str(s) => out.push_str(&quote_scalar_block(s)),
         Yaml::Seq(items) => write_seq(items, indent, out),
         Yaml::Map(pairs) => write_map(pairs, indent, out),
     }
@@ -261,10 +261,7 @@ fn write_seq(items: &[Yaml], indent: usize, out: &mut String) {
         out.push_str("[]");
         return;
     }
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 || out.ends_with('\n') {
-            push_indent(indent, out);
-        }
+    write_block_entries(items, indent, out, |item, indent, out| {
         out.push('-');
         match item {
             // Compact block form: `- key: val` with the first entry on
@@ -275,10 +272,7 @@ fn write_seq(items: &[Yaml], indent: usize, out: &mut String) {
             }
             other => write_block_child(other, indent, out),
         }
-        out.push('\n');
-    }
-    // Trim: the loop adds a trailing newline; callers handle separators.
-    out.pop();
+    });
 }
 
 fn write_map(pairs: &[(String, Yaml)], indent: usize, out: &mut String) {
@@ -286,13 +280,26 @@ fn write_map(pairs: &[(String, Yaml)], indent: usize, out: &mut String) {
         out.push_str("{}");
         return;
     }
-    for (i, (key, value)) in pairs.iter().enumerate() {
+    write_block_entries(pairs, indent, out, |(key, value), indent, out| {
+        out.push_str(&quote_scalar_block(key));
+        out.push(':');
+        write_block_child(value, indent, out);
+    });
+}
+
+/// Iterate `items`, writing each as a block entry: indent guard, item
+/// content via `write_item`, newline. Pops the trailing newline at the end.
+fn write_block_entries<T>(
+    items: &[T],
+    indent: usize,
+    out: &mut String,
+    write_item: impl Fn(&T, usize, &mut String),
+) {
+    for (i, item) in items.iter().enumerate() {
         if i > 0 || out.ends_with('\n') {
             push_indent(indent, out);
         }
-        out.push_str(&quote_scalar(key));
-        out.push(':');
-        write_block_child(value, indent, out);
+        write_item(item, indent, out);
         out.push('\n');
     }
     out.pop();
@@ -341,80 +348,6 @@ fn format_float(f: f64) -> String {
     } else {
         format!("{s}.0")
     }
-}
-
-/// Quote a string scalar when emitting it plain would change its meaning
-/// (re-inferred as null/bool/number) or break parsing. Otherwise emit it
-/// plain.
-fn quote_scalar(s: &str) -> String {
-    if needs_quoting(s) {
-        single_quote(s)
-    } else {
-        s.to_string()
-    }
-}
-
-fn needs_quoting(s: &str) -> bool {
-    if s.is_empty() {
-        return true;
-    }
-    // Would a plain scalar re-infer as a non-string? Then it must be quoted.
-    if !matches!(infer_plain(s), Value::String(_)) {
-        return true;
-    }
-    // Leading indicator characters or structural bytes make a plain
-    // scalar ambiguous or invalid.
-    let first = s.as_bytes()[0];
-    if matches!(
-        first,
-        b'-' | b'?'
-            | b':'
-            | b','
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'#'
-            | b'&'
-            | b'*'
-            | b'!'
-            | b'|'
-            | b'>'
-            | b'\''
-            | b'"'
-            | b'%'
-            | b'@'
-            | b'`'
-            | b' '
-    ) {
-        return true;
-    }
-    // Interior `: ` (mapping indicator), ` #` (comment), trailing space,
-    // or any newline/tab would all break a plain scalar.
-    if s.ends_with(' ')
-        || s.contains('\n')
-        || s.contains('\t')
-        || s.contains(": ")
-        || s.ends_with(':')
-        || s.contains(" #")
-    {
-        return true;
-    }
-    false
-}
-
-/// Single-quote a string, doubling any embedded single quotes.
-fn single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push('\'');
-        }
-        out.push(c);
-    }
-    out.push('\'');
-    out
 }
 
 #[cfg(test)]
@@ -702,6 +635,53 @@ mod tests {
         let y = from_yaml(src);
         let reparsed = from_yaml(&y.to_yaml_string());
         assert_eq!(y, reparsed);
+    }
+
+    /// A `Yaml::Str` containing a newline must NOT single-quote (which
+    /// line-folds back to a space) — it must double-quote with `\n`, and
+    /// round-trip to the exact original string (FINDINGS.md B1).
+    #[test]
+    fn str_with_newline_double_quotes_and_round_trips() {
+        let y = Yaml::Str("line1\nline2".into());
+        assert_eq!(build_str(&y), "\"line1\\nline2\"\n");
+        let back = from_yaml(&y.to_yaml_string());
+        assert_eq!(back, y);
+    }
+
+    /// A mapping key containing a newline must also round-trip exactly
+    /// (FINDINGS.md B1).
+    #[test]
+    fn map_key_with_newline_round_trips() {
+        let y = Yaml::Map(vec![("a\nb".into(), Yaml::Int(1))]);
+        let back = from_yaml(&y.to_yaml_string());
+        assert_eq!(back, y);
+    }
+
+    /// The hostile-alphabet builder round-trip property (FINDINGS.md §6):
+    /// for every string, `from_tree(parse(Str(s).to_yaml_string())) == s`,
+    /// proving the one quoting policy never corrupts a value. Catches B1
+    /// and the unquoted-`yes`/`010` half of A4.
+    #[test]
+    fn str_round_trips_hostile_alphabet() {
+        let cases = [
+            // control characters (B1)
+            "a\nb", "line1\nline2", "a\tb", "a\rb", "\n", "\t",
+            // structural / indicators / whitespace
+            "a,b", "a]b", "a}b", "a: b", "a:b", "a #c", "a#b", "a b",
+            " a", "a ", ":", "-", "- ", "?", "[", "]", "{", "}", ",", "#",
+            "&a", "*a", "!a", "|", ">", "%", "@", "`", "'", "\"", "", "a'b",
+            "a\"b", "a\\b",
+            // Core-schema and YAML 1.1 hazard words (A4)
+            "null", "true", "false", "~", "yes", "Yes", "YES", "no", "off",
+            "on", "On", "010", "1:30", "12:34:56", "42", "-7", "1.5", ".inf",
+            // plain-safe
+            "hello", "it's", "http://x", "key_name",
+        ];
+        for s in cases {
+            let y = Yaml::Str(s.to_string());
+            let back = from_yaml(&y.to_yaml_string());
+            assert_eq!(back, y, "round-trip failed for {s:?} via {:?}", y.to_yaml_string());
+        }
     }
 
     #[test]

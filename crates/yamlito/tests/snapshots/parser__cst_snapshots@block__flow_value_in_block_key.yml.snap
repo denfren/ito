@@ -1,0 +1,50 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block/flow_value_in_block_key.yml
+---
+STREAM@0..51
+  DOCUMENT@0..50
+    BLOCK_MAPPING@0..50
+      BLOCK_MAPPING_ENTRY@0..22
+        SCALAR@0..7
+          PLAIN_SCALAR@0..7 "servers"
+        COLON@7..8 ":"
+        WHITESPACE@8..9 " "
+        FLOW_SEQUENCE@9..22
+          L_BRACKET@9..10 "["
+          FLOW_SEQUENCE_ENTRY@10..15
+            SCALAR@10..15
+              PLAIN_SCALAR@10..15 "alpha"
+          COMMA@15..16 ","
+          WHITESPACE@16..17 " "
+          FLOW_SEQUENCE_ENTRY@17..21
+            SCALAR@17..21
+              PLAIN_SCALAR@17..21 "beta"
+          R_BRACKET@21..22 "]"
+      NEWLINE@22..23 "\n"
+      BLOCK_MAPPING_ENTRY@23..50
+        SCALAR@23..27
+          PLAIN_SCALAR@23..27 "meta"
+        COLON@27..28 ":"
+        WHITESPACE@28..29 " "
+        FLOW_MAPPING@29..50
+          L_BRACE@29..30 "{"
+          FLOW_MAPPING_ENTRY@30..40
+            SCALAR@30..36
+              PLAIN_SCALAR@30..36 "region"
+            COLON@36..37 ":"
+            WHITESPACE@37..38 " "
+            SCALAR@38..40
+              PLAIN_SCALAR@38..40 "eu"
+          COMMA@40..41 ","
+          WHITESPACE@41..42 " "
+          FLOW_MAPPING_ENTRY@42..49
+            SCALAR@42..46
+              PLAIN_SCALAR@42..46 "tier"
+            COLON@46..47 ":"
+            WHITESPACE@47..48 " "
+            SCALAR@48..49
+              PLAIN_SCALAR@48..49 "1"
+          R_BRACE@49..50 "}"
+  NEWLINE@50..51 "\n"

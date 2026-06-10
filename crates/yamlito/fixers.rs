@@ -467,18 +467,14 @@ fn collapse_intra_entry_whitespace(
 /// i.e. an indentless sequence). `Some(n)` means the entry is explicitly
 /// indented with `n` spaces and should be normalised; `None` means keep at 0.
 fn first_entry_col(block: &SyntaxNode) -> Option<usize> {
-    for el in block.children() {
-        if !is_block_entry(&el) {
-            continue;
-        }
-        return match el.children_with_tokens().next() {
+    block.children().find(is_block_entry).and_then(|el| {
+        match el.children_with_tokens().next() {
             Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE => {
                 Some(t.text().len())
             }
             _ => None,
-        };
-    }
-    None
+        }
+    })
 }
 
 /// Given `children[i]` is the target element, look backwards for the
@@ -556,55 +552,19 @@ fn plan_indent_fix(
 /// Double-quoted: safe to unquote iff the content contains no `\` (escape
 /// sequences encode characters that would otherwise require quoting).
 pub fn unquote_scalars(tree: &mut SyntaxTree) -> usize {
-    let mut targets: Vec<(SyntaxNode, String)> = Vec::new();
-    for ev in tree.root().preorder_with_tokens() {
-        let WalkEvent::Enter(NodeOrToken::Token(t)) = ev else {
-            continue;
-        };
-        let plain = match t.kind() {
-            SyntaxKind::SINGLE_QUOTED_SCALAR => {
-                let inner = t.text().trim_matches('\'');
-                if inner.contains("''") {
-                    continue;
-                }
-                inner.to_string()
-            }
-            SyntaxKind::DOUBLE_QUOTED_SCALAR => {
-                let inner = t.text().trim_matches('"');
-                if inner.contains('\\') {
-                    continue;
-                }
-                inner.to_string()
-            }
-            _ => continue,
-        };
-        let Some(plain) = as_plain_scalar(&plain).map(str::to_string) else {
-            continue;
-        };
-        let Some(scalar) = t.parent() else { continue };
-        if scalar.kind() != SyntaxKind::SCALAR {
-            continue;
+    apply_scalar_transforms(tree, SyntaxKind::PLAIN_SCALAR, |t| match t.kind() {
+        SyntaxKind::SINGLE_QUOTED_SCALAR => {
+            let inner = t.text().trim_matches('\'');
+            if inner.contains("''") { return None; }
+            as_plain_scalar(inner).map(str::to_string)
         }
-        targets.push((scalar, plain));
-    }
-    let n = targets.len();
-    for (scalar, plain) in targets {
-        let new = mk_node(
-            SyntaxKind::SCALAR,
-            [NodeOrToken::Token(mk_token(
-                SyntaxKind::PLAIN_SCALAR,
-                &plain,
-            ))],
-        );
-        apply_edit(
-            tree,
-            TreeEdit::ReplaceNode {
-                target: scalar,
-                new,
-            },
-        );
-    }
-    n
+        SyntaxKind::DOUBLE_QUOTED_SCALAR => {
+            let inner = t.text().trim_matches('"');
+            if inner.contains('\\') { return None; }
+            as_plain_scalar(inner).map(str::to_string)
+        }
+        _ => None,
+    })
 }
 
 /// Convert double-quoted scalars to single-quoted where possible.
@@ -613,43 +573,37 @@ pub fn unquote_scalars(tree: &mut SyntaxTree) -> usize {
 /// Double-quoted scalars with `\` escape sequences are skipped (the decoded
 /// value may differ from the raw text).
 pub fn prefer_single_quotes(tree: &mut SyntaxTree) -> usize {
+    apply_scalar_transforms(tree, SyntaxKind::SINGLE_QUOTED_SCALAR, |t| {
+        if t.kind() != SyntaxKind::DOUBLE_QUOTED_SCALAR { return None; }
+        let inner = t.text().trim_matches('"');
+        if inner.contains('\\') { return None; }
+        as_single_quoted(inner)
+    })
+}
+
+/// Walk the tree, call `transform` on each token. If it returns `Some(text)`,
+/// replace the parent SCALAR node with a new SCALAR containing a token of
+/// `out_kind` with that text.
+fn apply_scalar_transforms(
+    tree: &mut SyntaxTree,
+    out_kind: SyntaxKind,
+    transform: impl Fn(&SyntaxToken) -> Option<String>,
+) -> usize {
     let mut targets: Vec<(SyntaxNode, String)> = Vec::new();
     for ev in tree.root().preorder_with_tokens() {
-        let WalkEvent::Enter(NodeOrToken::Token(t)) = ev else {
-            continue;
-        };
-        if t.kind() != SyntaxKind::DOUBLE_QUOTED_SCALAR {
-            continue;
-        }
-        let inner = t.text().trim_matches('"');
-        if inner.contains('\\') {
-            continue;
-        }
-        let Some(quoted) = as_single_quoted(inner) else {
-            continue;
-        };
+        let WalkEvent::Enter(NodeOrToken::Token(t)) = ev else { continue };
+        let Some(text) = transform(&t) else { continue };
         let Some(scalar) = t.parent() else { continue };
-        if scalar.kind() != SyntaxKind::SCALAR {
-            continue;
-        }
-        targets.push((scalar, quoted));
+        if scalar.kind() != SyntaxKind::SCALAR { continue }
+        targets.push((scalar, text));
     }
     let n = targets.len();
-    for (scalar, quoted) in targets {
+    for (scalar, text) in targets {
         let new = mk_node(
             SyntaxKind::SCALAR,
-            [NodeOrToken::Token(mk_token(
-                SyntaxKind::SINGLE_QUOTED_SCALAR,
-                &quoted,
-            ))],
+            [NodeOrToken::Token(mk_token(out_kind, &text))],
         );
-        apply_edit(
-            tree,
-            TreeEdit::ReplaceNode {
-                target: scalar,
-                new,
-            },
-        );
+        apply_edit(tree, TreeEdit::ReplaceNode { target: scalar, new });
     }
     n
 }

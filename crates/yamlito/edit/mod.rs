@@ -23,6 +23,7 @@ use crate::SyntaxTree;
 use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, YamlLang};
 
 mod build;
+mod collection;
 mod entry;
 mod seq;
 

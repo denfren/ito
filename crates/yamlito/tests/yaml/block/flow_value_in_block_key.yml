@@ -1,0 +1,2 @@
+servers: [alpha, beta]
+meta: {region: eu, tier: 1}

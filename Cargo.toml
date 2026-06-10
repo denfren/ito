@@ -26,6 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 yamlito = { path = "crates/yamlito" }
 insta = { version = "1", features = ["glob"] }
 pretty_assertions = "1"
+proptest = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]

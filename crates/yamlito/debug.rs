@@ -11,25 +11,25 @@ pub fn cst_string(tree: &SyntaxTree) -> String {
 
 fn cst_node(node: &SyntaxNode, depth: usize, out: &mut String) {
     let range = node.text_range();
-    let indent = "  ".repeat(depth);
     out.push_str(&format!(
-        "{indent}{kind:?}@{start}..{end}\n",
-        kind = node.kind(),
-        start = usize::from(range.start()),
-        end = usize::from(range.end()),
+        "{}{:?}@{}..{}\n",
+        indent(depth),
+        node.kind(),
+        usize::from(range.start()),
+        usize::from(range.end()),
     ));
     for child in node.children_with_tokens() {
         match child {
             SyntaxElement::Node(n) => cst_node(&n, depth + 1, out),
             SyntaxElement::Token(t) => {
                 let r = t.text_range();
-                let child_indent = "  ".repeat(depth + 1);
                 out.push_str(&format!(
-                    "{child_indent}{kind:?}@{start}..{end} {text}\n",
-                    kind = t.kind(),
-                    start = usize::from(r.start()),
-                    end = usize::from(r.end()),
-                    text = escape(t.text()),
+                    "{}{:?}@{}..{} {}\n",
+                    indent(depth + 1),
+                    t.kind(),
+                    usize::from(r.start()),
+                    usize::from(r.end()),
+                    escape(t.text()),
                 ));
             }
         }
@@ -49,14 +49,11 @@ pub fn ast_string(tree: &SyntaxTree) -> String {
 }
 
 fn ast_document(doc: &Document, depth: usize, out: &mut String) {
-    let indent = "  ".repeat(depth);
-    out.push_str(&format!("{indent}Document\n"));
+    out.push_str(&format!("{}Document\n", indent(depth)));
     if let Some(dirs) = doc.directives() {
-        let child_indent = "  ".repeat(depth + 1);
-        out.push_str(&format!("{child_indent}Directives\n"));
+        out.push_str(&format!("{}Directives\n", indent(depth + 1)));
         for d in dirs.directives() {
-            let dd_indent = "  ".repeat(depth + 2);
-            out.push_str(&format!("{dd_indent}Directive {}\n", escape(d.text())));
+            out.push_str(&format!("{}Directive {}\n", indent(depth + 2), escape(d.text())));
         }
     }
     if let Some(root) = doc.root_node() {
@@ -72,17 +69,14 @@ fn ast_node(node: &Node, depth: usize, out: &mut String) {
         Node::BlockSequence(s) => ast_sequence("BlockSequence", s, depth, out),
         Node::FlowSequence(s) => ast_sequence("FlowSequence", s, depth, out),
         Node::Alias(a) => {
-            let indent = "  ".repeat(depth);
-            let name = a.name().unwrap_or_default();
-            out.push_str(&format!("{indent}Alias *{name}\n"));
+            out.push_str(&format!("{}Alias *{}\n", indent(depth), a.name().unwrap_or_default()));
         }
     }
 }
 
 fn ast_scalar(s: &Scalar, depth: usize, out: &mut String) {
-    let indent = "  ".repeat(depth);
     if s.is_null() {
-        out.push_str(&format!("{indent}Null\n"));
+        out.push_str(&format!("{}Null\n", indent(depth)));
         if let Some(props) = s.properties() {
             ast_properties(&props, depth + 1, out);
         }
@@ -97,7 +91,7 @@ fn ast_scalar(s: &Scalar, depth: usize, out: &mut String) {
         None => "?",
     };
     let raw = s.raw_text().unwrap_or_default();
-    out.push_str(&format!("{indent}Scalar [{style}] {}\n", escape(&raw)));
+    out.push_str(&format!("{}Scalar [{style}] {}\n", indent(depth), escape(&raw)));
     if let Some(props) = s.properties() {
         ast_properties(&props, depth + 1, out);
     }
@@ -107,51 +101,49 @@ fn ast_scalar(s: &Scalar, depth: usize, out: &mut String) {
             .ok()
             .map(|v| format!("{v:?}"))
             .unwrap_or_else(|| "?".into());
-        let child_indent = "  ".repeat(depth + 1);
         out.push_str(&format!(
-            "{child_indent}decoded={} value={value}\n",
+            "{}decoded={} value={value}\n",
+            indent(depth + 1),
             escape(&decoded)
         ));
     }
 }
 
 fn ast_mapping<M: Mapping>(label: &str, m: &M, depth: usize, out: &mut String) {
-    let indent = "  ".repeat(depth);
-    out.push_str(&format!("{indent}{label} ({} entries)\n", m.len()));
-    let entry_indent = "  ".repeat(depth + 1);
+    out.push_str(&format!("{}{label} ({} entries)\n", indent(depth), m.len()));
     for (k, v) in m.pairs() {
-        out.push_str(&format!("{entry_indent}Entry\n"));
-        let kv_indent = "  ".repeat(depth + 2);
-        out.push_str(&format!("{kv_indent}Key\n"));
+        out.push_str(&format!("{}Entry\n", indent(depth + 1)));
+        out.push_str(&format!("{}Key\n", indent(depth + 2)));
         ast_node(&k, depth + 3, out);
         match v {
             Some(v) => {
-                out.push_str(&format!("{kv_indent}Value\n"));
+                out.push_str(&format!("{}Value\n", indent(depth + 2)));
                 ast_node(&v, depth + 3, out);
             }
-            None => out.push_str(&format!("{kv_indent}Value (none)\n")),
+            None => out.push_str(&format!("{}Value (none)\n", indent(depth + 2))),
         }
     }
 }
 
 fn ast_sequence<S: Sequence>(label: &str, s: &S, depth: usize, out: &mut String) {
-    let indent = "  ".repeat(depth);
-    out.push_str(&format!("{indent}{label} ({} entries)\n", s.len()));
+    out.push_str(&format!("{}{label} ({} entries)\n", indent(depth), s.len()));
     for v in s.iter() {
         ast_node(&v, depth + 1, out);
     }
 }
 
 fn ast_properties(p: &NodeProperties, depth: usize, out: &mut String) {
-    let indent = "  ".repeat(depth);
-    out.push_str(&format!("{indent}NodeProperties\n"));
-    let child_indent = "  ".repeat(depth + 1);
+    out.push_str(&format!("{}NodeProperties\n", indent(depth)));
     if let Some(a) = p.anchor_name() {
-        out.push_str(&format!("{child_indent}anchor &{a}\n"));
+        out.push_str(&format!("{}anchor &{a}\n", indent(depth + 1)));
     }
     if let Some(t) = p.tag_value() {
-        out.push_str(&format!("{child_indent}tag {t:?}\n"));
+        out.push_str(&format!("{}tag {t:?}\n", indent(depth + 1)));
     }
+}
+
+fn indent(depth: usize) -> String {
+    "  ".repeat(depth)
 }
 
 fn escape(s: &str) -> String {

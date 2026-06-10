@@ -1,0 +1,28 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/anchor/seq_value_anchor.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "base"
+            decoded="base" value=String("base")
+        Value
+          BlockMapping (2 entries)
+            Entry
+              Key
+                Scalar [plain] "host"
+                  decoded="host" value=String("host")
+              Value
+                Scalar [plain] "alpha"
+                  decoded="alpha" value=String("alpha")
+            Entry
+              Key
+                Scalar [plain] "port"
+                  decoded="port" value=String("port")
+              Value
+                Scalar [plain] "80"
+                  decoded="80" value=Int(80)

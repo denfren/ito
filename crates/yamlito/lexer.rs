@@ -179,16 +179,8 @@ impl<'a> Lexer<'a> {
             }
             SyntaxKind::NEWLINE => {
                 // \r\n is one token, two bytes. Lone \n or \r each one byte.
-                match self.peek_byte() {
-                    Some(b'\r') => {
-                        self.pos += 1;
-                        if self.peek_byte() == Some(b'\n') {
-                            self.pos += 1;
-                        }
-                    }
-                    Some(b'\n') => self.pos += 1,
-                    _ => unreachable!(),
-                }
+                let bytes = self.src.as_bytes();
+                self.consume_newline(bytes);
             }
             SyntaxKind::COMMENT => {
                 // Consume `#` and everything up to but not including
@@ -319,15 +311,28 @@ impl<'a> Lexer<'a> {
         self.read_plain_with(stop, None)
     }
 
-    pub fn read_plain_with(&mut self, stop: PlainStop, min_indent: Option<usize>) -> &'a str {
+    /// `min_indent` is the indent barrier for multi-line plain-scalar
+    /// continuation: a continuation line is accepted only when its indent
+    /// is **strictly greater** than this value. The document root passes
+    /// `Some(-1)` so a column-0 line still continues (the document-level
+    /// indent is −1 per YAML 1.2 §7.3.3); nested block scalars pass their
+    /// parent container's indent (>= 0).
+    pub fn read_plain_with(&mut self, stop: PlainStop, min_indent: Option<isize>) -> &'a str {
         let start = self.pos;
         let mut last_non_space_end = self.scan_plain_line(stop);
 
-        // Multi-line continuation is only meaningful in block context.
-        let multiline_ok =
-            matches!(stop, PlainStop::BlockValue | PlainStop::BlockKey) && min_indent.is_some();
+        // Multi-line continuation applies in block context (bounded by an
+        // explicit indent barrier) and in flow context (where a plain
+        // scalar may span lines and fold; the flow terminators `,]}` and
+        // `: ` bound it, handled by scan_plain_line).
+        let is_flow = matches!(stop, PlainStop::FlowKey | PlainStop::FlowValue);
+        let multiline_ok = (matches!(stop, PlainStop::BlockValue | PlainStop::BlockKey)
+            && min_indent.is_some())
+            || is_flow;
         if multiline_ok {
-            let min = min_indent.unwrap();
+            // Block context uses the supplied indent barrier; flow context
+            // is not indentation-bounded, so any indent (>= 0) continues.
+            let min = min_indent.unwrap_or(0);
             loop {
                 // Save the state before attempting a continuation.
                 let line_end = self.pos;
@@ -337,11 +342,11 @@ impl<'a> Lexer<'a> {
                     self.pos = line_end;
                     break;
                 };
-                if cont_indent <= min {
+                if !is_flow && (cont_indent as isize) <= min {
                     self.pos = line_end;
                     break;
                 }
-                if self.line_starts_with_block_indicator_or_key(stop) {
+                if !is_flow && self.line_starts_with_block_indicator_or_key(stop) {
                     self.pos = line_end;
                     break;
                 }
@@ -376,6 +381,7 @@ impl<'a> Lexer<'a> {
             match b {
                 b'\n' | b'\r' => break,
                 b' ' | b'\t' => {
+                    // Find the end of the whole whitespace run once.
                     let mut look = self.pos + 1;
                     while let Some(&c) = bytes.get(look) {
                         if c == b' ' || c == b'\t' {
@@ -387,9 +393,10 @@ impl<'a> Lexer<'a> {
                     match bytes.get(look) {
                         None | Some(b'\n' | b'\r') => break,
                         Some(b'#') => break,
-                        _ => {}
+                        // Interior whitespace: skip the entire run at once
+                        // (it does not advance `last_non_space_end`).
+                        _ => self.pos = look,
                     }
-                    self.pos += 1;
                 }
                 b':' if matches!(stop, PlainStop::BlockKey | PlainStop::BlockValue)
                     && matches!(
@@ -399,7 +406,7 @@ impl<'a> Lexer<'a> {
                 {
                     break;
                 }
-                b':' if matches!(stop, PlainStop::FlowKey)
+                b':' if matches!(stop, PlainStop::FlowKey | PlainStop::FlowValue)
                     && matches!(
                         bytes.get(self.pos + 1),
                         None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']')
@@ -419,6 +426,20 @@ impl<'a> Lexer<'a> {
         last_non_space_end
     }
 
+    /// Consume a single newline (`\r\n`, `\r`, or `\n`) at `pos`.
+    fn consume_newline(&mut self, bytes: &[u8]) {
+        match bytes.get(self.pos) {
+            Some(b'\r') => {
+                self.pos += 1;
+                if bytes.get(self.pos) == Some(&b'\n') {
+                    self.pos += 1;
+                }
+            }
+            Some(b'\n') => self.pos += 1,
+            _ => {}
+        }
+    }
+
     /// Advance past one or more newlines (plus any trailing blank lines)
     /// to position `pos` at the first non-whitespace byte of the next
     /// non-blank line, or at EOF. Returns the indent (column) of that
@@ -430,16 +451,7 @@ impl<'a> Lexer<'a> {
             return None;
         }
         loop {
-            match bytes.get(self.pos) {
-                Some(b'\r') => {
-                    self.pos += 1;
-                    if bytes.get(self.pos) == Some(&b'\n') {
-                        self.pos += 1;
-                    }
-                }
-                Some(b'\n') => self.pos += 1,
-                _ => unreachable!(),
-            }
+            self.consume_newline(bytes);
             // Now at start of a line. Count indent.
             let line_start = self.pos;
             while let Some(b' ' | b'\t') = bytes.get(self.pos).copied() {
@@ -659,15 +671,8 @@ impl<'a> Lexer<'a> {
         loop {
             // Consume the terminator of the previous line.
             match bytes.get(self.pos) {
-                Some(b'\r') => {
-                    self.pos += 1;
-                    if bytes.get(self.pos) == Some(&b'\n') {
-                        self.pos += 1;
-                    }
-                }
-                Some(b'\n') => self.pos += 1,
                 None => break,
-                _ => unreachable!(),
+                _ => self.consume_newline(bytes),
             }
             let line_start = self.pos;
             // Count indent.

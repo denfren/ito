@@ -1,0 +1,19 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/tag/shorthand_str.yml
+---
+STREAM@0..14
+  DOCUMENT@0..13
+    BLOCK_MAPPING@0..13
+      BLOCK_MAPPING_ENTRY@0..13
+        SCALAR@0..3
+          PLAIN_SCALAR@0..3 "key"
+        COLON@3..4 ":"
+        WHITESPACE@4..5 " "
+        NODE_PROPERTIES@5..10
+          TAG@5..10 "!!str"
+        WHITESPACE@10..11 " "
+        SCALAR@11..13
+          PLAIN_SCALAR@11..13 "42"
+  NEWLINE@13..14 "\n"

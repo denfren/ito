@@ -1,0 +1,19 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/key/explicit_key.yml
+---
+STREAM@0..19
+  DOCUMENT@0..18
+    BLOCK_MAPPING@0..18
+      BLOCK_MAPPING_ENTRY@0..18
+        QUESTION@0..1 "?"
+        WHITESPACE@1..2 " "
+        SCALAR@2..10
+          PLAIN_SCALAR@2..10 "explicit"
+        NEWLINE@10..11 "\n"
+        COLON@11..12 ":"
+        WHITESPACE@12..13 " "
+        SCALAR@13..18
+          PLAIN_SCALAR@13..18 "value"
+  NEWLINE@18..19 "\n"

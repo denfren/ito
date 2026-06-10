@@ -1,0 +1,10 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/scalar/plain_multiline_root.yml
+---
+STREAM@0..58
+  DOCUMENT@0..57
+    SCALAR@0..57
+      PLAIN_SCALAR@0..57 "this is a long\nplain scalar that folds\nacross three lines"
+  NEWLINE@57..58 "\n"

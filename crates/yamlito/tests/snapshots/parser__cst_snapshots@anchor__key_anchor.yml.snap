@@ -1,0 +1,27 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/anchor/key_anchor.yml
+---
+STREAM@0..28
+  DOCUMENT@0..27
+    BLOCK_MAPPING@0..27
+      BLOCK_MAPPING_ENTRY@0..13
+        NODE_PROPERTIES@0..2
+          ANCHOR@0..2 "&a"
+        WHITESPACE@2..3 " "
+        SCALAR@3..6
+          PLAIN_SCALAR@3..6 "key"
+        COLON@6..7 ":"
+        WHITESPACE@7..8 " "
+        SCALAR@8..13
+          PLAIN_SCALAR@8..13 "value"
+      NEWLINE@13..14 "\n"
+      BLOCK_MAPPING_ENTRY@14..27
+        SCALAR@14..19
+          PLAIN_SCALAR@14..19 "plain"
+        COLON@19..20 ":"
+        WHITESPACE@20..21 " "
+        SCALAR@21..27
+          PLAIN_SCALAR@21..27 "scalar"
+  NEWLINE@27..28 "\n"

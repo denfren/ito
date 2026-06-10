@@ -1,0 +1,26 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block/indentless_sequence.yml
+---
+STREAM@0..13
+  DOCUMENT@0..12
+    BLOCK_MAPPING@0..12
+      BLOCK_MAPPING_ENTRY@0..12
+        SCALAR@0..3
+          PLAIN_SCALAR@0..3 "key"
+        COLON@3..4 ":"
+        NEWLINE@4..5 "\n"
+        BLOCK_SEQUENCE@5..12
+          BLOCK_SEQUENCE_ENTRY@5..8
+            DASH@5..6 "-"
+            WHITESPACE@6..7 " "
+            SCALAR@7..8
+              PLAIN_SCALAR@7..8 "a"
+          NEWLINE@8..9 "\n"
+          BLOCK_SEQUENCE_ENTRY@9..12
+            DASH@9..10 "-"
+            WHITESPACE@10..11 " "
+            SCALAR@11..12
+              PLAIN_SCALAR@11..12 "b"
+  NEWLINE@12..13 "\n"

@@ -38,8 +38,13 @@ use rowan::NodeOrToken;
 
 use crate::SyntaxTree;
 use crate::builder::Yaml;
-use crate::edit::{GreenElement, TreeEdit, apply_edit, mk_node, mk_token, splice_children_green};
-use crate::syntax::tree_utils::{indent_green_continuations, observed_block_col};
+use crate::edit::collection::{
+    block_insert, block_remove, collapse_block_collection_to_empty, collection_col,
+    entry_child_indices, replace_node_live,
+};
+use crate::edit::{GreenElement, mk_node, mk_token, splice_children_green};
+use crate::quoting::quote_scalar_flow;
+use crate::syntax::tree_utils::indent_green_continuations;
 use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 
 /// Insert `value` into the sequence `seq` at item position `index`
@@ -98,44 +103,9 @@ pub fn remove_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) ->
     }
 }
 
-/// Apply a `ReplaceNode { target, new }` edit on `target` and return the
-/// *live* replacement node afterwards.
-///
-/// `ReplaceNode` splices `new` into `target`'s parent at `target`'s
-/// child index (or makes it the tree root when `target` is parentless),
-/// detaching the old `target` handle. The live node is then the child at
-/// that same index in the (new) parent, or the new tree root. Both
-/// `target` and `new` keep the same `SyntaxKind`.
-fn replace_node_live(tree: &mut SyntaxTree, target: &SyntaxNode, new: rowan::GreenNode) -> SyntaxNode {
-    let parent = target.parent();
-    let idx = target.index();
-    apply_edit(
-        tree,
-        TreeEdit::ReplaceNode {
-            target: target.clone(),
-            new,
-        },
-    );
-    match parent {
-        Some(p) => match p.children_with_tokens().nth(idx) {
-            Some(NodeOrToken::Node(n)) => n,
-            _ => unreachable!("ReplaceNode put a node back at the target's child index"),
-        },
-        None => tree.root().clone(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Block sequences
 // ---------------------------------------------------------------------------
-
-fn item_child_indices(seq: &SyntaxNode, kind: SyntaxKind) -> Vec<usize> {
-    seq.children_with_tokens()
-        .enumerate()
-        .filter(|(_, el)| matches!(el, NodeOrToken::Node(n) if n.kind() == kind))
-        .map(|(i, _)| i)
-        .collect()
-}
 
 fn insert_block_item(
     tree: &mut SyntaxTree,
@@ -143,173 +113,36 @@ fn insert_block_item(
     index: usize,
     value: Yaml,
 ) -> SyntaxNode {
-    let col = sequence_col(seq);
+    let col = collection_col(seq, SyntaxKind::BLOCK_SEQUENCE_ENTRY);
     let item_green = build_block_item_green(value, col);
-
-    let item_indices = item_child_indices(seq, SyntaxKind::BLOCK_SEQUENCE_ENTRY);
-
-    let indent_ws: Vec<GreenElement> = if col > 0 {
-        vec![NodeOrToken::Token(mk_token(
-            SyntaxKind::WHITESPACE,
-            &" ".repeat(col),
-        ))]
-    } else {
-        Vec::new()
-    };
-
-    let (splice_at, fragment): (usize, Vec<GreenElement>) = if index >= item_indices.len() {
-        // Append after the last item: NEWLINE + indent + item.
-        let at = seq.children_with_tokens().count();
-        let mut frag = vec![NodeOrToken::Token(mk_token(SyntaxKind::NEWLINE, "\n"))];
-        frag.extend(indent_ws);
-        frag.push(NodeOrToken::Node(item_green));
-        (at, frag)
-    } else {
-        // Insert before the item at `index`: indent + item + NEWLINE.
-        let at = item_indices[index];
-        let mut frag = indent_ws;
-        frag.push(NodeOrToken::Node(item_green));
-        frag.push(NodeOrToken::Token(mk_token(SyntaxKind::NEWLINE, "\n")));
-        (at, frag)
-    };
-
-    let new_green = splice_children_green(seq, splice_at..splice_at, fragment);
-    replace_node_live(tree, seq, new_green)
+    block_insert(
+        tree,
+        seq,
+        index,
+        SyntaxKind::BLOCK_SEQUENCE_ENTRY,
+        col,
+        item_green,
+    )
 }
 
 fn remove_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) -> SyntaxNode {
-    let children: Vec<_> = seq.children_with_tokens().collect();
-    let item_positions: Vec<usize> = children
-        .iter()
-        .enumerate()
-        .filter(|(_, el)| {
-            matches!(el, NodeOrToken::Node(n) if n.kind() == SyntaxKind::BLOCK_SEQUENCE_ENTRY)
-        })
-        .map(|(i, _)| i)
-        .collect();
-    let Some(&item_idx) = item_positions.get(index) else {
-        return seq.clone();
-    };
-
-    // Removing the only remaining item: a block sequence cannot be empty,
-    // so collapse the whole node to a flow `[]`.
-    if item_positions.len() == 1 {
-        return collapse_block_seq_to_empty(tree, seq);
-    }
-
-    // Widen the removed range to swallow one adjacent NEWLINE separator
-    // (prefer the trailing one; fall back to the leading one for the last
-    // item) plus any leading indent WHITESPACE sibling.
-    let mut start = item_idx;
-    while start > 0 {
-        match &children[start - 1] {
-            NodeOrToken::Token(t) if t.kind() == SyntaxKind::WHITESPACE => start -= 1,
-            _ => break,
-        }
-    }
-    let mut end = item_idx + 1;
-    if matches!(children.get(end), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::NEWLINE) {
-        end += 1;
-    } else if start > 0
-        && matches!(children.get(start - 1), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::NEWLINE)
-    {
-        start -= 1;
-    }
-
-    let new_green = splice_children_green(seq, start..end, Vec::new());
-    replace_node_live(tree, seq, new_green)
-}
-
-/// Replace a now-empty block sequence with a flow `[]`. Because a flow
-/// node has a different `SyntaxKind` than the block one, the swap can't
-/// go through `ReplaceNode` on the sequence itself (kinds must match);
-/// instead we splice on the parent.
-///
-/// When the sequence is a mapping value laid out on its own line
-/// (`key:\n  - a`), the intervening `NEWLINE` (and any indent) between
-/// the `:` and the sequence is replaced with a single space so the
-/// result reads `key: []`. A document-root sequence (no preceding
-/// `COLON`) is replaced in place, yielding bare `[]`.
-fn collapse_block_seq_to_empty(tree: &mut SyntaxTree, seq: &SyntaxNode) -> SyntaxNode {
-    let empty = NodeOrToken::Node(mk_node(
-        SyntaxKind::FLOW_SEQUENCE,
-        [
-            NodeOrToken::Token(mk_token(SyntaxKind::L_BRACKET, "[")),
-            NodeOrToken::Token(mk_token(SyntaxKind::R_BRACKET, "]")),
-        ],
-    ));
-
-    let Some(parent) = seq.parent() else {
-        // Parentless root sequence: swap the tree's whole root for the
-        // emitted `[]` reparsed. Rare; keep it simple and correct.
-        let rebuilt = crate::parse("[]\n").expect("`[]` parses");
-        tree.set_root(rebuilt.root().clone());
-        return tree
-            .root()
-            .descendants()
-            .find(|n| n.kind() == SyntaxKind::FLOW_SEQUENCE)
-            .expect("rebuilt `[]` has a flow sequence");
-    };
-
-    let siblings: Vec<_> = parent.children_with_tokens().collect();
-    let seq_idx = seq.index();
-
-    // Walk back over the trivia (NEWLINE / WHITESPACE) immediately before
-    // the sequence, stopping at the first non-trivia element.
-    let mut start = seq_idx;
-    let mut saw_newline = false;
-    while start > 0 {
-        match &siblings[start - 1] {
-            NodeOrToken::Token(t)
-                if matches!(t.kind(), SyntaxKind::NEWLINE | SyntaxKind::WHITESPACE) =>
-            {
-                if t.kind() == SyntaxKind::NEWLINE {
-                    saw_newline = true;
-                }
-                start -= 1;
-            }
-            _ => break,
-        }
-    }
-
-    // If a COLON precedes the (collapsed) trivia, this is a mapping value
-    // on its own line — bring it back onto the key line with one space.
-    let preceded_by_colon = start > 0
-        && matches!(&siblings[start - 1], NodeOrToken::Token(t) if t.kind() == SyntaxKind::COLON);
-
-    let mut fragment: Vec<GreenElement> = Vec::new();
-    if saw_newline && preceded_by_colon {
-        fragment.push(NodeOrToken::Token(mk_token(SyntaxKind::WHITESPACE, " ")));
-    }
-    fragment.push(empty);
-    // The flow `[]` is the last element of the fragment; after the splice
-    // it lands at child-index `start + (fragment.len() - 1)` in the new
-    // parent (any leading WHITESPACE occupies the slots before it).
-    let flow_child_idx = start + (fragment.len() - 1);
-
-    let new_parent_green = splice_children_green(&parent, start..seq_idx + 1, fragment);
-    let new_parent = replace_node_live(tree, &parent, new_parent_green);
-    match new_parent.children_with_tokens().nth(flow_child_idx) {
-        Some(NodeOrToken::Node(n)) if n.kind() == SyntaxKind::FLOW_SEQUENCE => n,
-        _ => unreachable!("collapsed `[]` flow node sits at the spliced index"),
-    }
-}
-
-/// The column at which `seq`'s dashes are indented. Line-start items own
-/// their leading indent WHITESPACE, so the collection node reports
-/// column 0 via `observed_block_col`; read the indent from the first
-/// item's own leading WHITESPACE, falling back to the observed column.
-fn sequence_col(seq: &SyntaxNode) -> usize {
-    for item in seq.children() {
-        if item.kind() != SyntaxKind::BLOCK_SEQUENCE_ENTRY {
-            continue;
-        }
-        return match item.children_with_tokens().next() {
-            Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE => t.text().len(),
-            _ => observed_block_col(seq),
-        };
-    }
-    observed_block_col(seq)
+    block_remove(
+        tree,
+        seq,
+        index,
+        SyntaxKind::BLOCK_SEQUENCE_ENTRY,
+        // A block sequence cannot be empty, so the last item collapses the
+        // whole node to a flow `[]`.
+        |tree, seq| {
+            collapse_block_collection_to_empty(
+                tree,
+                seq,
+                SyntaxKind::FLOW_SEQUENCE,
+                (SyntaxKind::L_BRACKET, "["),
+                (SyntaxKind::R_BRACKET, "]"),
+            )
+        },
+    )
 }
 
 /// Build the green `BLOCK_SEQUENCE_ENTRY` for `- value`, indented for a
@@ -354,17 +187,18 @@ fn build_flow_item_green(value: Yaml) -> rowan::GreenNode {
 }
 
 /// Render `value` as inline flow text suitable for placing inside `[]`.
-/// Scalars use the builder's canonical scalar form; nested collections
-/// fall back to the builder's block form trimmed of its trailing
-/// newline, which the parser then accepts as a flow item only for
-/// scalars — collections inside flow need flow syntax, so we serialize
-/// them via a one-element flow wrapper round-trip.
+/// Strings are quoted with the strict **flow** policy
+/// ([`quote_scalar_flow`]) so flow terminators (`,` `[` `]` `{` `}`) and
+/// the `: ` mapping indicator can never leak through and corrupt the
+/// surrounding collection (FINDINGS.md B2/B3). Other scalars use the
+/// builder's canonical form. Collections recurse, quoting keys *and*
+/// values the same way.
 fn flow_scalar_text(value: &Yaml) -> String {
-    // For scalars the canonical block string is already a valid inline
-    // token (`true`, `42`, `'a b'`, ...). Collections are serialized as
-    // flow by recursively building a flow string.
     match value {
-        Yaml::Null | Yaml::Bool(_) | Yaml::Int(_) | Yaml::Float(_) | Yaml::Str(_) => {
+        // A string is quoted for flow context directly — `to_yaml_string`
+        // applies only block rules, which do not protect flow terminators.
+        Yaml::Str(s) => quote_scalar_flow(s),
+        Yaml::Null | Yaml::Bool(_) | Yaml::Int(_) | Yaml::Float(_) => {
             value.to_yaml_string().trim_end_matches('\n').to_string()
         }
         Yaml::Seq(items) => {
@@ -374,7 +208,7 @@ fn flow_scalar_text(value: &Yaml) -> String {
         Yaml::Map(pairs) => {
             let inner: Vec<String> = pairs
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, flow_scalar_text(v)))
+                .map(|(k, v)| format!("{}: {}", quote_scalar_flow(k), flow_scalar_text(v)))
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
@@ -531,7 +365,7 @@ fn insert_flow_item(
     value: Yaml,
 ) -> SyntaxNode {
     let item_green = build_flow_item_green(value);
-    let item_indices = item_child_indices(seq, SyntaxKind::FLOW_SEQUENCE_ENTRY);
+    let item_indices = entry_child_indices(seq, SyntaxKind::FLOW_SEQUENCE_ENTRY);
     let sep = flow_separator(seq);
 
     // Locate the closing bracket so an item dropped into an empty `[]`
@@ -955,9 +789,9 @@ mod tests {
     }
 
     // The value-model builder never emits literal (`|`) / folded (`>`)
-    // block scalars — a `Yaml::Str` containing a newline is single-quoted
-    // (see `builder::needs_quoting` / `single_quote`), which is a regular
-    // flow scalar with no significant interior indentation. So the
+    // block scalars — a `Yaml::Str` containing a newline is double-quoted
+    // with `\n` escapes (see `quoting::quote_scalar_block`), which is a
+    // regular flow scalar with no significant interior indentation. So the
     // block-scalar caveat of `indent_green_continuations` cannot be hit
     // through THIS code path; the helper still handles it safely for
     // reuse, and `tree_utils` carries a direct test for that case.
@@ -1410,6 +1244,56 @@ mod tests {
         push_seq_item(&mut tree, &seq, Yaml::Int(2));
         let v = Yaml::from_tree(&tree).unwrap();
         assert_eq!(v, Yaml::Seq(vec![Yaml::Int(1), Yaml::Int(2)]));
+    }
+
+    // ---- flow: hostile scalar values quote correctly (B2/B3) ----
+    //
+    // A string containing a flow terminator (`,` `]` `}`) or the `: `
+    // mapping indicator must be quoted when spliced into a flow sequence,
+    // or it silently corrupts the surrounding collection (data loss) or
+    // panics on reparse.
+
+    /// Push a `Yaml` value into a `[x]` flow seq and assert it reparses
+    /// and decodes back to `[x_value, value]` exactly.
+    fn assert_flow_push_round_trips(value: Yaml) {
+        let mut tree = crate::parse("[x]\n").unwrap();
+        let seq = flow_seq(&tree);
+        push_seq_item(&mut tree, &seq, value.clone());
+        reparse(&tree);
+        let v = Yaml::from_tree(&tree).unwrap();
+        assert_eq!(v, Yaml::Seq(vec![Yaml::Str("x".into()), value]));
+    }
+
+    #[test]
+    fn flow_push_string_with_comma_no_data_loss() {
+        assert_flow_push_round_trips(Yaml::Str("a,b".into()));
+    }
+
+    #[test]
+    fn flow_push_string_with_close_bracket_no_panic() {
+        assert_flow_push_round_trips(Yaml::Str("a]b".into()));
+    }
+
+    #[test]
+    fn flow_push_string_with_close_brace() {
+        assert_flow_push_round_trips(Yaml::Str("a}b".into()));
+    }
+
+    #[test]
+    fn flow_push_string_with_colon_space() {
+        assert_flow_push_round_trips(Yaml::Str("a: b".into()));
+    }
+
+    #[test]
+    fn flow_push_map_with_hostile_key_round_trips() {
+        // Flow-map key `"a: b"` must be quoted (B3): unquoted it reparses
+        // as key `a`, value `b: 1`.
+        assert_flow_push_round_trips(Yaml::Map(vec![("a: b".into(), Yaml::Int(1))]));
+    }
+
+    #[test]
+    fn flow_push_map_with_comma_key_and_value() {
+        assert_flow_push_round_trips(Yaml::Map(vec![("k,1".into(), Yaml::Str("v,2".into()))]));
     }
 
     #[test]

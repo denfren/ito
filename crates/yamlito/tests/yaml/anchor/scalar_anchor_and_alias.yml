@@ -1,0 +1,2 @@
+first: &x 1
+second: *x

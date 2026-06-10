@@ -5,7 +5,6 @@ use rowan::TextSize;
 pub struct ParseError {
     pub offset: TextSize,
     pub message: String,
-    pub expected: Vec<&'static str>,
 }
 
 impl ParseError {
@@ -13,7 +12,6 @@ impl ParseError {
         Self {
             offset,
             message: message.into(),
-            expected: Vec::new(),
         }
     }
 

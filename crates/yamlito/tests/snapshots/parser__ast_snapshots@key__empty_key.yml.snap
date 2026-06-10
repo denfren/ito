@@ -1,0 +1,14 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/key/empty_key.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Null
+        Value
+          Scalar [plain] "value"
+            decoded="value" value=String("value")

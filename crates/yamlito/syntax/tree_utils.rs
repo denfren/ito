@@ -109,31 +109,18 @@ pub(crate) fn indent_of(anchor: &SyntaxNode) -> String {
 /// by walking backward through preceding tokens to find the last NEWLINE.
 /// Recurses up the ancestor chain when the NEWLINE lives in a parent.
 pub(crate) fn observed_block_col(block: &SyntaxNode) -> usize {
-    let start: usize = block.text_range().start().into();
-    let mut col = start;
-    let mut t = block.prev_sibling_or_token();
-    while let Some(el) = t {
-        match &el {
-            NodeOrToken::Token(tok) if tok.kind() == SyntaxKind::NEWLINE => {
-                let nl_end: usize = tok.text_range().end().into();
-                return start.saturating_sub(nl_end);
-            }
-            _ => {}
-        }
-        t = el.prev_sibling_or_token();
-    }
-    if let Some(parent) = block.parent() {
-        let parent_start: usize = parent.text_range().start().into();
-        col = col.saturating_sub(parent_start);
-        return observed_block_col_from_ancestor(&parent, col);
-    }
-    col
+    observed_block_col_with_offset(block, 0)
 }
 
-pub(crate) fn observed_block_col_from_ancestor(
-    node: &SyntaxNode,
-    accumulated_offset: usize,
-) -> usize {
+/// Backward walk shared by the entry and ancestor-recursion cases.
+///
+/// `offset` is added to the inspected node's start before subtracting the
+/// preceding NEWLINE's end. On the initial call it is `0` (so the node's
+/// own absolute start is used). On the first hop into the ancestor chain
+/// the caller folds the original block's intra-parent column into `offset`
+/// (`block_start - parent_start`); further hops carry that same `offset`
+/// unchanged, exactly as the previous two-function form did.
+fn observed_block_col_with_offset(node: &SyntaxNode, offset: usize) -> usize {
     let node_start: usize = node.text_range().start().into();
     let mut t = node.prev_sibling_or_token();
     while let Some(el) = t {
@@ -141,14 +128,25 @@ pub(crate) fn observed_block_col_from_ancestor(
             && tok.kind() == SyntaxKind::NEWLINE
         {
             let nl_end: usize = tok.text_range().end().into();
-            return (node_start + accumulated_offset).saturating_sub(nl_end);
+            return (node_start + offset).saturating_sub(nl_end);
         }
         t = el.prev_sibling_or_token();
     }
     if let Some(parent) = node.parent() {
-        return observed_block_col_from_ancestor(&parent, accumulated_offset);
+        // First ancestor hop folds the block's column within `parent`
+        // into the offset; subsequent hops carry it unchanged.
+        let next_offset = if offset == 0 {
+            let parent_start: usize = parent.text_range().start().into();
+            node_start.saturating_sub(parent_start)
+        } else {
+            offset
+        };
+        return observed_block_col_with_offset(&parent, next_offset);
     }
-    accumulated_offset
+    // No NEWLINE and no parent: the node is the document root (start 0),
+    // so `node_start + offset` reduces to the original `start` (offset 0)
+    // or `offset` (ancestor recursion) — both forms coincide here.
+    node_start + offset
 }
 
 /// Return a copy of `node`'s green subtree with every INTERIOR line (each

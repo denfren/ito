@@ -1,0 +1,21 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/directive/yaml_version.yml
+---
+STREAM@0..25
+  DOCUMENT@0..24
+    DIRECTIVES@0..10
+      DIRECTIVE@0..9 "%YAML 1.2"
+      NEWLINE@9..10 "\n"
+    DIRECTIVES_END@10..13 "---"
+    NEWLINE@13..14 "\n"
+    BLOCK_MAPPING@14..24
+      BLOCK_MAPPING_ENTRY@14..24
+        SCALAR@14..17
+          PLAIN_SCALAR@14..17 "key"
+        COLON@17..18 ":"
+        WHITESPACE@18..19 " "
+        SCALAR@19..24
+          PLAIN_SCALAR@19..24 "value"
+  NEWLINE@24..25 "\n"

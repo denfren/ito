@@ -1,0 +1,15 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::cst_string(&tree)"
+input_file: crates/yamlito/tests/yaml/key/empty_key.yml
+---
+STREAM@0..8
+  DOCUMENT@0..7
+    BLOCK_MAPPING@0..7
+      BLOCK_MAPPING_ENTRY@0..7
+        NULL_SCALAR@0..0
+        COLON@0..1 ":"
+        WHITESPACE@1..2 " "
+        SCALAR@2..7
+          PLAIN_SCALAR@2..7 "value"
+  NEWLINE@7..8 "\n"

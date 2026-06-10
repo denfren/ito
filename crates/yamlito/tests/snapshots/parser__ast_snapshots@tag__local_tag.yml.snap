@@ -1,0 +1,17 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/tag/local_tag.yml
+---
+Stream
+  Document
+    BlockMapping (1 entries)
+      Entry
+        Key
+          Scalar [plain] "value"
+            decoded="value" value=String("value")
+        Value
+          Scalar [plain] "hello"
+            NodeProperties
+              tag Primary("mytag")
+            decoded="hello" value=String("hello")

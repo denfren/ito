@@ -1,0 +1,23 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/anchor/flow_anchor_alias.yml
+---
+Stream
+  Document
+    FlowMapping (2 entries)
+      Entry
+        Key
+          Scalar [plain] "a"
+            decoded="a" value=String("a")
+        Value
+          Scalar [plain] "1"
+            NodeProperties
+              anchor &v
+            decoded="1" value=Int(1)
+      Entry
+        Key
+          Scalar [plain] "b"
+            decoded="b" value=String("b")
+        Value
+          Alias *v

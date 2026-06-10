@@ -1,0 +1,18 @@
+---
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/anchor/seq_entry_key_anchor.yml
+---
+Stream
+  Document
+    BlockSequence (1 entries)
+      BlockMapping (1 entries)
+        Entry
+          Key
+            Scalar [plain] "k"
+              NodeProperties
+                anchor &a
+              decoded="k" value=String("k")
+          Value
+            Scalar [plain] "v"
+              decoded="v" value=String("v")

@@ -19,6 +19,11 @@ pub fn parse(source: &str) -> Result<SyntaxTree, ParseError> {
 /// in an `ERROR` token and closes the tree, so a linter/formatter can
 /// still operate on the well-formed prefix and report the error. The
 /// returned tree always round-trips (`emit() == source`).
+///
+/// Recovery is abandon-on-first-error, so the returned `Vec` holds at
+/// most one error (0 on success, 1 on the first failure). The `Vec`
+/// return type is kept deliberately: it is the stable public shape and
+/// leaves room for multi-error recovery without a signature break.
 pub fn parse_recover(source: &str) -> (SyntaxTree, Vec<ParseError>) {
     let mut p = Parser::new(source);
     let mut errors = Vec::new();
@@ -66,7 +71,6 @@ pub fn parse_recover(source: &str) -> (SyntaxTree, Vec<ParseError>) {
 struct Parser<'a> {
     lex: Lexer<'a>,
     builder: GreenNodeBuilder<'static>,
-    flow_depth: u32,
     /// Count of `start_node` calls not yet matched by `finish_node`.
     /// Used by error recovery to close the tree cleanly on early exit.
     open_nodes: usize,
@@ -88,7 +92,6 @@ impl<'a> Parser<'a> {
         Self {
             lex: Lexer::new(source),
             builder: GreenNodeBuilder::new(),
-            flow_depth: 0,
             open_nodes: 0,
             committed: 0,
         }
@@ -114,10 +117,6 @@ impl<'a> Parser<'a> {
     fn token(&mut self, k: SyntaxKind, text: &str) {
         self.committed += text.len();
         self.builder.token(YamlLang::kind_to_raw(k), text);
-    }
-
-    fn peek(&self) -> Option<LexHint> {
-        self.lex.peek()
     }
 
     /// Emit a zero-width NULL_SCALAR node standing in for an implicit
@@ -245,50 +244,67 @@ impl<'a> Parser<'a> {
         // Loop over documents. Each iteration parses optional directives,
         // an optional `---`, a body (possibly empty), and an optional `...`.
         let mut first = true;
-        let mut need_directives_end = false;
+        // Whether the previous document closed with a `...` end marker. A
+        // `...` marks the end of a document and, per YAML 1.2, a *bare*
+        // (no `---`) document may follow it — `"a\n...\nb\n"` is a valid
+        // two-document stream. Without a preceding `...`, a non-first
+        // document still requires `---`/directives.
+        let mut prev_ended_with_doc_end = false;
         while !self.lex.at_eof() {
-            // Parse directives (only valid before `---` of the next doc).
-            if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::DIRECTIVE))) {
-                self.parse_directives()?;
-                need_directives_end = true;
-            }
+            // Directives (only valid before `---` of the next doc) and the
+            // `---`/`...` markers all live INSIDE the DOCUMENT node, so the
+            // `%YAML`/`...` tokens travel with their document and the
+            // `Document::directives()`/`document_end_token()` accessors —
+            // which search the document's own children — see them.
+            let has_directives =
+                matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::DIRECTIVE)));
 
-            // `---` marker. Required when directives were present, or when
-            // this is not the first document (unless the previous ended
-            // with `...` already — then it's still required).
-            let at_dashes = self.at_document_start_marker();
-            if at_dashes {
-                self.start(SyntaxKind::DOCUMENT);
-                self.bump_directives_end();
-                self.eat_trivia();
-                self.parse_document_body_if_any()?;
-                self.finish(); // DOCUMENT
-                need_directives_end = false;
-            } else if need_directives_end {
-                return Err(self.err_here("expected '---' after directives"));
-            } else if !first {
-                // No `---` and not first — must be EOF or trailing trivia.
-                // Any other content here would be silently discarded; that
-                // mangles round-tripping (e.g. ansible-vault bodies whose
-                // header parses as a bare plain scalar).
+            if !has_directives
+                && !self.at_document_start_marker()
+                && !first
+                && !prev_ended_with_doc_end
+            {
+                // No directives, no `---`, not the first document, and the
+                // previous document was not closed by `...` — must be EOF or
+                // trailing trivia. Any other content here would be silently
+                // discarded; that mangles round-tripping (e.g. ansible-vault
+                // bodies whose header parses as a bare plain scalar).
                 return Err(
                     self.err_here("unexpected content after document; expected '---' or '...'")
                 );
-            } else {
-                // First doc, bare (no `---`).
-                self.start(SyntaxKind::DOCUMENT);
-                self.parse_document_body_if_any()?;
-                self.finish(); // DOCUMENT
             }
 
-            // Optional `...` end marker.
-            self.eat_trivia();
-            if self.at_document_end_marker() {
-                self.bump_document_end();
+            self.start(SyntaxKind::DOCUMENT);
+
+            if has_directives {
+                self.parse_directives()?;
+                // `---` is required after directives.
+                if !self.at_document_start_marker() {
+                    return Err(self.err_here("expected '---' after directives"));
+                }
+            }
+
+            if self.at_document_start_marker() {
+                self.bump_directives_end();
                 self.eat_trivia();
             }
+            self.parse_document_body_if_any()?;
+
+            // Optional `...` end marker, inside the document. Only absorb
+            // the inter-trivia into the document when a `...` actually
+            // follows; otherwise the trailing trivia is document-trailing
+            // and belongs at the STREAM level (consumed after `finish`).
+            let ends_with_doc_end = self.document_end_marker_follows_trivia();
+            if ends_with_doc_end {
+                self.eat_trivia();
+                self.bump_document_end();
+            }
+
+            self.finish(); // DOCUMENT
+            self.eat_trivia();
 
             first = false;
+            prev_ended_with_doc_end = ends_with_doc_end;
         }
 
         self.finish();
@@ -297,7 +313,7 @@ impl<'a> Parser<'a> {
 
     fn parse_directives(&mut self) -> Result<(), ParseError> {
         self.start(SyntaxKind::DIRECTIVES);
-        while matches!(self.peek(), Some(LexHint::Token(SyntaxKind::DIRECTIVE))) {
+        while matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::DIRECTIVE))) {
             self.bump_simple();
             self.eat_trivia();
         }
@@ -315,7 +331,12 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         let indent = self.lex.column();
-        self.parse_block_node(indent, indent)?;
+        // At the document root the plain-scalar continuation barrier is −1
+        // (document-level indent per YAML 1.2 §7.3.3), so a column-0 line
+        // folds into a root plain scalar (`"a\nb\n"` → one scalar "a b").
+        // A following `key:` line is still NOT folded: the continuation
+        // gate rejects lines that look like a mapping key.
+        self.parse_block_node(indent, -1)?;
         Ok(())
     }
 
@@ -325,6 +346,46 @@ impl<'a> Parser<'a> {
 
     fn at_document_end_marker(&self) -> bool {
         self.at_line_start_marker(b"...")
+    }
+
+    /// Reversible lookahead: after skipping trivia (whitespace, newlines,
+    /// comments) from the current position, is there a `...` document-end
+    /// marker at column 0? Does not advance the lexer or commit tokens.
+    fn document_end_marker_follows_trivia(&self) -> bool {
+        let bytes = self.lex.source().as_bytes();
+        let mut i = self.lex.pos();
+        let mut col = self.lex.column();
+        loop {
+            match bytes.get(i) {
+                Some(b' ' | b'\t') => {
+                    i += 1;
+                    col += 1;
+                }
+                Some(b'\n') => {
+                    i += 1;
+                    col = 0;
+                }
+                Some(b'\r') => {
+                    i += 1;
+                    if bytes.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                    col = 0;
+                }
+                Some(b'#') => {
+                    while let Some(&c) = bytes.get(i) {
+                        if c == b'\n' || c == b'\r' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        col == 0
+            && bytes.get(i..i + 3) == Some(b"...")
+            && matches!(bytes.get(i + 3), None | Some(b' ' | b'\t' | b'\n' | b'\r'))
     }
 
     fn at_line_start_marker(&self, needle: &[u8]) -> bool {
@@ -366,12 +427,24 @@ impl<'a> Parser<'a> {
     fn parse_block_node(
         &mut self,
         indent: usize,
-        scalar_min_indent: usize,
+        scalar_min_indent: isize,
     ) -> Result<(), ParseError> {
         self.reject_tab_indent_at_line_start()?;
         // Node properties (anchor/alias/tag) may precede any block node.
         // If the property group is an alias, it IS the node — return.
-        if self.at_node_property_start() {
+        //
+        // Capture a checkpoint *before* the properties. When the node that
+        // follows on the SAME line turns out to be a block mapping key
+        // (`&a k: v`), the properties belong to the KEY scalar — YAML 1.2
+        // and libyaml/serde_yaml attach them to the key, not the mapping.
+        // Promoting BLOCK_MAPPING/BLOCK_MAPPING_ENTRY from this checkpoint
+        // pulls the NODE_PROPERTIES inside the entry, as a preceding
+        // sibling of the key scalar (where `Scalar::properties()` finds
+        // them). For a lone scalar the checkpoint is unused: properties
+        // stay a preceding sibling of the SCALAR, unchanged.
+        let props_cp = self.builder.checkpoint();
+        let had_props = self.at_node_property_start();
+        if had_props {
             let was_alias = self.parse_node_properties_with_alias_check()?;
             if was_alias {
                 return Ok(());
@@ -395,6 +468,10 @@ impl<'a> Parser<'a> {
                 return Ok(());
             }
         }
+        // When properties precede a same-line mapping key, the entry must
+        // wrap them; pass the pre-properties checkpoint so the mapping/
+        // entry promotion encloses the NODE_PROPERTIES.
+        let entry_cp = if had_props { Some(props_cp) } else { None };
         // Peek past a leading WHITESPACE (the first entry's indent left by
         // eat_trivia_except_entry_indent) to determine what to dispatch on.
         // For collection/mapping cases the WHITESPACE will be consumed inside
@@ -414,7 +491,7 @@ impl<'a> Parser<'a> {
             }
             Some(LexHint::Token(SyntaxKind::DASH)) => self.parse_block_sequence(indent),
             Some(LexHint::Token(SyntaxKind::QUESTION)) => {
-                self.parse_block_mapping_or_scalar_ext(indent, scalar_min_indent)
+                self.parse_block_mapping_or_scalar_ext(indent, scalar_min_indent, entry_cp)
             }
             Some(LexHint::Token(SyntaxKind::LITERAL_SCALAR | SyntaxKind::FOLDED_SCALAR)) => {
                 self.eat_leading_whitespace();
@@ -423,15 +500,44 @@ impl<'a> Parser<'a> {
             Some(LexHint::Token(SyntaxKind::SINGLE_QUOTED_SCALAR))
             | Some(LexHint::Token(SyntaxKind::DOUBLE_QUOTED_SCALAR))
             | Some(LexHint::PlainStart) => {
-                self.parse_block_mapping_or_scalar_ext(indent, scalar_min_indent)
+                self.parse_block_mapping_or_scalar_ext(indent, scalar_min_indent, entry_cp)
+            }
+            // Block-scope empty key: `: value`. The mapping's first entry
+            // has an implicit (null) key; emit a zero-width NULL_SCALAR key
+            // so the index-based key()/value() accessors line up — the same
+            // invariant the flow (`{: v}`) and explicit (`? \n: v`) empty-key
+            // paths already maintain.
+            Some(LexHint::Token(SyntaxKind::COLON)) => {
+                self.parse_block_mapping_empty_first_key(indent, entry_cp)
             }
             Some(LexHint::Token(k)) => Err(self.err_here(format!("unexpected token {k:?}"))),
         }
     }
 
+    /// Parse a block mapping whose first entry has an empty (implicit null)
+    /// key — the line begins with `:` (`: value`). Positioned at the
+    /// leading indent WHITESPACE or the COLON.
+    fn parse_block_mapping_empty_first_key(
+        &mut self,
+        indent: usize,
+        props_cp: Option<rowan::Checkpoint>,
+    ) -> Result<(), ParseError> {
+        let cp = props_cp.unwrap_or_else(|| self.builder.checkpoint());
+        // Emit any leading entry-indent WHITESPACE inside the checkpoint so
+        // it lands inside BLOCK_MAPPING_ENTRY after checkpoint promotion.
+        self.eat_leading_whitespace();
+        self.start_at(cp, SyntaxKind::BLOCK_MAPPING);
+        self.start_at(cp, SyntaxKind::BLOCK_MAPPING_ENTRY);
+        self.emit_null(); // implicit empty key
+        self.finish_keyed_mapping_entry(indent)?;
+        self.parse_block_mapping_tail(indent)?;
+        self.finish(); // BLOCK_MAPPING
+        Ok(())
+    }
+
     fn at_node_property_start(&self) -> bool {
         matches!(
-            self.peek(),
+            self.lex.peek(),
             Some(LexHint::Token(
                 SyntaxKind::ANCHOR | SyntaxKind::ALIAS | SyntaxKind::TAG
             ))
@@ -440,7 +546,7 @@ impl<'a> Parser<'a> {
 
     fn at_line_end_or_eof(&self) -> bool {
         matches!(
-            self.peek(),
+            self.lex.peek(),
             None | Some(LexHint::Token(SyntaxKind::NEWLINE | SyntaxKind::COMMENT))
         )
     }
@@ -451,7 +557,7 @@ impl<'a> Parser<'a> {
     /// anchors/tags only (caller should continue into node dispatch).
     fn parse_node_properties_with_alias_check(&mut self) -> Result<bool, ParseError> {
         // Bare alias: emit ALIAS_NODE and return.
-        if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::ALIAS))) {
+        if matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::ALIAS))) {
             self.start(SyntaxKind::ALIAS_NODE);
             self.consume_alias()?;
             self.finish();
@@ -459,7 +565,7 @@ impl<'a> Parser<'a> {
         }
         self.start(SyntaxKind::NODE_PROPERTIES);
         loop {
-            match self.peek() {
+            match self.lex.peek() {
                 Some(LexHint::Token(SyntaxKind::ANCHOR)) => self.consume_anchor()?,
                 Some(LexHint::Token(SyntaxKind::TAG)) => self.consume_tag()?,
                 Some(LexHint::Token(SyntaxKind::ALIAS)) => {
@@ -470,7 +576,7 @@ impl<'a> Parser<'a> {
             // If whitespace is next AND another property follows, consume
             // the whitespace inside NODE_PROPERTIES and keep looping.
             // Otherwise stop — the whitespace belongs outside.
-            if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::WHITESPACE)))
+            if matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::WHITESPACE)))
                 && self.next_non_ws_byte_is_property_sigil()
             {
                 self.bump_simple();
@@ -499,26 +605,16 @@ impl<'a> Parser<'a> {
 
     fn consume_anchor(&mut self) -> Result<(), ParseError> {
         match self.lex.bump_anchor() {
-            Ok(t) => {
-                self.token(SyntaxKind::ANCHOR, t);
-                Ok(())
-            }
-            Err(LexError::EmptyAnchorName { start }) => {
-                Err(self.err_at(start, "anchor name cannot be empty"))
-            }
+            Ok(t) => { self.token(SyntaxKind::ANCHOR, t); Ok(()) }
+            Err(LexError::EmptyAnchorName { start }) => Err(self.err_at(start, "anchor name cannot be empty")),
             Err(_) => unreachable!(),
         }
     }
 
     fn consume_alias(&mut self) -> Result<(), ParseError> {
         match self.lex.bump_alias() {
-            Ok(t) => {
-                self.token(SyntaxKind::ALIAS, t);
-                Ok(())
-            }
-            Err(LexError::EmptyAliasName { start }) => {
-                Err(self.err_at(start, "alias name cannot be empty"))
-            }
+            Ok(t) => { self.token(SyntaxKind::ALIAS, t); Ok(()) }
+            Err(LexError::EmptyAliasName { start }) => Err(self.err_at(start, "alias name cannot be empty")),
             Err(_) => unreachable!(),
         }
     }
@@ -545,7 +641,8 @@ impl<'a> Parser<'a> {
     fn parse_block_mapping_or_scalar_ext(
         &mut self,
         indent: usize,
-        scalar_min_indent: usize,
+        scalar_min_indent: isize,
+        props_cp: Option<rowan::Checkpoint>,
     ) -> Result<(), ParseError> {
         // Explicit-key form: `? key` at this indent introduces a block
         // mapping whose first entry uses the explicit syntax.
@@ -563,7 +660,11 @@ impl<'a> Parser<'a> {
             self.finish();
             return Ok(());
         }
-        let cp = self.builder.checkpoint();
+        // When node properties precede a same-line mapping key, promote the
+        // mapping/entry from *before* those properties (props_cp) so the
+        // NODE_PROPERTIES land inside the entry and decorate the key scalar
+        // (D4). Otherwise promote from here.
+        let cp = props_cp.unwrap_or_else(|| self.builder.checkpoint());
         // Emit any leading entry-indent WHITESPACE inside the checkpoint so
         // it lands inside BLOCK_MAPPING_ENTRY after checkpoint promotion.
         self.eat_leading_whitespace();
@@ -576,15 +677,13 @@ impl<'a> Parser<'a> {
         self.lex.set_pos(save);
 
         if is_mapping {
-            // Commit scalar as a single-line key.
+            // Commit scalar as a single-line key, then promote the span
+            // since `cp` into BLOCK_MAPPING + BLOCK_MAPPING_ENTRY (so any
+            // leading WHITESPACE / NODE_PROPERTIES land inside the entry).
             self.commit_scalar(kind_and_span);
-            self.eat_inline_trivia();
-            // Promote into BLOCK_MAPPING + BLOCK_MAPPING_ENTRY.
             self.start_at(cp, SyntaxKind::BLOCK_MAPPING);
             self.start_at(cp, SyntaxKind::BLOCK_MAPPING_ENTRY);
-            self.finish_block_mapping_entry_body(indent)?;
-            self.eat_inline_trivia();
-            self.finish(); // BLOCK_MAPPING_ENTRY
+            self.finish_keyed_mapping_entry(indent)?;
             self.parse_block_mapping_tail(indent)?;
             self.finish(); // BLOCK_MAPPING
             Ok(())
@@ -611,12 +710,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Scan the first line of a scalar without committing to the builder.
-    /// Returns the token kind and the ending position.
+    /// Returns the token kind and the *start* position where scanning
+    /// began (the lexer is left advanced past the token text, so the end
+    /// is `self.lex.pos()`); `commit_scalar` slices `[start..pos]`.
     fn scan_scalar_first_line(
         &mut self,
         stop: PlainStop,
     ) -> Result<(ScalarTokenKind, usize), ParseError> {
-        match self.peek() {
+        match self.lex.peek() {
             Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
             )) => {
@@ -713,6 +814,21 @@ impl<'a> Parser<'a> {
         self.lex.set_pos(i);
     }
 
+    /// Complete an open BLOCK_MAPPING_ENTRY whose key SCALAR has just been
+    /// committed: skip inline trivia, require the `:` indicator, parse the
+    /// value via `finish_block_mapping_entry_body`, then close the entry.
+    /// Shared by the first-entry promotion path and the tail loop.
+    fn finish_keyed_mapping_entry(&mut self, indent: usize) -> Result<(), ParseError> {
+        self.eat_inline_trivia();
+        if !self.lex.is_block_colon_indicator() {
+            return Err(self.err_here("expected ':' after mapping key"));
+        }
+        self.finish_block_mapping_entry_body(indent)?;
+        self.eat_inline_trivia();
+        self.finish(); // BLOCK_MAPPING_ENTRY
+        Ok(())
+    }
+
     /// At this point the mapping entry is open (BLOCK_MAPPING_ENTRY
     /// started via start_node_at). The key SCALAR is inside it, followed
     /// by any inline trivia. We're now positioned at the COLON.
@@ -732,7 +848,7 @@ impl<'a> Parser<'a> {
             self.eat_inline_trivia();
         }
 
-        match self.peek() {
+        match self.lex.peek() {
             None => {
                 self.emit_null(); // empty value at EOF
                 Ok(())
@@ -747,7 +863,7 @@ impl<'a> Parser<'a> {
                         // Parent is the mapping at `indent`; plain-scalar
                         // continuation lines are bounded by that indent,
                         // not by the value's starting column `col`.
-                        self.parse_block_node(col, indent)?;
+                        self.parse_block_node(col, indent as isize)?;
                         Ok(())
                     }
                     Some(col) if col == indent && self.peek_past_trivia_is_dash() => {
@@ -775,7 +891,7 @@ impl<'a> Parser<'a> {
             Some(LexHint::PlainStart)
             | Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
-            )) => self.parse_scalar_as_node(PlainStop::BlockValue, Some(indent)),
+            )) => self.parse_scalar_as_node(PlainStop::BlockValue, Some(indent as isize)),
             Some(LexHint::Token(SyntaxKind::LITERAL_SCALAR | SyntaxKind::FOLDED_SCALAR)) => {
                 self.parse_block_scalar(indent)
             }
@@ -793,15 +909,20 @@ impl<'a> Parser<'a> {
         self.bump_simple();
         self.eat_inline_trivia();
         // Key: single-line scalar, or newline-then-indented block, or empty.
-        match self.peek() {
-            None => {}
+        // An empty key emits a zero-width NULL_SCALAR stand-in so the
+        // index-based key()/value() accessors line up (the key is always
+        // the first Node child of the entry).
+        match self.lex.peek() {
+            None => self.emit_null(),
             Some(LexHint::Token(SyntaxKind::NEWLINE)) => {
                 // Empty key on this line; look for nested block key.
                 if let Some(col) = self.column_past_trivia()
                     && col > indent
                 {
                     self.eat_trivia();
-                    self.parse_block_node(col, col)?;
+                    self.parse_block_node(col, col as isize)?;
+                } else {
+                    self.emit_null();
                 }
             }
             Some(LexHint::PlainStart)
@@ -816,7 +937,7 @@ impl<'a> Parser<'a> {
                 // Nested explicit-key mapping as the key (`? ? nested ...`).
                 // Recurse as a block node at this column.
                 let col = self.lex.column();
-                self.parse_block_node(col, col)?;
+                self.parse_block_node(col, col as isize)?;
             }
             Some(LexHint::Token(k)) => {
                 return Err(self.err_here(format!("unexpected token {k:?} after '?'")));
@@ -826,7 +947,7 @@ impl<'a> Parser<'a> {
         self.eat_trivia();
         if !self.lex.at_eof() {
             let col = self.lex.column();
-            if col == indent && matches!(self.peek(), Some(LexHint::Token(SyntaxKind::COLON))) {
+            if col == indent && matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::COLON))) {
                 self.finish_block_mapping_entry_body(indent)?;
             }
             // If no matching `:`, it's a key-only entry (empty value).
@@ -904,13 +1025,7 @@ impl<'a> Parser<'a> {
             // Consume leading indent whitespace inside the entry.
             self.eat_leading_whitespace();
             self.parse_scalar_as_node(PlainStop::BlockKey, None)?;
-            self.eat_inline_trivia();
-            if !self.lex.is_block_colon_indicator() {
-                return Err(self.err_here("expected ':' after mapping key"));
-            }
-            self.finish_block_mapping_entry_body(indent)?;
-            self.eat_inline_trivia();
-            self.finish(); // BLOCK_MAPPING_ENTRY
+            self.finish_keyed_mapping_entry(indent)?;
         }
         Ok(())
     }
@@ -931,12 +1046,12 @@ impl<'a> Parser<'a> {
     // handing the lexer parser context it deliberately lacks, so they stay
     // here, close to the indentation logic that consumes them.
 
-    /// Return the column of the next non-trivia token, without advancing
-    /// the lexer. Returns `None` at EOF.
-    fn column_past_trivia(&self) -> Option<usize> {
-        let bytes = self.lex.source().as_bytes();
-        let mut i = self.lex.pos();
-        let mut col = self.lex.column();
+    /// Skip a trivia run (whitespace, newlines, comments) in `bytes`
+    /// starting at byte index `i`, tracking column in `col`. Returns the
+    /// `(index, column)` of the first non-trivia byte, or `None` at EOF.
+    /// The two callers below differ only in whether they need the column,
+    /// so this folds the shared `#`-to-EOL and CRLF byte loops in one place.
+    fn skip_trivia_bytes(bytes: &[u8], mut i: usize, mut col: usize) -> Option<(usize, usize)> {
         while let Some(&b) = bytes.get(i) {
             match b {
                 b' ' | b'\t' => {
@@ -955,44 +1070,37 @@ impl<'a> Parser<'a> {
                     col = 0;
                 }
                 b'#' => {
-                    // comment to end of line
+                    // comment to end of line; let the outer loop handle the newline
                     while let Some(&c) = bytes.get(i) {
                         if c == b'\n' || c == b'\r' {
                             break;
                         }
                         i += 1;
                     }
-                    // let outer loop handle the newline
                 }
-                _ => return Some(col),
+                _ => return Some((i, col)),
             }
         }
         None
+    }
+
+    /// Return the column of the next non-trivia token, without advancing
+    /// the lexer. Returns `None` at EOF.
+    fn column_past_trivia(&self) -> Option<usize> {
+        let bytes = self.lex.source().as_bytes();
+        Self::skip_trivia_bytes(bytes, self.lex.pos(), self.lex.column()).map(|(_, col)| col)
     }
 
     /// True iff, after skipping trivia, the next byte is a DASH acting
     /// as a block-sequence indicator.
     fn peek_past_trivia_is_dash(&self) -> bool {
         let bytes = self.lex.source().as_bytes();
-        let mut i = self.lex.pos();
-        while let Some(&b) = bytes.get(i) {
-            match b {
-                b' ' | b'\t' | b'\n' | b'\r' => i += 1,
-                b'#' => {
-                    while let Some(&c) = bytes.get(i) {
-                        if c == b'\n' || c == b'\r' {
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
-                b'-' => {
-                    return matches!(bytes.get(i + 1), None | Some(b' ' | b'\t' | b'\n' | b'\r'));
-                }
-                _ => return false,
+        match Self::skip_trivia_bytes(bytes, self.lex.pos(), 0) {
+            Some((i, _)) if bytes.get(i) == Some(&b'-') => {
+                matches!(bytes.get(i + 1), None | Some(b' ' | b'\t' | b'\n' | b'\r'))
             }
+            _ => false,
         }
-        false
     }
 
     fn parse_block_sequence(&mut self, indent: usize) -> Result<(), ParseError> {
@@ -1033,7 +1141,7 @@ impl<'a> Parser<'a> {
             // After eat_trivia_except_entry_indent() we may be at a leading WHITESPACE
             // token before the DASH (indent ws is now inside the entry).
             // Peek past any whitespace to confirm we have a DASH.
-            let at_dash = match self.peek() {
+            let at_dash = match self.lex.peek() {
                 Some(LexHint::Token(SyntaxKind::DASH)) => true,
                 Some(LexHint::Token(SyntaxKind::WHITESPACE)) => {
                     matches!(
@@ -1068,7 +1176,13 @@ impl<'a> Parser<'a> {
         // Inline trivia after the dash (usually a single space).
         self.eat_inline_trivia();
 
-        // Node properties on the entry's value.
+        // Node properties on the entry's value. Checkpoint *before* them so
+        // that if the value turns out to be a same-line mapping key
+        // (`- &a k: v`), the inner mapping/entry promotion can enclose the
+        // NODE_PROPERTIES and attach them to the key scalar — consistent
+        // with the bare-mapping `&a k: v` D4 behavior.
+        let props_cp = self.builder.checkpoint();
+        let mut entry_cp = None;
         if self.at_node_property_start() {
             let was_alias = self.parse_node_properties_with_alias_check()?;
             if was_alias {
@@ -1077,9 +1191,10 @@ impl<'a> Parser<'a> {
                 return Ok(());
             }
             self.eat_inline_trivia();
+            entry_cp = Some(props_cp);
         }
 
-        match self.peek() {
+        match self.lex.peek() {
             None => {
                 // `-` at EOF is an empty entry.
                 self.emit_null();
@@ -1093,7 +1208,7 @@ impl<'a> Parser<'a> {
                 match next_col {
                     Some(col) if col > indent => {
                         self.eat_trivia_except_entry_indent();
-                        self.parse_block_node(col, col)?;
+                        self.parse_block_node(col, col as isize)?;
                     }
                     _ => self.emit_null(), // empty entry, trivia stays for the sequence
                 }
@@ -1119,7 +1234,7 @@ impl<'a> Parser<'a> {
                 // multi-line continuation is bounded by the dash column
                 // (`indent`), not the key-column of the content.
                 let child_indent = self.lex.column();
-                self.parse_block_mapping_or_scalar_ext(child_indent, indent)?;
+                self.parse_block_mapping_or_scalar_ext(child_indent, indent as isize, entry_cp)?;
             }
             Some(LexHint::Token(k)) => {
                 return Err(self.err_here(format!("unexpected token {k:?} in sequence entry")));
@@ -1170,10 +1285,10 @@ impl<'a> Parser<'a> {
     fn parse_scalar_as_node(
         &mut self,
         stop: PlainStop,
-        min_indent: Option<usize>,
+        min_indent: Option<isize>,
     ) -> Result<(), ParseError> {
         self.start(SyntaxKind::SCALAR);
-        match self.peek() {
+        match self.lex.peek() {
             Some(LexHint::Token(SyntaxKind::SINGLE_QUOTED_SCALAR))
             | Some(LexHint::Token(SyntaxKind::DOUBLE_QUOTED_SCALAR)) => {
                 self.bump_quoted()?;
@@ -1193,82 +1308,62 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_flow_mapping(&mut self) -> Result<(), ParseError> {
-        self.start(SyntaxKind::FLOW_MAPPING);
-        // L_BRACE
-        self.bump_simple();
-        self.flow_depth += 1;
-        self.eat_trivia();
-
-        if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::R_BRACE))) {
-            self.bump_simple();
-            self.flow_depth -= 1;
-            self.finish();
-            return Ok(());
-        }
-
-        loop {
-            self.parse_flow_mapping_entry()?;
-            self.eat_trivia();
-            match self.peek() {
-                Some(LexHint::Token(SyntaxKind::COMMA)) => {
-                    self.bump_simple();
-                    self.eat_trivia();
-                    if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::R_BRACE))) {
-                        break; // trailing comma
-                    }
-                }
-                Some(LexHint::Token(SyntaxKind::R_BRACE)) => break,
-                None => return Err(self.err_here("expected '}' in flow mapping")),
-                _ => return Err(self.err_here("expected ',' or '}' in flow mapping")),
-            }
-        }
-
-        self.eat_trivia();
-        if !matches!(self.peek(), Some(LexHint::Token(SyntaxKind::R_BRACE))) {
-            return Err(self.err_here("expected '}' in flow mapping"));
-        }
-        self.bump_simple();
-        self.flow_depth -= 1;
-        self.finish();
-        Ok(())
+        self.parse_flow_collection(
+            SyntaxKind::FLOW_MAPPING,
+            SyntaxKind::R_BRACE,
+            "}",
+            Self::parse_flow_mapping_entry,
+        )
     }
 
     fn parse_flow_sequence(&mut self) -> Result<(), ParseError> {
-        self.start(SyntaxKind::FLOW_SEQUENCE);
-        self.bump_simple();
-        self.flow_depth += 1;
+        self.parse_flow_collection(
+            SyntaxKind::FLOW_SEQUENCE,
+            SyntaxKind::R_BRACKET,
+            "]",
+            Self::parse_flow_sequence_entry,
+        )
+    }
+
+    fn parse_flow_collection(
+        &mut self,
+        container: SyntaxKind,
+        close: SyntaxKind,
+        close_ch: &str,
+        parse_entry: fn(&mut Self) -> Result<(), ParseError>,
+    ) -> Result<(), ParseError> {
+        self.start(container);
+        self.bump_simple(); // opening delimiter
         self.eat_trivia();
 
-        if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::R_BRACKET))) {
+        if matches!(self.lex.peek(), Some(LexHint::Token(k)) if k == close) {
             self.bump_simple();
-            self.flow_depth -= 1;
             self.finish();
             return Ok(());
         }
 
         loop {
-            self.parse_flow_sequence_entry()?;
+            parse_entry(self)?;
             self.eat_trivia();
-            match self.peek() {
+            match self.lex.peek() {
                 Some(LexHint::Token(SyntaxKind::COMMA)) => {
                     self.bump_simple();
                     self.eat_trivia();
-                    if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::R_BRACKET))) {
+                    if matches!(self.lex.peek(), Some(LexHint::Token(k)) if k == close) {
                         break; // trailing comma
                     }
                 }
-                Some(LexHint::Token(SyntaxKind::R_BRACKET)) => break,
-                None => return Err(self.err_here("expected ']' in flow sequence")),
-                _ => return Err(self.err_here("expected ',' or ']' in flow sequence")),
+                Some(LexHint::Token(k)) if k == close => break,
+                None => return Err(self.err_here(format!("expected '{close_ch}' in flow collection"))),
+                _ => return Err(self.err_here(format!("expected ',' or '{close_ch}' in flow collection"))),
             }
         }
 
         self.eat_trivia();
-        if !matches!(self.peek(), Some(LexHint::Token(SyntaxKind::R_BRACKET))) {
-            return Err(self.err_here("expected ']' in flow sequence"));
+        if !matches!(self.lex.peek(), Some(LexHint::Token(k)) if k == close) {
+            return Err(self.err_here(format!("expected '{close_ch}' in flow collection")));
         }
         self.bump_simple();
-        self.flow_depth -= 1;
         self.finish();
         Ok(())
     }
@@ -1299,7 +1394,7 @@ impl<'a> Parser<'a> {
             self.eat_trivia();
         }
 
-        match self.peek() {
+        match self.lex.peek() {
             Some(LexHint::Token(SyntaxKind::L_BRACE)) => {
                 self.parse_flow_mapping()?;
             }
@@ -1312,21 +1407,8 @@ impl<'a> Parser<'a> {
             )) => {
                 // Checkpoint so we can retroactively wrap as
                 // FLOW_MAPPING_ENTRY if we see a flow-colon indicator.
-                let quoted = matches!(
-                    self.peek(),
-                    Some(LexHint::Token(
-                        SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR
-                    ))
-                );
                 let cp = self.builder.checkpoint();
-                self.parse_scalar_as_node(PlainStop::FlowKey, None)?;
-                self.eat_trivia();
-                let has_colon = if quoted {
-                    self.lex.is_flow_colon_indicator_after_quoted()
-                } else {
-                    self.lex.is_flow_colon_indicator()
-                };
-                if has_colon {
+                if self.parse_flow_scalar_then_colon()? {
                     self.start_at(cp, SyntaxKind::FLOW_MAPPING_ENTRY);
                     self.finish_flow_entry_after_key()?;
                     self.eat_inline_trivia();
@@ -1347,7 +1429,7 @@ impl<'a> Parser<'a> {
     /// marker has already been opened. Handles key-only entries (`{a}`).
     fn parse_flow_entry_body(&mut self) -> Result<(), ParseError> {
         // Optional explicit-key indicator in flow: `{? key: value}`.
-        if matches!(self.peek(), Some(LexHint::Token(SyntaxKind::QUESTION))) {
+        if matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::QUESTION))) {
             self.bump_simple();
             self.eat_trivia();
         }
@@ -1361,38 +1443,64 @@ impl<'a> Parser<'a> {
             }
             self.eat_trivia();
         }
-        let mut quoted_key = false;
-        match self.peek() {
-            Some(LexHint::Token(SyntaxKind::L_BRACE)) => self.parse_flow_mapping()?,
-            Some(LexHint::Token(SyntaxKind::L_BRACKET)) => self.parse_flow_sequence()?,
+        match self.lex.peek() {
+            Some(LexHint::Token(SyntaxKind::L_BRACE)) => {
+                self.parse_flow_mapping()?;
+                self.eat_trivia();
+                if self.lex.is_flow_colon_indicator() {
+                    self.finish_flow_entry_after_key()?;
+                }
+            }
+            Some(LexHint::Token(SyntaxKind::L_BRACKET)) => {
+                self.parse_flow_sequence()?;
+                self.eat_trivia();
+                if self.lex.is_flow_colon_indicator() {
+                    self.finish_flow_entry_after_key()?;
+                }
+            }
             Some(LexHint::PlainStart)
             | Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
             )) => {
-                quoted_key = matches!(
-                    self.peek(),
-                    Some(LexHint::Token(
-                        SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR
-                    ))
-                );
-                self.parse_scalar_as_node(PlainStop::FlowKey, None)?;
+                if self.parse_flow_scalar_then_colon()? {
+                    self.finish_flow_entry_after_key()?;
+                }
             }
             // Empty key (key-only from properties); fall through to value.
+            // Emit a NULL_SCALAR stand-in so index-based key()/value()
+            // accessors line up (the empty key is the first Node child).
             Some(LexHint::Token(SyntaxKind::COLON | SyntaxKind::COMMA | SyntaxKind::R_BRACE))
-            | None => {}
+            | None => {
+                self.emit_null();
+                self.eat_trivia();
+                if self.lex.is_flow_colon_indicator() {
+                    self.finish_flow_entry_after_key()?;
+                }
+            }
             _ => return Err(self.err_here("expected flow mapping key")),
         }
+        Ok(())
+    }
 
+    /// Parse a flow scalar at key position (`parse_scalar_as_node` with
+    /// `FlowKey` stop), then eat trivia and report whether a flow-colon
+    /// indicator follows — picking the quoted vs plain colon probe based
+    /// on the scalar kind. Shared by `parse_flow_sequence_entry` and
+    /// `parse_flow_entry_body`.
+    fn parse_flow_scalar_then_colon(&mut self) -> Result<bool, ParseError> {
+        let quoted = matches!(
+            self.lex.peek(),
+            Some(LexHint::Token(
+                SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR
+            ))
+        );
+        self.parse_scalar_as_node(PlainStop::FlowKey, None)?;
         self.eat_trivia();
-        let has_colon = if quoted_key {
+        Ok(if quoted {
             self.lex.is_flow_colon_indicator_after_quoted()
         } else {
             self.lex.is_flow_colon_indicator()
-        };
-        if has_colon {
-            self.finish_flow_entry_after_key()?;
-        }
-        Ok(())
+        })
     }
 
     /// At a flow-colon indicator. Consume the COLON, any trivia, then the
@@ -1408,7 +1516,7 @@ impl<'a> Parser<'a> {
             }
             self.eat_trivia();
         }
-        match self.peek() {
+        match self.lex.peek() {
             Some(LexHint::Token(
                 SyntaxKind::COMMA | SyntaxKind::R_BRACE | SyntaxKind::R_BRACKET,
             ))
@@ -1490,5 +1598,289 @@ mod tests {
         let (tree, errors) = crate::parse_recover("a: 1\nb: 2\n");
         assert!(errors.is_empty());
         assert_eq!(tree.emit(), "a: 1\nb: 2\n");
+    }
+
+    // --- B4: flow plain values must terminate at ": " ---
+
+    #[test]
+    fn b4_flow_plain_value_rejects_colon_space() {
+        // A plain scalar in flow context may not contain ": " (YAML 1.2);
+        // `{k: v: w}` must be a parse error rather than value "v: w".
+        assert!(crate::parse("{k: v: w}\n").is_err());
+    }
+
+    #[test]
+    fn b4_legal_flow_value_still_parses() {
+        use crate::ast::{AstNode, Stream};
+        let tree = crate::parse("{k: v}\n").expect("legal flow mapping");
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let mapping = root.as_mapping().unwrap();
+        let (_k, v) = mapping.pairs().next().unwrap();
+        let v = v.expect("value present");
+        assert_eq!(v.syntax().text().to_string(), "v");
+    }
+
+    #[test]
+    fn b4_flow_value_with_colon_no_space_ok() {
+        // `:` not followed by space/flow-terminator stays plain content.
+        let tree = crate::parse("{k: a:b}\n").expect("colon-without-space is content");
+        assert_eq!(tree.emit(), "{k: a:b}\n");
+    }
+
+    // --- D3: multi-line plain scalars in flow context fold to a space ---
+
+    fn scalar_decoded(n: &crate::ast::Node) -> String {
+        match n {
+            crate::ast::Node::Scalar(s) => s.decoded().unwrap(),
+            other => panic!("expected scalar, got {:?}", other.syntax().kind()),
+        }
+    }
+
+    #[test]
+    fn d3_flow_sequence_multiline_plain_folds() {
+        use crate::ast::{AstNode, Stream};
+        let src = "[a\nb]\n";
+        let tree = crate::parse(src).expect("multi-line plain in flow seq");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let seq = root.as_sequence().unwrap();
+        let item = seq.iter().next().unwrap();
+        assert_eq!(scalar_decoded(&item), "a b");
+    }
+
+    #[test]
+    fn d3_flow_mapping_multiline_plain_value_folds() {
+        use crate::ast::{AstNode, Stream};
+        let src = "{k: a\nb}\n";
+        let tree = crate::parse(src).expect("multi-line plain flow value");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let mapping = root.as_mapping().unwrap();
+        let (_k, v) = mapping.pairs().next().unwrap();
+        assert_eq!(scalar_decoded(&v.unwrap()), "a b");
+    }
+
+    #[test]
+    fn d3_b4_still_enforced_after_multiline() {
+        // B4 must remain: `: ` inside a flow plain value is still illegal.
+        assert!(crate::parse("{k: v: w}\n").is_err());
+    }
+
+    // --- D4: anchor/tag before a key attaches to the KEY scalar ---
+
+    #[test]
+    fn d4_anchor_before_key_decorates_key_scalar() {
+        use crate::ast::{AstNode, Stream};
+        let src = "&a k: v\n";
+        let tree = crate::parse(src).expect("anchor before key");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        // The mapping itself carries no properties.
+        assert!(
+            root.properties().is_none(),
+            "mapping must NOT carry the key's anchor"
+        );
+        let mapping = root.as_mapping().unwrap();
+        let (k, v) = mapping.pairs().next().unwrap();
+        let props = k.properties().expect("key scalar carries properties");
+        assert_eq!(props.anchor_name().as_deref(), Some("a"));
+        assert_eq!(scalar_decoded(&k), "k");
+        assert_eq!(scalar_decoded(&v.unwrap()), "v");
+    }
+
+    #[test]
+    fn d4_value_anchor_still_decorates_value() {
+        // The seq_value_anchor shape: anchor on a value (nested mapping)
+        // must remain attached to the value, not the key.
+        use crate::ast::{AstNode, Stream};
+        let src = "base: &base\n  host: alpha\n";
+        let tree = crate::parse(src).expect("value anchor");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let mapping = root.as_mapping().unwrap();
+        let (k, v) = mapping.pairs().next().unwrap();
+        assert!(k.properties().is_none(), "key must not carry value anchor");
+        let v = v.unwrap();
+        let props = v.properties().expect("value carries anchor");
+        assert_eq!(props.anchor_name().as_deref(), Some("base"));
+    }
+
+    // --- D1: root plain scalar continuation at column 0 ---
+
+    fn decoded_root_scalar(src: &str) -> String {
+        use crate::ast::{AstNode, Stream};
+        let tree = crate::parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+        assert_eq!(tree.emit(), src, "round-trip for {src:?}");
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        scalar_decoded(&root)
+    }
+
+    #[test]
+    fn d1_root_plain_continues_at_column_zero() {
+        assert_eq!(decoded_root_scalar("a\nb\n"), "a b");
+        assert_eq!(decoded_root_scalar("a\nb\nc\n"), "a b c");
+    }
+
+    #[test]
+    fn d1_does_not_merge_separate_mapping_lines() {
+        use crate::ast::{AstNode, Stream};
+        let src = "a: 1\nb: 2\n";
+        let tree = crate::parse(src).expect("two-entry mapping");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let mapping = root.as_mapping().unwrap();
+        assert_eq!(mapping.pairs().count(), 2, "must stay a 2-entry mapping");
+    }
+
+    #[test]
+    fn d1_root_continuation_stops_at_document_markers_and_eof() {
+        // A `...` terminates the root scalar rather than folding.
+        use crate::ast::{AstNode, Stream};
+        let src = "a\n...\n";
+        let tree = crate::parse(src).expect("scalar then doc-end");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        assert_eq!(stream.documents().count(), 1);
+    }
+
+    #[test]
+    fn d1_multi_doc_still_parses() {
+        use crate::ast::{AstNode, Stream};
+        let src = "a\nb\n---\nc\nd\n";
+        let tree = crate::parse(src).expect("multi-doc with folded roots");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        assert_eq!(stream.documents().count(), 2);
+    }
+
+    // --- D2: bare document after `...` ---
+
+    #[test]
+    fn d2_bare_document_after_doc_end() {
+        use crate::ast::{AstNode, Stream};
+        let src = "a\n...\nb\n";
+        let tree = crate::parse(src).expect("bare doc after ...");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let docs: Vec<_> = stream.documents().collect();
+        assert_eq!(docs.len(), 2, "expected two documents");
+        assert_eq!(scalar_decoded(&docs[0].root_node().unwrap()), "a");
+        assert_eq!(scalar_decoded(&docs[1].root_node().unwrap()), "b");
+    }
+
+    #[test]
+    fn d2_still_rejects_bare_doc_without_marker() {
+        // Without a `...` (or `---`), a second bare document is still an
+        // error — D1 root folding only applies to *continuation* lines,
+        // and `b: 2` here is a separate mapping line that cannot fold into
+        // the scalar `a`.
+        assert!(crate::parse("a\nb: 2\n").is_err());
+    }
+
+    // --- B6: empty keys emit a NULL_SCALAR so key()/value() line up ---
+
+    #[test]
+    fn b6_flow_empty_key() {
+        use crate::ast::{AstNode, Stream};
+        let tree = crate::parse("{: v}\n").expect("empty flow key");
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let entry = root
+            .syntax()
+            .children()
+            .find_map(crate::ast::FlowMappingEntry::cast)
+            .expect("flow mapping entry");
+        let key = entry.key().expect("key node present");
+        // The empty key decodes to the null scalar (empty string).
+        assert_eq!(key.syntax().text().to_string(), "");
+        let value = entry.value().expect("value node present");
+        assert_eq!(value.syntax().text().to_string(), "v");
+    }
+
+    #[test]
+    fn b6_block_scope_empty_key() {
+        use crate::ast::{AstNode, Stream};
+        let src = ": v\n";
+        let tree = crate::parse(src).expect("block-scope empty key");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let entry = root
+            .syntax()
+            .children()
+            .find_map(crate::ast::BlockMappingEntry::cast)
+            .expect("block mapping entry");
+        let key = entry.key().expect("key node present");
+        assert_eq!(key.syntax().text().to_string(), "");
+        let value = entry.value().expect("value node present");
+        assert_eq!(value.syntax().text().to_string(), "v");
+    }
+
+    #[test]
+    fn b6_block_empty_key_with_following_entry() {
+        use crate::ast::{AstNode, Stream};
+        let src = ": v\nk: w\n";
+        let tree = crate::parse(src).expect("empty key then normal entry");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let mapping = root.as_mapping().unwrap();
+        assert_eq!(mapping.pairs().count(), 2);
+    }
+
+    #[test]
+    fn b6_explicit_block_empty_key() {
+        use crate::ast::{AstNode, Stream};
+        let tree = crate::parse("? \n: v\n").expect("explicit empty key");
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        let root = doc.root_node().unwrap();
+        let entry = root
+            .syntax()
+            .children()
+            .find_map(crate::ast::BlockMappingEntry::cast)
+            .expect("block mapping entry");
+        let key = entry.key().expect("key node present");
+        assert_eq!(key.syntax().text().to_string(), "");
+        let value = entry.value().expect("value node present");
+        assert_eq!(value.syntax().text().to_string(), "v");
+    }
+
+    // --- A1: directives/document-end live inside DOCUMENT ---
+
+    #[test]
+    fn a1_directives_and_document_end_inside_document() {
+        use crate::ast::{AstNode, Stream};
+        let src = "%YAML 1.2\n---\na: 1\n...\n";
+        let tree = crate::parse(src).expect("directives + doc end");
+        assert_eq!(tree.emit(), src);
+        let stream = Stream::cast(tree.root().clone()).unwrap();
+        let doc = stream.documents().next().unwrap();
+        assert!(doc.directives().is_some(), "directives() should be Some");
+        assert!(
+            doc.document_end_token().is_some(),
+            "document_end_token() should be Some"
+        );
+        assert!(
+            doc.directives_end_token().is_some(),
+            "directives_end_token() should be Some"
+        );
     }
 }

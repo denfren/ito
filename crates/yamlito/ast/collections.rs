@@ -6,7 +6,6 @@ use crate::ast::nodes::{
     BlockMapping, BlockMappingEntry, BlockSequence, BlockSequenceEntry, FlowMapping,
     FlowMappingEntry, FlowSequence, FlowSequenceEntry, Node,
 };
-use crate::ast::value::Value;
 
 /// Uniform view over a mapping/sequence entry of either style. Sequence
 /// entries have no key, so `key()` returns `None` for them.
@@ -164,11 +163,6 @@ impl Sequence for FlowSequence {
         Box::new(self.entries().filter_map(|e| e.value()))
     }
 }
-
-// Keep `Value` referenced so rustdoc links work and the import isn't
-// flagged. It's used conceptually by consumers; no direct usage here.
-#[allow(dead_code)]
-fn _value_marker(_: Value) {}
 
 #[cfg(test)]
 mod tests {

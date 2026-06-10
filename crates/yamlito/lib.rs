@@ -1,7 +1,7 @@
 //! YAML parser and lossless concrete-syntax-tree editor.
 //!
-//! This crate isolates all YAML-specific code (lexer, parser, syntax
-//! tree, typed AST, surgical edits, fixers, and the Rhai cursor glue).
+//! See `DIALECT.md` (crate root) for yamlito's YAML 1.2 dialect notes:
+//! spec-conformant cases worth calling out and known limitations.
 
 pub mod ast;
 pub mod builder;
@@ -11,7 +11,7 @@ pub mod error;
 pub mod fixers;
 pub mod lexer;
 pub(crate) mod parser;
-pub mod scripting;
+pub mod quoting;
 pub mod syntax;
 
 pub use builder::Yaml;

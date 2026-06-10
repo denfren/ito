@@ -8,10 +8,7 @@ repository = "https://github.com/denfren/ito"
 path = "lib.rs"
 
 [dependencies]
-annotate-snippets.workspace = true
-globset.workspace = true
 num_enum.workspace = true
-rhai.workspace = true
 rowan.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -19,4 +16,5 @@ thiserror.workspace = true
 [dev-dependencies]
 insta.workspace = true
 pretty_assertions.workspace = true
+proptest.workspace = true
 serde_json.workspace = true
