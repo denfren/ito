@@ -30,8 +30,12 @@ use rhai::plugin::*;
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Module};
 
 use yamlito::SyntaxTree;
+use yamlito::Yaml;
 use yamlito::ast::{AstNode, Mapping, Node, Scalar, Value};
-use yamlito::edit::{GreenElement, TreeEdit, apply_edit, mk_node, mk_token};
+use yamlito::edit::{
+    GreenElement, TreeEdit, apply_edit, insert_seq_item, mk_node, mk_token, push_seq_item,
+    remove_seq_item,
+};
 use yamlito::lexer::{as_plain_scalar, as_single_quoted};
 use yamlito::syntax::{SyntaxKind, SyntaxNode};
 
@@ -296,6 +300,14 @@ fn dynamic_to_yaml_scalar_text(d: &Dynamic) -> Option<String> {
     None
 }
 
+/// Convert a Rhai `Dynamic` into a `yamlito::Yaml` value model, ready to
+/// splice into a sequence. Scalars, arrays, and object maps are all
+/// supported via the same serde bridge that `yaml::to_string` uses; the
+/// inserted item is therefore always parse- and round-trip-consistent.
+fn dynamic_to_yaml(value: &Dynamic) -> Result<Yaml, Box<EvalAltResult>> {
+    rhai::serde::from_dynamic(value)
+}
+
 fn yaml_quote_if_needed(s: &str) -> String {
     const SPECIAL_CHARS: &[char] = &['\n', '\r', '\t', ':', '#', '\'', '"'];
     const LEADING_INDICATORS: &[char] = &['-', '?', '*', '&', '!', '|', '>', '@', '%', '`'];
@@ -522,6 +534,68 @@ pub mod sequence_api {
     #[rhai_fn(index_get, return_raw, pure)]
     pub fn get_by_index(s: &mut SequenceCursor, i: i64) -> Result<Dynamic, Box<EvalAltResult>> {
         seq_step_index(s, i)
+    }
+
+    /// Append `value` after the last item. `value` may be a scalar, an
+    /// array, or an object map; nested collections are serialized and
+    /// spliced so the result stays parse- and round-trip-consistent.
+    /// Existing layout (block dashes, flow spacing, multiline indent) is
+    /// continued. The edit replaces the underlying sequence node; the
+    /// cursor adopts the fresh node, so the same handle stays valid for
+    /// further edits.
+    #[rhai_fn(name = "push", return_raw)]
+    pub fn sequence_push(s: &mut SequenceCursor, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
+        let item = dynamic_to_yaml(&value)?;
+        let fresh = {
+            let mut tree = s.tree.borrow_mut();
+            push_seq_item(&mut tree, &s.node, item)
+        };
+        s.node = fresh;
+        Ok(())
+    }
+
+    /// Insert `value` at item position `index` (clamped to the item
+    /// count, so an out-of-range index appends). Negative indices error.
+    /// See [`sequence_push`] for the accepted value shapes and the
+    /// cursor-refresh behaviour.
+    #[rhai_fn(name = "insert", return_raw)]
+    pub fn sequence_insert(
+        s: &mut SequenceCursor,
+        index: i64,
+        value: Dynamic,
+    ) -> Result<(), Box<EvalAltResult>> {
+        if index < 0 {
+            return Err(format!("negative index: {index}").into());
+        }
+        let item = dynamic_to_yaml(&value)?;
+        let fresh = {
+            let mut tree = s.tree.borrow_mut();
+            insert_seq_item(&mut tree, &s.node, index as usize, item)
+        };
+        s.node = fresh;
+        Ok(())
+    }
+
+    /// Remove the item at position `index`, together with its adjacent
+    /// separator. Out-of-range indices are a no-op. Negative indices
+    /// error. Removing the last remaining item of a block sequence
+    /// collapses it to a flow `[]` (a block sequence cannot be empty) —
+    /// the cursor then points at that flow node, so a following `push`
+    /// grows it.
+    #[rhai_fn(name = "remove", return_raw)]
+    pub fn sequence_remove(
+        s: &mut SequenceCursor,
+        index: i64,
+    ) -> Result<(), Box<EvalAltResult>> {
+        if index < 0 {
+            return Err(format!("negative index: {index}").into());
+        }
+        let fresh = {
+            let mut tree = s.tree.borrow_mut();
+            remove_seq_item(&mut tree, &s.node, index as usize)
+        };
+        s.node = fresh;
+        Ok(())
     }
 
     /// Leading comment block attached to this sequence's enclosing entry
