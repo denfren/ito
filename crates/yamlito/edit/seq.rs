@@ -48,19 +48,30 @@ use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 /// gets a `[...]` item with separator spacing matching its neighbours.
 ///
 /// `seq` must be a `BLOCK_SEQUENCE` or `FLOW_SEQUENCE` belonging to
-/// `tree`.
-pub fn insert_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value: Yaml) {
+/// `tree`. Returns the *live* sequence node after the edit — rowan's
+/// `ReplaceNode` detaches the old node, so the caller should hold this
+/// returned handle instead of their old `seq`.
+pub fn insert_seq_item(
+    tree: &mut SyntaxTree,
+    seq: &SyntaxNode,
+    index: usize,
+    value: Yaml,
+) -> SyntaxNode {
     match seq.kind() {
         SyntaxKind::BLOCK_SEQUENCE => insert_block_item(tree, seq, index, value),
         SyntaxKind::FLOW_SEQUENCE => insert_flow_item(tree, seq, index, value),
-        other => debug_assert!(false, "insert_seq_item: not a sequence: {other:?}"),
+        other => {
+            debug_assert!(false, "insert_seq_item: not a sequence: {other:?}");
+            seq.clone()
+        }
     }
 }
 
 /// Append `value` after the last item of `seq`. Convenience for
-/// `insert_seq_item(tree, seq, usize::MAX, value)`.
-pub fn push_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, value: Yaml) {
-    insert_seq_item(tree, seq, usize::MAX, value);
+/// `insert_seq_item(tree, seq, usize::MAX, value)`. Returns the live
+/// sequence node after the edit (see [`insert_seq_item`]).
+pub fn push_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, value: Yaml) -> SyntaxNode {
+    insert_seq_item(tree, seq, usize::MAX, value)
 }
 
 /// Remove the item at position `index` from `seq`, together with the
@@ -71,11 +82,46 @@ pub fn push_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, value: Yaml) {
 /// Removing the last remaining item of a *block* sequence converts the
 /// whole node into an empty flow `[]` (a block sequence cannot be
 /// empty); removing the last item of a flow sequence leaves `[]`.
-pub fn remove_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
+///
+/// Returns the *live* sequence node after the edit — the new node a
+/// caller should hold instead of their old `seq`. When the last block
+/// item is removed this is the freshly inserted flow `[]` node; for an
+/// out-of-range no-op it is `seq` unchanged.
+pub fn remove_seq_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) -> SyntaxNode {
     match seq.kind() {
         SyntaxKind::BLOCK_SEQUENCE => remove_block_item(tree, seq, index),
         SyntaxKind::FLOW_SEQUENCE => remove_flow_item(tree, seq, index),
-        other => debug_assert!(false, "remove_seq_item: not a sequence: {other:?}"),
+        other => {
+            debug_assert!(false, "remove_seq_item: not a sequence: {other:?}");
+            seq.clone()
+        }
+    }
+}
+
+/// Apply a `ReplaceNode { target, new }` edit on `target` and return the
+/// *live* replacement node afterwards.
+///
+/// `ReplaceNode` splices `new` into `target`'s parent at `target`'s
+/// child index (or makes it the tree root when `target` is parentless),
+/// detaching the old `target` handle. The live node is then the child at
+/// that same index in the (new) parent, or the new tree root. Both
+/// `target` and `new` keep the same `SyntaxKind`.
+fn replace_node_live(tree: &mut SyntaxTree, target: &SyntaxNode, new: rowan::GreenNode) -> SyntaxNode {
+    let parent = target.parent();
+    let idx = target.index();
+    apply_edit(
+        tree,
+        TreeEdit::ReplaceNode {
+            target: target.clone(),
+            new,
+        },
+    );
+    match parent {
+        Some(p) => match p.children_with_tokens().nth(idx) {
+            Some(NodeOrToken::Node(n)) => n,
+            _ => unreachable!("ReplaceNode put a node back at the target's child index"),
+        },
+        None => tree.root().clone(),
     }
 }
 
@@ -91,7 +137,12 @@ fn item_child_indices(seq: &SyntaxNode, kind: SyntaxKind) -> Vec<usize> {
         .collect()
 }
 
-fn insert_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value: Yaml) {
+fn insert_block_item(
+    tree: &mut SyntaxTree,
+    seq: &SyntaxNode,
+    index: usize,
+    value: Yaml,
+) -> SyntaxNode {
     let col = sequence_col(seq);
     let item_green = build_block_item_green(value, col);
 
@@ -123,16 +174,10 @@ fn insert_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, valu
     };
 
     let new_green = splice_children_green(seq, splice_at..splice_at, fragment);
-    apply_edit(
-        tree,
-        TreeEdit::ReplaceNode {
-            target: seq.clone(),
-            new: new_green,
-        },
-    );
+    replace_node_live(tree, seq, new_green)
 }
 
-fn remove_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
+fn remove_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) -> SyntaxNode {
     let children: Vec<_> = seq.children_with_tokens().collect();
     let item_positions: Vec<usize> = children
         .iter()
@@ -143,14 +188,13 @@ fn remove_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
         .map(|(i, _)| i)
         .collect();
     let Some(&item_idx) = item_positions.get(index) else {
-        return;
+        return seq.clone();
     };
 
     // Removing the only remaining item: a block sequence cannot be empty,
     // so collapse the whole node to a flow `[]`.
     if item_positions.len() == 1 {
-        collapse_block_seq_to_empty(tree, seq);
-        return;
+        return collapse_block_seq_to_empty(tree, seq);
     }
 
     // Widen the removed range to swallow one adjacent NEWLINE separator
@@ -173,13 +217,7 @@ fn remove_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
     }
 
     let new_green = splice_children_green(seq, start..end, Vec::new());
-    apply_edit(
-        tree,
-        TreeEdit::ReplaceNode {
-            target: seq.clone(),
-            new: new_green,
-        },
-    );
+    replace_node_live(tree, seq, new_green)
 }
 
 /// Replace a now-empty block sequence with a flow `[]`. Because a flow
@@ -192,7 +230,7 @@ fn remove_block_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
 /// the `:` and the sequence is replaced with a single space so the
 /// result reads `key: []`. A document-root sequence (no preceding
 /// `COLON`) is replaced in place, yielding bare `[]`.
-fn collapse_block_seq_to_empty(tree: &mut SyntaxTree, seq: &SyntaxNode) {
+fn collapse_block_seq_to_empty(tree: &mut SyntaxTree, seq: &SyntaxNode) -> SyntaxNode {
     let empty = NodeOrToken::Node(mk_node(
         SyntaxKind::FLOW_SEQUENCE,
         [
@@ -206,7 +244,11 @@ fn collapse_block_seq_to_empty(tree: &mut SyntaxTree, seq: &SyntaxNode) {
         // emitted `[]` reparsed. Rare; keep it simple and correct.
         let rebuilt = crate::parse("[]\n").expect("`[]` parses");
         tree.set_root(rebuilt.root().clone());
-        return;
+        return tree
+            .root()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FLOW_SEQUENCE)
+            .expect("rebuilt `[]` has a flow sequence");
     };
 
     let siblings: Vec<_> = parent.children_with_tokens().collect();
@@ -240,15 +282,17 @@ fn collapse_block_seq_to_empty(tree: &mut SyntaxTree, seq: &SyntaxNode) {
         fragment.push(NodeOrToken::Token(mk_token(SyntaxKind::WHITESPACE, " ")));
     }
     fragment.push(empty);
+    // The flow `[]` is the last element of the fragment; after the splice
+    // it lands at child-index `start + (fragment.len() - 1)` in the new
+    // parent (any leading WHITESPACE occupies the slots before it).
+    let flow_child_idx = start + (fragment.len() - 1);
 
-    let new_parent = splice_children_green(&parent, start..seq_idx + 1, fragment);
-    apply_edit(
-        tree,
-        TreeEdit::ReplaceNode {
-            target: parent,
-            new: new_parent,
-        },
-    );
+    let new_parent_green = splice_children_green(&parent, start..seq_idx + 1, fragment);
+    let new_parent = replace_node_live(tree, &parent, new_parent_green);
+    match new_parent.children_with_tokens().nth(flow_child_idx) {
+        Some(NodeOrToken::Node(n)) if n.kind() == SyntaxKind::FLOW_SEQUENCE => n,
+        _ => unreachable!("collapsed `[]` flow node sits at the spliced index"),
+    }
 }
 
 /// The column at which `seq`'s dashes are indented. Line-start items own
@@ -494,7 +538,12 @@ fn entry_without_trailing_newline(entry: &SyntaxNode) -> rowan::GreenNode {
     mk_node(SyntaxKind::FLOW_SEQUENCE_ENTRY, kept)
 }
 
-fn insert_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value: Yaml) {
+fn insert_flow_item(
+    tree: &mut SyntaxTree,
+    seq: &SyntaxNode,
+    index: usize,
+    value: Yaml,
+) -> SyntaxNode {
     let item_green = build_flow_item_green(value);
     let item_indices = item_child_indices(seq, SyntaxKind::FLOW_SEQUENCE_ENTRY);
     let sep = flow_separator(seq);
@@ -513,14 +562,7 @@ fn insert_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value
         let at = r_bracket_idx.unwrap_or(children.len());
         let frag = vec![NodeOrToken::Node(item_green)];
         let new_green = splice_children_green(seq, at..at, frag);
-        apply_edit(
-            tree,
-            TreeEdit::ReplaceNode {
-                target: seq.clone(),
-                new: new_green,
-            },
-        );
-        return;
+        return replace_node_live(tree, seq, new_green);
     }
 
     let (range, fragment): (std::ops::Range<usize>, Vec<GreenElement>) = if index
@@ -564,16 +606,10 @@ fn insert_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize, value
     };
 
     let new_green = splice_children_green(seq, range, fragment);
-    apply_edit(
-        tree,
-        TreeEdit::ReplaceNode {
-            target: seq.clone(),
-            new: new_green,
-        },
-    );
+    replace_node_live(tree, seq, new_green)
 }
 
-fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
+fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) -> SyntaxNode {
     let children: Vec<_> = seq.children_with_tokens().collect();
     let item_positions: Vec<usize> = children
         .iter()
@@ -584,7 +620,7 @@ fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
         .map(|(i, _)| i)
         .collect();
     let Some(&item_idx) = item_positions.get(index) else {
-        return;
+        return seq.clone();
     };
 
     // Removing the only item: collapse to a clean `[]`, dropping any
@@ -597,14 +633,7 @@ fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
                 NodeOrToken::Token(mk_token(SyntaxKind::R_BRACKET, "]")),
             ],
         );
-        apply_edit(
-            tree,
-            TreeEdit::ReplaceNode {
-                target: seq.clone(),
-                new: empty,
-            },
-        );
-        return;
+        return replace_node_live(tree, seq, empty);
     }
 
     let is_comma = |i: usize| {
@@ -687,13 +716,7 @@ fn remove_flow_item(tree: &mut SyntaxTree, seq: &SyntaxNode, index: usize) {
     }
 
     let new_green = splice_children_green(seq, start..end, replacement);
-    apply_edit(
-        tree,
-        TreeEdit::ReplaceNode {
-            target: seq.clone(),
-            new: new_green,
-        },
-    );
+    replace_node_live(tree, seq, new_green)
 }
 
 #[cfg(test)]
@@ -729,6 +752,24 @@ mod tests {
         let seq = block_seq(&tree);
         push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
         assert_eq!(tree.emit(), "- a\n- b\n- c\n");
+        reparse(&tree);
+    }
+
+    /// The returned node is the live block sequence and can drive a second
+    /// edit directly, without re-finding it in the tree.
+    #[test]
+    fn block_push_returns_live_node_for_chained_edit() {
+        let mut tree = crate::parse("- a\n- b\n").unwrap();
+        let seq = block_seq(&tree);
+        let new = push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
+        assert_eq!(new.kind(), SyntaxKind::BLOCK_SEQUENCE);
+        // Issue a second edit through the returned handle.
+        let n2 = push_seq_item(&mut tree, &new, Yaml::Str("d".into()));
+        assert_eq!(n2.kind(), SyntaxKind::BLOCK_SEQUENCE);
+        let out = tree.emit();
+        assert_eq!(out, "- a\n- b\n- c\n- d\n");
+        assert!(out.contains("- c\n"));
+        assert!(out.contains("- d\n"));
         reparse(&tree);
     }
 
@@ -901,6 +942,22 @@ mod tests {
         reparse(&tree);
     }
 
+    /// The collapse-to-`[]` path returns the live FLOW_SEQUENCE node, so a
+    /// chained push can grow it without re-finding it via `flow_seq`.
+    #[test]
+    fn block_remove_only_item_returns_live_flow_node() {
+        let mut tree = crate::parse("items:\n  - a\n").unwrap();
+        let seq = block_seq(&tree);
+        let empty = remove_seq_item(&mut tree, &seq, 0);
+        assert_eq!(tree.emit(), "items: []\n");
+        assert_eq!(empty.kind(), SyntaxKind::FLOW_SEQUENCE);
+        // Grow the returned `[]` node directly.
+        let grown = push_seq_item(&mut tree, &empty, Yaml::Str("b".into()));
+        assert_eq!(grown.kind(), SyntaxKind::FLOW_SEQUENCE);
+        assert_eq!(tree.emit(), "items: [b]\n");
+        reparse(&tree);
+    }
+
     // ---- flow: push / append, spacing variants ----
 
     #[test]
@@ -909,6 +966,21 @@ mod tests {
         let seq = flow_seq(&tree);
         push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
         assert_eq!(tree.emit(), "[a, b, c]\n");
+        reparse(&tree);
+    }
+
+    /// The returned node is the live flow sequence and supports a chained
+    /// second edit.
+    #[test]
+    fn flow_push_returns_live_node_for_chained_edit() {
+        let mut tree = crate::parse("[a, b]\n").unwrap();
+        let seq = flow_seq(&tree);
+        let new = push_seq_item(&mut tree, &seq, Yaml::Str("c".into()));
+        assert_eq!(new.kind(), SyntaxKind::FLOW_SEQUENCE);
+        let n2 = push_seq_item(&mut tree, &new, Yaml::Str("d".into()));
+        assert_eq!(n2.kind(), SyntaxKind::FLOW_SEQUENCE);
+        let out = tree.emit();
+        assert_eq!(out, "[a, b, c, d]\n");
         reparse(&tree);
     }
 
