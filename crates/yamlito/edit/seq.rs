@@ -39,7 +39,7 @@ use rowan::NodeOrToken;
 use crate::SyntaxTree;
 use crate::builder::Yaml;
 use crate::edit::{GreenElement, TreeEdit, apply_edit, mk_node, mk_token, splice_children_green};
-use crate::syntax::tree_utils::observed_block_col;
+use crate::syntax::tree_utils::{indent_green_continuations, observed_block_col};
 use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 
 /// Insert `value` into the sequence `seq` at item position `index`
@@ -314,37 +314,23 @@ fn sequence_col(seq: &SyntaxNode) -> usize {
 
 /// Build the green `BLOCK_SEQUENCE_ENTRY` for `- value`, indented for a
 /// sequence at column `col`. We serialize a single-item sequence, parse
-/// it, and lift its entry subtree — guaranteeing structural and
-/// round-trip consistency with the parser.
+/// its CANONICAL column-0 text (which the builder guarantees parses),
+/// lift its entry subtree, then push `col` extra spaces onto every
+/// interior continuation line via [`indent_green_continuations`] so the
+/// multi-line item aligns under a sequence at `col`.
+///
+/// The entry's own first line stays bare: the caller supplies its leading
+/// indent as a sibling WHITESPACE token (see [`insert_block_item`]).
 fn build_block_item_green(value: Yaml, col: usize) -> rowan::GreenNode {
     let fragment = Yaml::Seq(vec![value]);
-    let text = indent_fragment(&fragment.to_yaml_string(), col);
+    let text = fragment.to_yaml_string();
     let tree = crate::parse(&text).expect("builder fragment must parse");
-    tree.root()
+    let entry = tree
+        .root()
         .descendants()
         .find(|n| n.kind() == SyntaxKind::BLOCK_SEQUENCE_ENTRY)
-        .expect("fragment has a sequence entry")
-        .green()
-        .into_owned()
-}
-
-/// Re-indent every line of `text` after the first by `col` spaces, so a
-/// fragment built at column 0 nests correctly under a sequence at `col`.
-/// The first line is left bare (the caller supplies its leading indent
-/// as a sibling WHITESPACE token).
-fn indent_fragment(text: &str, col: usize) -> String {
-    if col == 0 {
-        return text.to_string();
-    }
-    let pad = " ".repeat(col);
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        if i > 0 && !line.trim_end_matches('\n').is_empty() {
-            out.push_str(&pad);
-        }
-        out.push_str(line);
-    }
-    out
+        .expect("fragment has a sequence entry");
+    indent_green_continuations(&entry, col)
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +848,119 @@ mod tests {
         assert_eq!(tree.emit(), "- k: 1\n- k: 2\n");
         reparse(&tree);
     }
+
+    // ---- block: multi-line item values (maps, nested seqs) ----
+    //
+    // Regression tests for the panic in `build_block_item_green`: pushing
+    // a MAP (or nested seq) — any multi-line value — into a BLOCK sequence
+    // used to reparse standalone with `col` baked into the continuation
+    // lines, mangling the indentation. The fix reindents the parsed
+    // entry's continuation lines at the green level instead.
+
+    #[test]
+    fn block_push_multiline_map_top_level() {
+        let mut tree = crate::parse("- a\n").unwrap();
+        let seq = block_seq(&tree);
+        push_seq_item(
+            &mut tree,
+            &seq,
+            Yaml::Map(vec![("k".into(), Yaml::Int(1)), ("j".into(), Yaml::Int(2))]),
+        );
+        assert_eq!(tree.emit(), "- a\n- k: 1\n  j: 2\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn block_push_multiline_map_nested_col2() {
+        // The original panic repro: a map pushed into a 2-space sequence.
+        let mut tree = crate::parse("items:\n  - a\n").unwrap();
+        let seq = block_seq(&tree);
+        push_seq_item(
+            &mut tree,
+            &seq,
+            Yaml::Map(vec![("k".into(), Yaml::Int(1)), ("j".into(), Yaml::Int(2))]),
+        );
+        assert_eq!(tree.emit(), "items:\n  - a\n  - k: 1\n    j: 2\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn block_push_multiline_map_deep_col4() {
+        let mut tree = crate::parse("a:\n  b:\n    - x\n").unwrap();
+        let seq = block_seq(&tree);
+        push_seq_item(
+            &mut tree,
+            &seq,
+            Yaml::Map(vec![("k".into(), Yaml::Int(1)), ("j".into(), Yaml::Int(2))]),
+        );
+        assert_eq!(tree.emit(), "a:\n  b:\n    - x\n    - k: 1\n      j: 2\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn block_insert_front_multiline_map() {
+        let mut tree = crate::parse("items:\n  - b\n").unwrap();
+        let seq = block_seq(&tree);
+        insert_seq_item(
+            &mut tree,
+            &seq,
+            0,
+            Yaml::Map(vec![("k".into(), Yaml::Int(1)), ("j".into(), Yaml::Int(2))]),
+        );
+        assert_eq!(tree.emit(), "items:\n  - k: 1\n    j: 2\n  - b\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn block_insert_middle_multiline_map() {
+        let mut tree = crate::parse("items:\n  - a\n  - c\n").unwrap();
+        let seq = block_seq(&tree);
+        insert_seq_item(
+            &mut tree,
+            &seq,
+            1,
+            Yaml::Map(vec![("k".into(), Yaml::Int(1)), ("j".into(), Yaml::Int(2))]),
+        );
+        assert_eq!(tree.emit(), "items:\n  - a\n  - k: 1\n    j: 2\n  - c\n");
+        reparse(&tree);
+    }
+
+    #[test]
+    fn block_push_nested_seq_value() {
+        // A nested sequence is also multi-line: canonical form is
+        // `-\n  - 1\n  - 2\n  - 3`.
+        let mut tree = crate::parse("items:\n  - a\n").unwrap();
+        let seq = block_seq(&tree);
+        push_seq_item(
+            &mut tree,
+            &seq,
+            Yaml::Seq(vec![Yaml::Int(1), Yaml::Int(2), Yaml::Int(3)]),
+        );
+        assert_eq!(
+            tree.emit(),
+            "items:\n  - a\n  -\n    - 1\n    - 2\n    - 3\n"
+        );
+        reparse(&tree);
+        let v = Yaml::from_tree(&tree).unwrap();
+        assert_eq!(
+            v,
+            Yaml::Map(vec![(
+                "items".into(),
+                Yaml::Seq(vec![
+                    Yaml::Str("a".into()),
+                    Yaml::Seq(vec![Yaml::Int(1), Yaml::Int(2), Yaml::Int(3)]),
+                ]),
+            )])
+        );
+    }
+
+    // The value-model builder never emits literal (`|`) / folded (`>`)
+    // block scalars — a `Yaml::Str` containing a newline is single-quoted
+    // (see `builder::needs_quoting` / `single_quote`), which is a regular
+    // flow scalar with no significant interior indentation. So the
+    // block-scalar caveat of `indent_green_continuations` cannot be hit
+    // through THIS code path; the helper still handles it safely for
+    // reuse, and `tree_utils` carries a direct test for that case.
 
     #[test]
     fn block_push_string_quoted_when_needed() {
