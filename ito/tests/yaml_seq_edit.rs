@@ -1,5 +1,5 @@
 //! Integration tests for the `yaml::edit` sequence structural edits
-//! (`push` / `insert` / `remove`) exposed on a `YamlSequence` cursor.
+//! (`append` / `insert_at` / `remove_at`) exposed on a `YamlSequence` cursor.
 
 use rhai::Engine;
 
@@ -28,7 +28,7 @@ fn block_push_keeps_indent() {
     let out = eval_string(
         r#"
         let s = yaml::edit("items:\n  - a\n  - b\n");
-        s.doc["items"].push("c");
+        s.doc["items"].append("c");
         s.to_string()
         "#,
     );
@@ -40,7 +40,7 @@ fn block_insert_at_index() {
     let out = eval_string(
         r#"
         let s = yaml::edit("- a\n- c\n");
-        s.doc.insert(1, "b");
+        s.doc.insert_at(1, "b");
         s.to_string()
         "#,
     );
@@ -52,7 +52,7 @@ fn block_remove() {
     let out = eval_string(
         r#"
         let s = yaml::edit("- a\n- b\n- c\n");
-        s.doc.remove(1);
+        s.doc.remove_at(1);
         s.to_string()
         "#,
     );
@@ -64,7 +64,7 @@ fn flow_push_preserves_spacing() {
     let tight = eval_string(
         r#"
         let s = yaml::edit("[a,b]\n");
-        s.doc.push("c");
+        s.doc.append("c");
         s.to_string()
         "#,
     );
@@ -73,7 +73,7 @@ fn flow_push_preserves_spacing() {
     let spaced = eval_string(
         r#"
         let s = yaml::edit("[a, b]\n");
-        s.doc.push("c");
+        s.doc.append("c");
         s.to_string()
         "#,
     );
@@ -85,7 +85,7 @@ fn flow_multiline_layout_continues() {
     let out = eval_string(
         r#"
         let s = yaml::edit("[\n  a,\n  b,\n]\n");
-        s.doc.push("c");
+        s.doc.append("c");
         s.to_string()
         "#,
     );
@@ -97,7 +97,7 @@ fn nested_collection_value() {
     let out = eval_string(
         r#"
         let s = yaml::edit("- a\n");
-        s.doc.push(#{ k: 1, nested: [1, 2] });
+        s.doc.append(#{ k: 1, nested: [1, 2] });
         s.to_string()
         "#,
     );
@@ -111,7 +111,7 @@ fn string_that_looks_scalar_is_quoted() {
     let out = eval_string(
         r#"
         let s = yaml::edit("- a\n");
-        s.doc.push("true");
+        s.doc.append("true");
         s.to_string()
         "#,
     );
@@ -126,28 +126,28 @@ fn chained_edits_through_one_cursor() {
         r#"
         let s = yaml::edit("items:\n  - a\n  - b\n");
         let seq = s.doc["items"];
-        seq.push("c");
-        seq.push("d");
-        seq.insert(0, "z");
-        seq.remove(1);
+        seq.append("c");
+        seq.append("d");
+        seq.insert_at(0, "z");
+        seq.remove_at(1);
         s.to_string()
         "#,
     );
-    // a b -> +c -> +d -> insert z@0 -> z a b c d -> remove@1 -> z b c d
+    // a b -> +c -> +d -> insert_at z@0 -> z a b c d -> remove_at@1 -> z b c d
     assert_eq!(out, "items:\n  - z\n  - b\n  - c\n  - d\n");
 }
 
 /// Removing the only block item collapses to a flow `[]`; the same
-/// cursor then points at that flow node and `push` grows it.
+/// cursor then points at that flow node and `append` grows it.
 #[test]
 fn collapse_to_empty_then_grow_through_same_cursor() {
     let out = eval_string(
         r#"
         let s = yaml::edit("items:\n  - a\n");
         let seq = s.doc["items"];
-        seq.remove(0);
-        seq.push("b");
-        seq.push("c");
+        seq.remove_at(0);
+        seq.append("b");
+        seq.append("c");
         s.to_string()
         "#,
     );
@@ -159,7 +159,7 @@ fn out_of_range_remove_is_noop() {
     let out = eval_string(
         r#"
         let s = yaml::edit("- a\n- b\n");
-        s.doc.remove(9);
+        s.doc.remove_at(9);
         s.to_string()
         "#,
     );
@@ -171,7 +171,7 @@ fn out_of_range_insert_appends() {
     let out = eval_string(
         r#"
         let s = yaml::edit("- a\n");
-        s.doc.insert(99, "b");
+        s.doc.insert_at(99, "b");
         s.to_string()
         "#,
     );
@@ -181,7 +181,7 @@ fn out_of_range_insert_appends() {
 #[test]
 fn negative_index_errors() {
     assert!(
-        eval_err(r#"yaml::edit("[a]\n").doc.insert(-1, "x")"#).contains("negative index"),
+        eval_err(r#"yaml::edit("[a]\n").doc.insert_at(-1, "x")"#).contains("negative index"),
     );
-    assert!(eval_err(r#"yaml::edit("[a]\n").doc.remove(-1)"#).contains("negative index"));
+    assert!(eval_err(r#"yaml::edit("[a]\n").doc.remove_at(-1)"#).contains("negative index"));
 }

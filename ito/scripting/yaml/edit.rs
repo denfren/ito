@@ -33,8 +33,8 @@ use yamlito::SyntaxTree;
 use yamlito::Yaml;
 use yamlito::ast::{AstNode, Mapping, Node, Scalar, Value};
 use yamlito::edit::{
-    GreenElement, TreeEdit, apply_edit, insert_seq_item, mk_node, mk_token, push_seq_item,
-    remove_seq_item,
+    GreenElement, TreeEdit, apply_edit, insert_map_entry, insert_seq_item, mk_node, mk_token,
+    push_seq_item, remove_map_entry, remove_seq_item,
 };
 use yamlito::lexer::{as_plain_scalar, as_single_quoted};
 use yamlito::syntax::{SyntaxKind, SyntaxNode};
@@ -106,6 +106,16 @@ fn mapping_key_node(map_node: &SyntaxNode, key: &str) -> Option<SyntaxNode> {
         }
     }
     None
+}
+
+/// Entry position of `key` in the mapping (counting all entries in
+/// source order), or `None` if absent. Used to translate the script's
+/// key-based mapping edits onto yamlito's position-based primitives.
+fn mapping_key_index(map_node: &SyntaxNode, key: &str) -> Option<usize> {
+    let node = Node::cast(map_node.clone())?;
+    node.as_mapping()?.pairs().position(|(k, _)| {
+        matches!(&k, Node::Scalar(s) if s.decoded().ok().as_deref() == Some(key))
+    })
 }
 
 /// Wrap a `Node`-resolved SyntaxNode into the right cursor variant and
@@ -495,6 +505,136 @@ pub mod mapping_api {
         }
         Ok(true)
     }
+
+    /// Append a new `key: value` entry after the last one. Errors if
+    /// `key` already exists (YAML mappings cannot have duplicate keys);
+    /// use [`append_or_update`](#method.mapping_append_or_update) or
+    /// `m[key].write(value)` to change an existing entry. `value` may be
+    /// a scalar, an array, or an object map; nested collections are
+    /// serialized and spliced so the result stays parse- and
+    /// round-trip-consistent. Existing layout (block indent, flow
+    /// spacing) is continued. The edit replaces the underlying mapping
+    /// node; the cursor adopts the fresh node, so the same handle stays
+    /// valid for further edits.
+    #[rhai_fn(name = "append", return_raw)]
+    pub fn mapping_append(
+        m: &mut MappingCursor,
+        key: ImmutableString,
+        value: Dynamic,
+    ) -> Result<(), Box<EvalAltResult>> {
+        map_add(m, usize::MAX, &key, value)
+    }
+
+    /// Insert a new `key: value` entry at entry position `index`
+    /// (clamped to the entry count, so an out-of-range index appends).
+    /// Errors if `key` already exists. See [`append`](#method.mapping_append)
+    /// for value shapes and cursor-refresh behaviour.
+    #[rhai_fn(name = "insert_at", return_raw)]
+    pub fn mapping_insert_at(
+        m: &mut MappingCursor,
+        index: i64,
+        key: ImmutableString,
+        value: Dynamic,
+    ) -> Result<(), Box<EvalAltResult>> {
+        if index < 0 {
+            return Err(format!("negative index: {index}").into());
+        }
+        map_add(m, index as usize, &key, value)
+    }
+
+    /// Set `key` to `value`: if `key` already exists, replace its value
+    /// in place (keeping the entry's position); otherwise append a new
+    /// entry. Never introduces a duplicate key. Same value shapes and
+    /// cursor-refresh behaviour as [`append`](#method.mapping_append).
+    #[rhai_fn(name = "append_or_update", return_raw)]
+    pub fn mapping_append_or_update(
+        m: &mut MappingCursor,
+        key: ImmutableString,
+        value: Dynamic,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let item = dynamic_to_yaml(&value)?;
+        let existing = mapping_key_index(&m.node, &key);
+        let fresh = {
+            let mut tree = m.tree.borrow_mut();
+            match existing {
+                // Update: insert the replacement at the old position
+                // first, then drop the stale entry (now shifted one
+                // later). Inserting before removing keeps the mapping
+                // non-empty throughout, so a single-entry block map is
+                // never transiently collapsed to a flow `{}`.
+                Some(i) => {
+                    let n = insert_map_entry(&mut tree, &m.node, i, &key, item);
+                    remove_map_entry(&mut tree, &n, i + 1)
+                }
+                None => insert_map_entry(&mut tree, &m.node, usize::MAX, &key, item),
+            }
+        };
+        m.node = fresh;
+        Ok(())
+    }
+
+    /// Remove the entry whose key matches `key`, together with its
+    /// adjacent separator. Returns `true` if the key was found and
+    /// removed, `false` if absent. Removing the last remaining entry of
+    /// a block mapping collapses it to a flow `{}` (a block mapping
+    /// cannot be empty) — the cursor then points at that flow node, so a
+    /// following `append` grows it.
+    #[rhai_fn(name = "remove", return_raw)]
+    pub fn mapping_remove(
+        m: &mut MappingCursor,
+        key: ImmutableString,
+    ) -> Result<bool, Box<EvalAltResult>> {
+        let Some(i) = mapping_key_index(&m.node, &key) else {
+            return Ok(false);
+        };
+        let fresh = {
+            let mut tree = m.tree.borrow_mut();
+            remove_map_entry(&mut tree, &m.node, i)
+        };
+        m.node = fresh;
+        Ok(true)
+    }
+
+    /// Remove the entry at entry position `index`, together with its
+    /// adjacent separator. Out-of-range indices are a no-op. Negative
+    /// indices error. Same block-mapping collapse and cursor-refresh
+    /// behaviour as [`remove`](#method.mapping_remove).
+    #[rhai_fn(name = "remove_at", return_raw)]
+    pub fn mapping_remove_at(
+        m: &mut MappingCursor,
+        index: i64,
+    ) -> Result<(), Box<EvalAltResult>> {
+        if index < 0 {
+            return Err(format!("negative index: {index}").into());
+        }
+        let fresh = {
+            let mut tree = m.tree.borrow_mut();
+            remove_map_entry(&mut tree, &m.node, index as usize)
+        };
+        m.node = fresh;
+        Ok(())
+    }
+}
+
+/// Shared add path for `append`/`insert_at`: reject a duplicate key,
+/// then splice a fresh entry at `index` (clamped). Refreshes the cursor
+/// to the live mapping node.
+fn map_add(
+    m: &mut MappingCursor,
+    index: usize,
+    key: &str,
+    value: Dynamic,
+) -> Result<(), Box<EvalAltResult>> {
+    if mapping_key_index(&m.node, key).is_some() {
+        return Err(format!("duplicate key: {key}").into());
+    }
+    let item = dynamic_to_yaml(&value)?;
+    let fresh = {
+        let mut tree = m.tree.borrow_mut();
+        insert_map_entry(&mut tree, &m.node, index, key, item)
+    };
+    m.node = fresh;
+    Ok(())
 }
 
 fn seq_elements_of_kind(s: &SequenceCursor, predicate: impl Fn(SyntaxKind) -> bool) -> rhai::Array {
@@ -543,8 +683,11 @@ pub mod sequence_api {
     /// continued. The edit replaces the underlying sequence node; the
     /// cursor adopts the fresh node, so the same handle stays valid for
     /// further edits.
-    #[rhai_fn(name = "push", return_raw)]
-    pub fn sequence_push(s: &mut SequenceCursor, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
+    #[rhai_fn(name = "append", return_raw)]
+    pub fn sequence_append(
+        s: &mut SequenceCursor,
+        value: Dynamic,
+    ) -> Result<(), Box<EvalAltResult>> {
         let item = dynamic_to_yaml(&value)?;
         let fresh = {
             let mut tree = s.tree.borrow_mut();
@@ -556,10 +699,10 @@ pub mod sequence_api {
 
     /// Insert `value` at item position `index` (clamped to the item
     /// count, so an out-of-range index appends). Negative indices error.
-    /// See [`sequence_push`] for the accepted value shapes and the
+    /// See [`sequence_append`] for the accepted value shapes and the
     /// cursor-refresh behaviour.
-    #[rhai_fn(name = "insert", return_raw)]
-    pub fn sequence_insert(
+    #[rhai_fn(name = "insert_at", return_raw)]
+    pub fn sequence_insert_at(
         s: &mut SequenceCursor,
         index: i64,
         value: Dynamic,
@@ -580,10 +723,10 @@ pub mod sequence_api {
     /// separator. Out-of-range indices are a no-op. Negative indices
     /// error. Removing the last remaining item of a block sequence
     /// collapses it to a flow `[]` (a block sequence cannot be empty) —
-    /// the cursor then points at that flow node, so a following `push`
+    /// the cursor then points at that flow node, so a following `append`
     /// grows it.
-    #[rhai_fn(name = "remove", return_raw)]
-    pub fn sequence_remove(
+    #[rhai_fn(name = "remove_at", return_raw)]
+    pub fn sequence_remove_at(
         s: &mut SequenceCursor,
         index: i64,
     ) -> Result<(), Box<EvalAltResult>> {

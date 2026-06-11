@@ -94,11 +94,13 @@ From the stream cursor you reach mappings, sequences, and scalars.
   (i-th document's root), and iteration over document roots.
 - **Mapping** (`YamlMapping`) — `m[key]`, `m.len()`, `m.keys()`,
   `m.values()`, `m.contains(key)`, `m.rename_key(old, new)` (returns
-  `false` if absent), and iteration yielding entries.
+  `false` if absent), the structural edits `m.append(key, value)` /
+  `m.append_or_update(key, value)` / `m.insert_at(index, key, value)` /
+  `m.remove(key)` / `m.remove_at(index)`, and iteration yielding entries.
 - **Sequence** (`YamlSequence`) — `s[i]`, `s.len()`, plus `s.mappings()`
   / `s.sequences()` / `s.scalars()` (elements filtered by kind),
-  iteration over elements, and the structural edits `s.push(value)` /
-  `s.insert(index, value)` / `s.remove(index)`.
+  iteration over elements, and the structural edits `s.append(value)` /
+  `s.insert_at(index, value)` / `s.remove_at(index)`.
 - **Scalar** (`YamlScalar`) — `read()` (decode to a native value),
   `write(value)` (replace the value, re-quoting as needed), and the
   quoting helpers below.
@@ -131,15 +133,15 @@ style.
 
 | Method | Effect |
 | --- | --- |
-| `push(value)` | Append `value` after the last item. |
-| `insert(index, value)` | Insert at item position `index` (clamped to the count, so an out-of-range index appends). |
-| `remove(index)` | Remove the item at `index` (out-of-range is a no-op). |
+| `append(value)` | Append `value` after the last item. |
+| `insert_at(index, value)` | Insert at item position `index` (clamped to the count, so an out-of-range index appends). |
+| `remove_at(index)` | Remove the item at `index` (out-of-range is a no-op). |
 
 `value` can be a scalar, an array, or a map — nested collections are
 serialized and spliced so the result always reparses. Removing the last
 remaining item of a *block* sequence collapses it to a flow `[]` (a block
 sequence cannot be empty); the cursor then points at that flow node, so a
-following `push` grows it. Negative indices are an error.
+following `append` grows it. Negative indices are an error.
 
 Each of these edits replaces the underlying sequence node, but the cursor
 refreshes itself to the new node, so the same handle stays valid across a
@@ -148,10 +150,43 @@ run of edits:
 ```rhai
 let stream = yaml::edit(fs::read("/config.yml"));
 let ports = stream.doc["service"]["ports"];
-ports.push(8443);
-ports.insert(0, 80);
-ports.remove(2);
+ports.append(8443);
+ports.insert_at(0, 80);
+ports.remove_at(2);
 fs::write("/config.yml", stream.to_string());
+```
+
+### Adding and removing mapping entries
+
+A mapping cursor edits entries the same way, preserving layout — block
+stays block, flow stays flow. The add methods **error on a duplicate
+key** (a YAML mapping cannot repeat a key); to change an existing entry
+use `append_or_update` or `m[key].write(value)`.
+
+| Method | Effect |
+| --- | --- |
+| `append(key, value)` | Append a new `key: value` entry after the last one. Errors if `key` already exists. |
+| `insert_at(index, key, value)` | Insert a new entry at entry position `index` (clamped, so out-of-range appends). Errors if `key` already exists. |
+| `append_or_update(key, value)` | Replace `key`'s value in place if it exists (keeping its position), else append. Never duplicates a key. |
+| `remove(key)` | Remove the entry for `key` (returns `true` if found, `false` if absent). |
+| `remove_at(index)` | Remove the entry at position `index` (out-of-range is a no-op). |
+
+`value` can be a scalar, an array, or a map — nested collections are
+serialized and spliced so the result always reparses. Removing the last
+remaining entry of a *block* mapping collapses it to a flow `{}` (a block
+mapping cannot be empty); the cursor then points at that flow node, so a
+following `append` grows it. Negative indices are an error.
+
+Like the sequence edits, each replaces the underlying mapping node while
+refreshing the cursor, so the same handle stays valid across edits:
+
+```rhai
+let stream = yaml::edit(fs::read("/svc.yml"));
+let meta = stream.doc["metadata"];
+meta.append("namespace", "prod");            // new entry (errors on dup)
+meta.append_or_update("name", "frontend");   // set, whether or not present
+meta.remove("annotations");
+fs::write("/svc.yml", stream.to_string());
 ```
 
 ### Iteration
