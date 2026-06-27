@@ -114,19 +114,27 @@ impl Vfs {
     /// namespace. Uses the same "really changed" predicate as
     /// [`Vfs::diff`]: a write matching disk is not reported, and a remove
     /// of an absent file is not reported.
-    pub fn changed(&self) -> Vec<String> {
+    pub fn changed(&self) -> std::result::Result<Vec<String>, std::io::Error> {
         let pending = self.pending.borrow();
         let mut out: Vec<String> = pending
             .actions
             .iter()
-            .filter(|(path, action)| match action {
-                Action::Write(new) => std::fs::read_to_string(path).unwrap_or_default() != **new,
-                Action::Remove => path.symlink_metadata().is_ok(),
+            .filter_map(|(path, action)| match action {
+                Action::Write(new) => match std::fs::read_to_string(path) {
+                    Ok(old) => (old != **new).then(|| Ok(self.mapper.relativize(path))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Some(Ok(self.mapper.relativize(path)))
+                    }
+                    Err(e) => Some(Err(e)),
+                },
+                Action::Remove => path
+                    .symlink_metadata()
+                    .is_ok()
+                    .then(|| Ok(self.mapper.relativize(path))),
             })
-            .map(|(path, _)| self.mapper.relativize(path))
-            .collect();
+            .collect::<std::result::Result<_, _>>()?;
         out.sort();
-        out
+        Ok(out)
     }
 
     /// Render a unified diff of every pending action against current disk
@@ -135,19 +143,32 @@ impl Vfs {
     /// all-additions new file, and a remove of an existing file shows as an
     /// all-deletions diff. Returns an empty string when there is nothing to
     /// show.
-    pub fn diff(&self) -> String {
+    pub fn diff(&self) -> std::result::Result<String, std::io::Error> {
         let pending = self.pending.borrow();
         let mut out = String::new();
         for (path, action) in &pending.actions {
-            let old = std::fs::read_to_string(path).unwrap_or_default();
+            let old = match std::fs::read_to_string(path) {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
             let new = match action {
                 Action::Write(content) => content.as_str(),
                 Action::Remove => "",
             };
-            if old == new {
+            if old.as_deref() == Some(new) {
                 continue;
             }
+            let is_new_file = old.is_none();
+            let old = old.unwrap_or_default();
             let rel = self.mapper.relativize(path);
+            // An empty write to a new path has no line-level diff to show, but
+            // we still emit the header so callers (and humans) can see the file
+            // will be created.
+            if is_new_file && new.is_empty() {
+                out.push_str(&format!("--- /dev/null\n+++ b/{rel}\n"));
+                continue;
+            }
             let diff = similar::TextDiff::from_lines(&old, new);
             out.push_str(
                 &diff
@@ -157,7 +178,7 @@ impl Vfs {
                     .to_string(),
             );
         }
-        out
+        Ok(out)
     }
 }
 
@@ -615,7 +636,12 @@ pub fn register(engine: &mut Engine, vfs: &Vfs, allow_flush: bool, dry_run: bool
         if !allow_flush {
             return Err("fs::flush() is disabled; pass --unsafe-fs-flush to enable it".into());
         }
-        if dry_run && !v.changed().is_empty() {
+        if dry_run
+            && !v
+                .changed()
+                .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?
+                .is_empty()
+        {
             return Err("fs::flush() would change files under --dry-run; refusing to write".into());
         }
         v.flush().map_err(|e| -> Box<EvalAltResult> { e.into() })?;

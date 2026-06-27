@@ -166,7 +166,7 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
 
     // The set of real changes (buffered writes differing from disk) is the
     // shared basis for the --list-changed listing and the --exit-code status.
-    let changed = vfs.changed();
+    let changed = vfs.changed().map_err(|e| format!("changed: {e}"))?;
 
     // Report axis: --diff and --list-changed are mutually exclusive (clap
     // enforces this). They report against the buffered writes, so they work
@@ -180,7 +180,7 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
             }
         }
         if run.output.diff {
-            write!(out, "{}", vfs.diff()).map_err(|e| format!("write diff: {e}"))?;
+            write!(out, "{}", vfs.diff().map_err(|e| format!("diff: {e}"))?).map_err(|e| format!("write diff: {e}"))?;
         }
     }
 
