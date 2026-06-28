@@ -26,8 +26,13 @@ fn main() {
             std::env::set_current_dir(dir).map_err(|e| format!("-C {}: {e}", dir.display()))?;
         }
         match cli.command {
-            Command::Exec { expression, run } => run_script(ScriptSource::Inline(expression), run),
-            Command::Run { script_path, run } => {
+            None => {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                list_available_scripts(&root);
+                return Ok(Outcome::default());
+            }
+            Some(Command::Exec { expression, run }) => run_script(ScriptSource::Inline(expression), run),
+            Some(Command::Run { script_path, run }) => {
                 let source = if script_path.as_os_str() == "-" {
                     ScriptSource::Stdin
                 } else {
@@ -35,7 +40,7 @@ fn main() {
                 };
                 run_script(source, run)
             }
-            Command::Script(args) => {
+            Some(Command::Script(args)) => {
                 let name = args[0].clone();
                 let rest = &args[1..];
                 let run = ScriptRunArgs::try_parse_from(
@@ -45,10 +50,10 @@ fn main() {
                 .run;
                 run_script(ScriptSource::Named(name), run)
             }
-            Command::Help { topic, plain, no_pager } => ito::help::doc(topic.as_deref(), plain, no_pager)
+            Some(Command::Help { topic, plain, no_pager }) => ito::help::doc(topic.as_deref(), plain, no_pager)
                 .map(|()| Outcome::default())
                 .map_err(RunError::from),
-            Command::Util { command } => match command {
+            Some(Command::Util { command }) => match command {
                 UtilCommand::Completions { shell } => {
                     generate_completions(shell);
                     Ok(Outcome::default())
@@ -274,6 +279,61 @@ fn generate_completions(shell: Shell) {
         name,
         &mut std::io::stdout(),
     );
+}
+
+/// Scan `root` for all scripts across all well-known locations and print them.
+///
+/// Well-known patterns:
+///   `<name>.ito.rhai`, `.<name>.ito.rhai`, `ito/<name>.rhai`, `.ito/<name>.rhai`
+///
+/// Scripts are listed as `ito <name>` entries, sorted. When none are found
+/// a short hint is printed instead.
+fn list_available_scripts(root: &std::path::Path) {
+    use std::collections::BTreeSet;
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+
+    // `<name>.ito.rhai` and `.<name>.ito.rhai` in root
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            if let Some(name) = fname.strip_suffix(".ito.rhai") {
+                // Strip a leading dot for dotted variants.
+                let name = name.strip_prefix('.').unwrap_or(name);
+                if !name.is_empty() && entry.path().is_file() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    // `ito/<name>.rhai` and `.ito/<name>.rhai`
+    for subdir in &["ito", ".ito"] {
+        if let Ok(entries) = std::fs::read_dir(root.join(subdir)) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname = fname.to_string_lossy();
+                if let Some(name) = fname.strip_suffix(".rhai") {
+                    if !name.is_empty() && entry.path().is_file() {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if names.is_empty() {
+        println!("No scripts found in {}.", root.display());
+        println!("Place a script at e.g. `<name>.ito.rhai` and run it with `ito <name>`.");
+    } else {
+        println!("Available scripts in {}:", root.display());
+        for name in &names {
+            println!("  ito {name}");
+        }
+    }
+    println!();
+    println!("Run `ito --help` for CLI usage, `ito help` for scripting documentation.");
 }
 
 /// Returns the candidate paths for a named script, in priority order.

@@ -49,7 +49,7 @@ pub struct Cli {
     pub directory: Vec<PathBuf>,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]

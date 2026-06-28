@@ -44,8 +44,28 @@ impl Fixture {
 }
 
 #[test]
-fn no_subcommand_prints_help_and_exits_nonzero() {
-    ito().assert().failure().stderr(predicate::str::contains("Usage"));
+fn no_subcommand_lists_scripts_and_exits_zero() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("deploy.ito.rhai"), r#"print("deploy")"#).unwrap();
+    ito()
+        .args(["-C", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ito deploy"))
+        .stdout(predicate::str::contains("ito --help"))
+        .stdout(predicate::str::contains("ito help"));
+}
+
+#[test]
+fn no_subcommand_no_scripts_prints_hint() {
+    let dir = TempDir::new().unwrap();
+    ito()
+        .args(["-C", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No scripts found"))
+        .stdout(predicate::str::contains("ito --help"))
+        .stdout(predicate::str::contains("ito help"));
 }
 
 // --- -C is accepted before any subcommand ---
