@@ -3,27 +3,13 @@
 ## Workflow
 
 - Make sure the project builds (`cargo build`) before committing.
-- Commits that land on a branch (and any commit on a release tag) follow
-  [Conventional Commits](https://www.conventionalcommits.org/):
-  `type(scope): description`. This requirement takes precedence over any
-  general "commit often / messages don't matter" guidance — those loose,
-  intermediate commits are fine while iterating, but the history that
-  ships must conform so the changelog is complete and accurate. Allowed
-  types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`. The scope
-  is optional and free-form (e.g. `feat(yaml): ...`). Mark breaking
-  changes with `!` in the subject (e.g. `feat(cli)!: ...`). Only
-  `feat`/`fix`/`docs` surface in the changelog.
-- The changelog lives at `CHANGELOG.md` (repo root, Keep a Changelog
-  format) and is **generated** from commit history by
-  [`git-cliff`](https://git-cliff.org/) — do not hand-edit it. 
+- The changelog lives at `CHANGELOG.md` (repo root, [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format) and is **hand-written** — update it as part of the release commit.
 
 ### Release steps
 
 To cut a release `vX.Y.Z`, in order:
 
-1. `git cliff --tag vX.Y.Z -o CHANGELOG.md` — regenerate the changelog
-   as if the new version were already current (renders the unreleased
-   commits under the `vX.Y.Z` heading).
+1. Update `CHANGELOG.md` — renaming the unreleased section to `## [X.Y.Z] - YYYY-MM-DD`
 2. Bump `version` in `ito/Cargo.toml` to `X.Y.Z`.
 3. `cargo build` — updates `Cargo.lock` with the new version.
 4. Commit (`chore(release): vX.Y.Z`) and tag `vX.Y.Z`.

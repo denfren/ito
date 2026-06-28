@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- First-class invocation of well-known script names — `ito <name>`
+  - looks for one of
+    - `<name>.ito.rhai`
+    - `.<name>.ito.rhai`
+    - `ito/<name>.rhai`
+    - `.ito/<name>.rhai`
+
+### Changed
+
+- **Breaking:** `run` now requires an explicit path argument
+  - to get the old default run `ito main`
+
+### Fixed
+
+- Writing an empty string to a new file now correctly reports as a change
+- **yamlito:** Block scalar decoding fixes (literal and folded styles)
+  - test cases taken from [yaml-test-suite](https://github.com/yaml/yaml-test-suite)
+  - explicit indent indicator (`|2`, `>1`) now relative to parent block indent per spec
+  - folded scalar line-folding and blank-line handling corrected
+  - double-quoted scalar trailing whitespace trimmed correctly before line folds
+
 ## [0.4.0] - 2026-06-11
 
 ### Added
