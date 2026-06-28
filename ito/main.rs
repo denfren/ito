@@ -21,43 +21,41 @@ fn main() {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    let result = match cli.command {
-        Command::Exec { expression, run } => {
-            let source = ScriptSource::Inline(expression);
-            run_script(source, run)
+    let result: Result<Outcome, RunError> = (|| {
+        for dir in &cli.directory {
+            std::env::set_current_dir(dir).map_err(|e| format!("-C {}: {e}", dir.display()))?;
         }
-        Command::Run { script_path, run } => {
-            let source = if script_path.as_os_str() == "-" {
-                ScriptSource::Stdin
-            } else {
-                ScriptSource::File(script_path)
-            };
-            run_script(source, run)
-        }
-        Command::Script(args) => {
-            let name = args[0].clone();
-            let rest = &args[1..];
-            let run = ScriptRunArgs::try_parse_from(
-                std::iter::once("ito").chain(rest.iter().map(|s| s.as_str())),
-            )
-            .unwrap_or_else(|e| e.exit())
-            .run;
-            run_script(ScriptSource::Named(name), run)
-        }
-        Command::Help {
-            topic,
-            plain,
-            no_pager,
-        } => ito::help::doc(topic.as_deref(), plain, no_pager)
-            .map(|()| Outcome::default())
-            .map_err(RunError::from),
-        Command::Util { command } => match command {
-            UtilCommand::Completions { shell } => {
-                generate_completions(shell);
-                Ok(Outcome::default())
+        match cli.command {
+            Command::Exec { expression, run } => run_script(ScriptSource::Inline(expression), run),
+            Command::Run { script_path, run } => {
+                let source = if script_path.as_os_str() == "-" {
+                    ScriptSource::Stdin
+                } else {
+                    ScriptSource::File(script_path)
+                };
+                run_script(source, run)
             }
-        },
-    };
+            Command::Script(args) => {
+                let name = args[0].clone();
+                let rest = &args[1..];
+                let run = ScriptRunArgs::try_parse_from(
+                    std::iter::once("ito").chain(rest.iter().map(|s| s.as_str())),
+                )
+                .unwrap_or_else(|e| e.exit())
+                .run;
+                run_script(ScriptSource::Named(name), run)
+            }
+            Command::Help { topic, plain, no_pager } => ito::help::doc(topic.as_deref(), plain, no_pager)
+                .map(|()| Outcome::default())
+                .map_err(RunError::from),
+            Command::Util { command } => match command {
+                UtilCommand::Completions { shell } => {
+                    generate_completions(shell);
+                    Ok(Outcome::default())
+                }
+            },
+        }
+    })();
 
     match result {
         Err(e) => {
@@ -97,10 +95,6 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
     // script print() is suppressed.
     let script_echo = !(run.output.quiet || run.output.diff || run.output.changed);
     let args = collect_script_args(run.script_args)?;
-
-    for dir in &run.directory {
-        std::env::set_current_dir(dir).map_err(|e| format!("-C {}: {e}", dir.display()))?;
-    }
     let vfs_root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
 
     // Resolve the script source after `-C` is applied: named discovery

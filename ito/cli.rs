@@ -38,6 +38,16 @@ pub struct Cli {
     )]
     pub verbose: u8,
 
+    #[arg(
+        short = 'C',
+        long = "directory",
+        value_name = "DIR",
+        action = clap::ArgAction::Append,
+        global = true,
+        help = "Change to DIR before doing anything else (sets the `fs` module root). Repeatable; each is relative to the previous one.",
+    )]
+    pub directory: Vec<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -104,20 +114,9 @@ pub enum UtilCommand {
     },
 }
 
-/// Flags shared by `exec` and `run`: working directory, injected args,
-/// and output control.
+/// Flags shared by `exec` and `run`: injected args and output control.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    #[arg(
-        short = 'C',
-        long = "directory",
-        value_name = "DIR",
-        action = clap::ArgAction::Append,
-        help_heading = "Run control",
-        help = "Change to DIR before doing anything else (sets the `fs` module root). Repeatable; each is relative to the previous one.",
-    )]
-    pub directory: Vec<PathBuf>,
-
     #[arg(
         long = "unsafe-proc",
         help_heading = "Run control",
