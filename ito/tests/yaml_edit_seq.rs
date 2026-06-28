@@ -145,8 +145,10 @@ fn out_of_range_insert_appends() {
 
 #[test]
 fn negative_index_errors() {
-    assert!(eval_err("[a]\n", r#"yaml::edit(subject).doc.insert_at(-1, "x")"#)
-        .contains("negative index"));
+    assert!(
+        eval_err("[a]\n", r#"yaml::edit(subject).doc.insert_at(-1, "x")"#)
+            .contains("negative index")
+    );
     assert!(
         eval_err("[a]\n", r#"yaml::edit(subject).doc.remove_at(-1)"#).contains("negative index")
     );

@@ -36,8 +36,12 @@ impl Scalar {
             ScalarStyle::Plain => Ok(decode_plain(raw)),
             ScalarStyle::SingleQuoted => decode_single_quoted(raw),
             ScalarStyle::DoubleQuoted => decode_double_quoted(raw),
-            ScalarStyle::Literal => decode_block(raw, BlockStyle::Literal, self.block_parent_indent()),
-            ScalarStyle::Folded => decode_block(raw, BlockStyle::Folded, self.block_parent_indent()),
+            ScalarStyle::Literal => {
+                decode_block(raw, BlockStyle::Literal, self.block_parent_indent())
+            }
+            ScalarStyle::Folded => {
+                decode_block(raw, BlockStyle::Folded, self.block_parent_indent())
+            }
         }
     }
 

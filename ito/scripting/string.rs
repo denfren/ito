@@ -35,12 +35,9 @@ pub fn register(engine: &mut Engine) {
         s.trim().into()
     });
 
-    engine.register_fn(
-        "make_trimmed",
-        |s: &mut ImmutableString| {
-            *s = s.trim().into();
-        },
-    );
+    engine.register_fn("make_trimmed", |s: &mut ImmutableString| {
+        *s = s.trim().into();
+    });
 
     // --- trim_start ---
 
@@ -49,12 +46,9 @@ pub fn register(engine: &mut Engine) {
         |s: ImmutableString| -> ImmutableString { s.trim_start().into() },
     );
 
-    engine.register_fn(
-        "make_trimmed_start",
-        |s: &mut ImmutableString| {
-            *s = s.trim_start().into();
-        },
-    );
+    engine.register_fn("make_trimmed_start", |s: &mut ImmutableString| {
+        *s = s.trim_start().into();
+    });
 
     // --- trim_end ---
 
@@ -62,12 +56,9 @@ pub fn register(engine: &mut Engine) {
         s.trim_end().into()
     });
 
-    engine.register_fn(
-        "make_trimmed_end",
-        |s: &mut ImmutableString| {
-            *s = s.trim_end().into();
-        },
-    );
+    engine.register_fn("make_trimmed_end", |s: &mut ImmutableString| {
+        *s = s.trim_end().into();
+    });
 
     // --- upper (Rhai has `to_upper`; we add `make_upper` returning the string) ---
 
@@ -87,12 +78,9 @@ pub fn register(engine: &mut Engine) {
         "".into()
     });
 
-    engine.register_fn(
-        "make_cleared",
-        |s: &mut ImmutableString| {
-            *s = "".into();
-        },
-    );
+    engine.register_fn("make_cleared", |s: &mut ImmutableString| {
+        *s = "".into();
+    });
 
     // --- truncate ---
 
@@ -104,13 +92,10 @@ pub fn register(engine: &mut Engine) {
         },
     );
 
-    engine.register_fn(
-        "make_truncated",
-        |s: &mut ImmutableString, len: i64| {
-            let len = len.max(0) as usize;
-            *s = s.chars().take(len).collect::<String>().into();
-        },
-    );
+    engine.register_fn("make_truncated", |s: &mut ImmutableString, len: i64| {
+        let len = len.max(0) as usize;
+        *s = s.chars().take(len).collect::<String>().into();
+    });
 
     // --- crop ---
 
@@ -132,10 +117,9 @@ pub fn register(engine: &mut Engine) {
         },
     );
 
-    engine.register_fn(
-        "make_cropped",
-        |s: &mut ImmutableString, start: i64| crop_range(s, start, None),
-    );
+    engine.register_fn("make_cropped", |s: &mut ImmutableString, start: i64| {
+        crop_range(s, start, None)
+    });
 
     engine.register_fn(
         "make_cropped",
@@ -220,10 +204,9 @@ pub fn register(engine: &mut Engine) {
         },
     );
 
-    engine.register_fn(
-        "make_removed",
-        |s: &mut ImmutableString, ch: char| remove_all(s, &ch.to_string()),
-    );
+    engine.register_fn("make_removed", |s: &mut ImmutableString, ch: char| {
+        remove_all(s, &ch.to_string())
+    });
 
     engine.register_fn(
         "make_removed",

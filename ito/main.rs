@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::cli::{Command, LoadedScript, RunArgs, ScriptArgsFlags, Shell, UtilCommand};
 use clap::{CommandFactory, Parser};
 use cli::Cli;
+use thiserror::__private18::AsDisplay;
 
 /// Minimal parser wrapper so `RunArgs` (an `Args` struct) can be parsed
 /// from a raw arg list for `ito <name> [flags]`.
@@ -25,14 +26,14 @@ fn main() {
         for dir in &cli.directory {
             std::env::set_current_dir(dir).map_err(|e| format!("-C {}: {e}", dir.display()))?;
         }
-        match cli.command {
-            None => {
-                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-                list_available_scripts(&root);
-                return Ok(Outcome::default());
-            }
-            Some(Command::Exec { expression, run }) => run_script(ScriptSource::Inline(expression), run),
-            Some(Command::Run { script_path, run }) => {
+        let Some(command) = cli.command else {
+            let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+            list_available_scripts(&root);
+            return Ok(Outcome::default());
+        };
+        match command {
+            Command::Exec { expression, run } => run_script(ScriptSource::Inline(expression), run),
+            Command::Run { script_path, run } => {
                 let source = if script_path.as_os_str() == "-" {
                     ScriptSource::Stdin
                 } else {
@@ -40,7 +41,7 @@ fn main() {
                 };
                 run_script(source, run)
             }
-            Some(Command::Script(args)) => {
+            Command::Script(args) => {
                 let name = args[0].clone();
                 let rest = &args[1..];
                 let run = ScriptRunArgs::try_parse_from(
@@ -50,10 +51,14 @@ fn main() {
                 .run;
                 run_script(ScriptSource::Named(name), run)
             }
-            Some(Command::Help { topic, plain, no_pager }) => ito::help::doc(topic.as_deref(), plain, no_pager)
+            Command::Help {
+                topic,
+                plain,
+                no_pager,
+            } => ito::help::doc(topic.as_deref(), plain, no_pager)
                 .map(|()| Outcome::default())
                 .map_err(RunError::from),
-            Some(Command::Util { command }) => match command {
+            Command::Util { command } => match command {
                 UtilCommand::Completions { shell } => {
                     generate_completions(shell);
                     Ok(Outcome::default())
@@ -111,7 +116,9 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
             base_dir: None,
         },
         ScriptSource::File(ref p) => load_script_file(p).map_err(RunError::from)?,
-        ScriptSource::Stdin => load_script_file(std::path::Path::new("-")).map_err(RunError::from)?,
+        ScriptSource::Stdin => {
+            load_script_file(std::path::Path::new("-")).map_err(RunError::from)?
+        }
         ScriptSource::Named(ref name) => {
             let p = discover_named_script(&vfs_root, name)?;
             load_script_file(&p).map_err(RunError::from)?
@@ -205,7 +212,8 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
             }
         }
         if run.output.diff {
-            write!(out, "{}", vfs.diff().map_err(|e| format!("diff: {e}"))?).map_err(|e| format!("write diff: {e}"))?;
+            write!(out, "{}", vfs.diff().map_err(|e| format!("diff: {e}"))?)
+                .map_err(|e| format!("write diff: {e}"))?;
         }
     }
 
@@ -421,7 +429,6 @@ pub(crate) fn load_script_file(p: &std::path::Path) -> Result<LoadedScript, Stri
         base_dir,
     })
 }
-
 
 pub(crate) fn collect_script_args(
     flags: ScriptArgsFlags,

@@ -47,11 +47,10 @@ fn append_nested_value() {
 
 #[test]
 fn append_duplicate_key_errors() {
-    assert!(eval_err(
-        "a: 1\n",
-        r#"yaml::edit(subject).doc.append("a", 2)"#
-    )
-    .contains("duplicate key: a"));
+    assert!(
+        eval_err("a: 1\n", r#"yaml::edit(subject).doc.append("a", 2)"#)
+            .contains("duplicate key: a")
+    );
 }
 
 #[test]
@@ -90,20 +89,18 @@ fn insert_at_out_of_range_appends() {
 
 #[test]
 fn insert_at_duplicate_key_errors() {
-    assert!(eval_err(
-        "a: 1\n",
-        r#"yaml::edit(subject).doc.insert_at(0, "a", 2)"#
-    )
-    .contains("duplicate key: a"));
+    assert!(
+        eval_err("a: 1\n", r#"yaml::edit(subject).doc.insert_at(0, "a", 2)"#)
+            .contains("duplicate key: a")
+    );
 }
 
 #[test]
 fn insert_at_negative_index_errors() {
-    assert!(eval_err(
-        "a: 1\n",
-        r#"yaml::edit(subject).doc.insert_at(-1, "b", 2)"#
-    )
-    .contains("negative index"));
+    assert!(
+        eval_err("a: 1\n", r#"yaml::edit(subject).doc.insert_at(-1, "b", 2)"#)
+            .contains("negative index")
+    );
 }
 
 // ---- append_or_update ----
@@ -146,11 +143,17 @@ fn remove_by_key() {
 #[test]
 fn remove_returns_found_flag() {
     assert_eq!(
-        eval("a: 1\n", r#"yaml::edit(subject).doc.remove("a").to_string()"#),
+        eval(
+            "a: 1\n",
+            r#"yaml::edit(subject).doc.remove("a").to_string()"#
+        ),
         "true"
     );
     assert_eq!(
-        eval("a: 1\n", r#"yaml::edit(subject).doc.remove("zzz").to_string()"#),
+        eval(
+            "a: 1\n",
+            r#"yaml::edit(subject).doc.remove("zzz").to_string()"#
+        ),
         "false"
     );
 }

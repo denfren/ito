@@ -113,9 +113,9 @@ fn mapping_key_node(map_node: &SyntaxNode, key: &str) -> Option<SyntaxNode> {
 /// key-based mapping edits onto yamlito's position-based primitives.
 fn mapping_key_index(map_node: &SyntaxNode, key: &str) -> Option<usize> {
     let node = Node::cast(map_node.clone())?;
-    node.as_mapping()?.pairs().position(|(k, _)| {
-        matches!(&k, Node::Scalar(s) if s.decoded().ok().as_deref() == Some(key))
-    })
+    node.as_mapping()?.pairs().position(
+        |(k, _)| matches!(&k, Node::Scalar(s) if s.decoded().ok().as_deref() == Some(key)),
+    )
 }
 
 /// Wrap a `Node`-resolved SyntaxNode into the right cursor variant and
@@ -600,10 +600,7 @@ pub mod mapping_api {
     /// indices error. Same block-mapping collapse and cursor-refresh
     /// behaviour as [`remove`](#method.mapping_remove).
     #[rhai_fn(name = "remove_at", return_raw)]
-    pub fn mapping_remove_at(
-        m: &mut MappingCursor,
-        index: i64,
-    ) -> Result<(), Box<EvalAltResult>> {
+    pub fn mapping_remove_at(m: &mut MappingCursor, index: i64) -> Result<(), Box<EvalAltResult>> {
         if index < 0 {
             return Err(format!("negative index: {index}").into());
         }

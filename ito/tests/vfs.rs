@@ -54,10 +54,7 @@ fn empty_write_to_existing_empty_file_is_not_changed() {
     run(&vfs, r#"fs::write("/existing.txt", "");"#);
 
     let changed = vfs.changed().unwrap();
-    assert!(
-        changed.is_empty(),
-        "expected no changes, got: {changed:?}"
-    );
+    assert!(changed.is_empty(), "expected no changes, got: {changed:?}");
     cleanup(&dir);
 }
 

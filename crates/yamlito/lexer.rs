@@ -711,7 +711,8 @@ impl<'a> Lexer<'a> {
         // decoder chomps them per the chomping indicator).
         // An explicit indent digit `n` sets the content indent to
         // parent_indent + n (clamped at 0 for a root parent at column −1).
-        let effective_indent = explicit_indent.map(|n| (parent_indent + n as isize).max(0) as usize);
+        let effective_indent =
+            explicit_indent.map(|n| (parent_indent + n as isize).max(0) as usize);
         let mut detected_indent = effective_indent;
         let mut last_included_pos = self.pos;
         self.consume_newline(bytes); // header's terminating newline

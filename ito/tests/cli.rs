@@ -87,7 +87,12 @@ fn global_dash_c_works_with_run() {
     let script = dir.path().join("s.rhai");
     fs::write(&script, r#"print("run")"#).unwrap();
     ito()
-        .args(["-C", dir.path().to_str().unwrap(), "run", script.to_str().unwrap()])
+        .args([
+            "-C",
+            dir.path().to_str().unwrap(),
+            "run",
+            script.to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("run"));
@@ -148,7 +153,9 @@ fn discover_not_found_exits_nonzero() {
         .arg("nonexistent")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no script found for 'nonexistent'"));
+        .stderr(predicate::str::contains(
+            "no script found for 'nonexistent'",
+        ));
 }
 
 #[test]

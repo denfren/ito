@@ -229,7 +229,10 @@ fn add_attribute() {
 
 #[test]
 fn read_literal_values() {
-    assert_eq!(eval_str(DOC, r#"let h = hcl::edit(subject); h["region"].read()"#), "us-east-1");
+    assert_eq!(
+        eval_str(DOC, r#"let h = hcl::edit(subject); h["region"].read()"#),
+        "us-east-1"
+    );
     let n: i64 = eval(
         DOC,
         r#"let h = hcl::edit(subject); h.block("resource","aws_instance","web")["count"].read()"#,
@@ -253,7 +256,10 @@ fn block_navigation_and_counts() {
     assert_eq!(keys, ["ami", "count"]);
 
     let types: rhai::Array = eval(DOC, r#"let h = hcl::edit(subject); h.block_types()"#);
-    let types: Vec<String> = types.into_iter().map(|d| d.into_string().unwrap()).collect();
+    let types: Vec<String> = types
+        .into_iter()
+        .map(|d| d.into_string().unwrap())
+        .collect();
     assert_eq!(types, ["resource"]);
 }
 
@@ -276,15 +282,24 @@ fn try_variants_swallow_errors() {
     let exists: bool = eval(DOC, r#"let h = hcl::edit(subject); h["nope"].exists()"#);
     assert!(!exists);
 
-    let ok: bool = eval(DOC, r#"let h = hcl::edit(subject); h["nope"].try_write("v")"#);
+    let ok: bool = eval(
+        DOC,
+        r#"let h = hcl::edit(subject); h["nope"].try_write("v")"#,
+    );
     assert!(!ok);
 }
 
 #[test]
 fn block_count_no_labels_matches_any() {
-    let count: i64 = eval(DOC, r#"let h = hcl::edit(subject); h.block_count("resource")"#);
+    let count: i64 = eval(
+        DOC,
+        r#"let h = hcl::edit(subject); h.block_count("resource")"#,
+    );
     assert_eq!(count, 2);
-    let zero: i64 = eval(DOC, r#"let h = hcl::edit(subject); h.block_count("resource", [])"#);
+    let zero: i64 = eval(
+        DOC,
+        r#"let h = hcl::edit(subject); h.block_count("resource", [])"#,
+    );
     assert_eq!(zero, 0);
 }
 
@@ -328,10 +343,16 @@ fn label_globs() {
 
 #[test]
 fn type_checks() {
-    assert!(eval::<bool>(DOC, r#"let h = hcl::edit(subject); h.is_body()"#));
+    assert!(eval::<bool>(
+        DOC,
+        r#"let h = hcl::edit(subject); h.is_body()"#
+    ));
     assert!(eval::<bool>(
         DOC,
         r#"let h = hcl::edit(subject); h.block("resource","aws_instance","web").is_block()"#
     ));
-    assert!(eval::<bool>(DOC, r#"let h = hcl::edit(subject); h["region"].is_expr()"#));
+    assert!(eval::<bool>(
+        DOC,
+        r#"let h = hcl::edit(subject); h["region"].is_expr()"#
+    ));
 }
