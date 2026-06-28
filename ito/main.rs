@@ -16,10 +16,14 @@ struct ScriptRunArgs {
     #[command(flatten)]
     run: RunArgs,
 }
-use ito::scripting::{ScriptArg, Vfs};
+use ito::scripting::{ScriptArg, ScriptFlags, Vfs};
 
 fn main() {
-    let cli = Cli::parse();
+    // Strip key=value / +flag tokens before clap sees the argument list.
+    let raw: Vec<String> = std::env::args().collect();
+    let (script_flags, clean_args) = ScriptFlags::split(&raw[1..]);
+
+    let cli = Cli::parse_from(std::iter::once(raw[0].clone()).chain(clean_args.into_iter()));
     init_tracing(cli.verbose);
 
     let result: Result<Outcome, RunError> = (|| {
@@ -37,7 +41,9 @@ fn main() {
         };
 
         match command {
-            Command::Exec { expression, run } => run_script(ScriptSource::Inline(expression), run),
+            Command::Exec { expression, run } => {
+                run_script(ScriptSource::Inline(expression), run, script_flags)
+            }
             Command::Run { script_path, run } => {
                 let source = if script_path.as_os_str() == "-" {
                     tracing::trace!("Read from STDIN");
@@ -47,7 +53,7 @@ fn main() {
                     tracing::trace!(%file, "Read from FILE");
                     ScriptSource::File(script_path)
                 };
-                run_script(source, run)
+                run_script(source, run, script_flags)
             }
             Command::Script(args) => {
                 let name = args[0].clone();
@@ -57,7 +63,7 @@ fn main() {
                 )
                 .unwrap_or_else(|e| e.exit())
                 .run;
-                run_script(ScriptSource::Named(name), run)
+                run_script(ScriptSource::Named(name), run, script_flags)
             }
             Command::Help {
                 topic,
@@ -108,7 +114,7 @@ pub(crate) fn init_tracing(verbosity: u8) {
         .ok();
 }
 
-fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
+fn run_script(source: ScriptSource, run: RunArgs, script_flags: ScriptFlags) -> Result<Outcome, RunError> {
     // --diff/--list-changed imply --quiet: their report is the output, so
     // script print() is suppressed.
     let script_echo = !(run.output.quiet || run.output.diff || run.output.changed);
@@ -168,7 +174,7 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
     ito::scripting::yaml::register(&mut rhai);
     ito::scripting::hcl::register(&mut rhai);
     ito::scripting::j2::register(&mut rhai, &vfs);
-    ito::scripting::version::register(&mut rhai, env!("CARGO_PKG_VERSION"));
+    ito::scripting::ito::register(&mut rhai, env!("CARGO_PKG_VERSION"), script_flags);
     ito::scripting::string::register(&mut rhai);
     // The `proc` module executes arbitrary processes — off by default;
     // opt in with `--unsafe-proc`.

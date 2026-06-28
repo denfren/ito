@@ -194,7 +194,7 @@ pub struct ScriptArgsFlags {
         num_args = 2,
         action = clap::ArgAction::Append,
         display_order = 0,
-        help = "Inject a string global into the script scope.",
+        help = "Deprecated: inject a string global. Prefer key=value on the command line.",
     )]
     pub arg_string: Vec<String>,
     #[arg(
@@ -204,7 +204,7 @@ pub struct ScriptArgsFlags {
         num_args = 2,
         action = clap::ArgAction::Append,
         display_order = 1,
-        help = "Inject a numeric global (i64 or f64) into the script scope.",
+        help = "Deprecated: inject a numeric global (i64 or f64). Prefer key=value on the command line.",
     )]
     pub arg_numeric: Vec<String>,
     #[arg(
@@ -214,7 +214,7 @@ pub struct ScriptArgsFlags {
         num_args = 2,
         action = clap::ArgAction::Append,
         display_order = 2,
-        help = "Inject a boolean global into the script scope.",
+        help = "Deprecated: inject a boolean global. Prefer +flag on the command line.",
     )]
     pub arg_bool: Vec<String>,
 }

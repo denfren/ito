@@ -21,7 +21,7 @@ The rhai modules provided by `ito`.
 - [hcl — HCL](modules/hcl.md)
 - [j2 — Jinja2 templates](modules/j2.md)
 - [proc — process execution](modules/proc.md)
-- [ito — runtime guard](modules/ito.md)
+- [ito — runtime utilities](modules/ito.md)
 
 # Rhai language
 

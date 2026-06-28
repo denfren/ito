@@ -9,12 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ito:** Script flags — pass `key=value` and `+flag` on the command line;
+  read them with `ito::opt`, `ito::try_opt`, and `ito::flag`
 - First-class invocation of well-known script names — `ito <name>`
   - looks for one of
     - `<name>.ito.rhai`
     - `.<name>.ito.rhai`
     - `ito/<name>.rhai`
     - `.ito/<name>.rhai`
+
+### Deprecated
+
+- `-S`/`-N`/`-B` (`--string`/`--numeric`/`--bool`) injected globals — use `key=value` and `+flag` with `ito::opt`/`ito::flag` instead
 
 ### Changed
 

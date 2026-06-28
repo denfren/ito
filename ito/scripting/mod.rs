@@ -6,6 +6,7 @@
 
 pub mod args;
 pub mod hcl;
+pub mod ito;
 pub mod j2;
 pub mod json;
 pub mod path;
@@ -14,10 +15,10 @@ pub mod proc;
 pub mod re;
 pub mod string;
 pub mod toml;
-pub mod version;
 pub mod vfs;
 pub mod yaml;
 
 pub use args::ScriptArg;
+pub use ito::ScriptFlags;
 pub use pathmap::PathMapper;
 pub use vfs::Vfs;

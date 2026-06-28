@@ -173,3 +173,94 @@ fn reserved_name_without_file_exits_nonzero() {
     let fx = Fixture::new();
     in_fixture(&fx).arg("exec").assert().failure();
 }
+
+// --- ito::flag / ito::opt / ito::try_opt ---
+
+#[test]
+fn script_flag_present() {
+    ito()
+        .args(["exec", r#"print(ito::flag("dry-run"))"#, "+dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("true"));
+}
+
+#[test]
+fn script_flag_absent() {
+    ito()
+        .args(["exec", r#"print(ito::flag("dry-run"))"#])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("false"));
+}
+
+#[test]
+fn script_opt_present() {
+    ito()
+        .args(["exec", r#"print(ito::opt("env"))"#, "env=staging"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staging"));
+}
+
+#[test]
+fn script_opt_absent_exits_nonzero() {
+    ito()
+        .args(["exec", r#"print(ito::opt("env"))"#])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn script_try_opt_present() {
+    ito()
+        .args(["exec", r#"print(ito::try_opt("tag"))"#, "tag=v1.2.3"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("v1.2.3"));
+}
+
+#[test]
+fn script_try_opt_absent_returns_unit() {
+    // Avoid `=` in the inline script — it would be stripped as a key=value script opt.
+    ito()
+        .args(["exec", r#"if ito::try_opt("tag") == () { print("absent") }"#])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("absent"));
+}
+
+#[test]
+fn script_flags_stripped_before_clap() {
+    // +flag and key=value before exec must not confuse clap
+    ito()
+        .args([
+            "exec",
+            r#"print(ito::flag("x") + " " + ito::opt("k"))"#,
+            "+x",
+            "k=hello",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("true hello"));
+}
+
+#[test]
+fn double_dash_does_not_stop_script_flag_scanning() {
+    // +flag after -- is still consumed as a script flag
+    ito()
+        .args(["exec", r#"print(ito::flag("x"))"#, "--", "+x"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("true"));
+}
+
+#[test]
+fn clap_style_arg_not_treated_as_opt() {
+    // --key=val must not be consumed as a script opt
+    ito()
+        .args(["exec", r#"print(ito::try_opt("key") == ())"#, "--key=val"])
+        .assert()
+        // clap will reject --key=val as unknown; the point is it isn't a script opt
+        .failure();
+}
