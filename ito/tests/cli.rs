@@ -64,6 +64,7 @@ fn no_subcommand_no_scripts_prints_hint() {
         .assert()
         .success()
         .stdout(predicate::str::contains("No scripts found"))
+        .stdout(predicate::str::contains("<name>.ito.rhai"))
         .stdout(predicate::str::contains("ito --help"))
         .stdout(predicate::str::contains("ito help"));
 }

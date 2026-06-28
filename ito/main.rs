@@ -325,7 +325,16 @@ fn list_available_scripts(root: &std::path::Path) {
 
     if names.is_empty() {
         println!("No scripts found in {}.", root.display());
-        println!("Place a script at e.g. `<name>.ito.rhai` and run it with `ito <name>`.");
+        println!("Place a script at one of:");
+        for pattern in &[
+            "<name>.ito.rhai",
+            ".<name>.ito.rhai",
+            "ito/<name>.rhai",
+            ".ito/<name>.rhai",
+        ] {
+            println!("  {}/{}", root.display(), pattern);
+        }
+        println!("Then run it with `ito <name>`.");
     } else {
         println!("Available scripts in {}:", root.display());
         for name in &names {
