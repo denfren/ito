@@ -1,0 +1,9 @@
+---
+source: ito/tests/hcl_edit.rs
+expression: "eval_str(&format!(\"{src}\\\n         let t = h.block(\\\"variable\\\",\\\"x\\\").attr(\\\"type\\\").read_raw();\\n\\\n         h.block(\\\"variable\\\",\\\"x\\\").add(\\\"alias\\\", t);\\n\\\n         h.to_string()\"))"
+---
+variable "x" {
+  type = list(string)
+  default = var.fallback
+  alias = list(string)
+}

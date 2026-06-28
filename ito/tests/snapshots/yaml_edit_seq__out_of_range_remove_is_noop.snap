@@ -1,0 +1,6 @@
+---
+source: ito/tests/yaml_edit_seq.rs
+expression: "eval(r#\"\n        let s = yaml::edit(\"- a\\n- b\\n\");\n        s.doc.remove_at(9);\n        s.to_string()\n        \"#)"
+---
+- a
+- b

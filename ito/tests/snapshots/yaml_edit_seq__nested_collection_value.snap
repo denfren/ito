@@ -1,0 +1,9 @@
+---
+source: ito/tests/yaml_edit_seq.rs
+expression: "eval(r#\"\n        let s = yaml::edit(\"- a\\n\");\n        s.doc.append(#{ k: 1, nested: [1, 2] });\n        s.to_string()\n        \"#)"
+---
+- a
+- k: 1
+  nested:
+    - 1
+    - 2

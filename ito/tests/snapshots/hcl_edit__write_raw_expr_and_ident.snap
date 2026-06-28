@@ -1,0 +1,7 @@
+---
+source: ito/tests/hcl_edit.rs
+expression: "eval_str(&format!(\"{src}\\\n         h.block(\\\"variable\\\",\\\"x\\\").attr(\\\"type\\\").write(hcl::expr(\\\"list(string)\\\"));\\n\\\n         h.to_string()\"))"
+---
+variable "x" {
+  type = list(string)
+}

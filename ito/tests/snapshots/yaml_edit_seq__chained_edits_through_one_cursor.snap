@@ -1,0 +1,9 @@
+---
+source: ito/tests/yaml_edit_seq.rs
+expression: "eval(r#\"\n        let s = yaml::edit(\"items:\\n  - a\\n  - b\\n\");\n        let seq = s.doc[\"items\"];\n        seq.append(\"c\");\n        seq.append(\"d\");\n        seq.insert_at(0, \"z\");\n        seq.remove_at(1);\n        s.to_string()\n        \"#)"
+---
+items:
+  - z
+  - b
+  - c
+  - d

@@ -35,3 +35,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 wait-timeout.workspace = true
 yamlito.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

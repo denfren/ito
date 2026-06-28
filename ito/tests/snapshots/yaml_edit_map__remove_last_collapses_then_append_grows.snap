@@ -1,0 +1,5 @@
+---
+source: ito/tests/yaml_edit_map.rs
+expression: "eval(r#\"\n        let s = yaml::edit(\"only: 1\\n\");\n        let m = s.doc;\n        m.remove(\"only\");\n        m.append(\"x\", 1);\n        m.append(\"y\", 2);\n        s.to_string()\n        \"#)"
+---
+{x: 1, y: 2}

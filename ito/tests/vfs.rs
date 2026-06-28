@@ -6,7 +6,6 @@ use rhai::Engine;
 
 use ito::scripting::vfs::Vfs;
 
-/// Create a unique temp directory for a test and return its path.
 fn tmp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ito-vfs-test-{name}"));
     std::fs::create_dir_all(&dir).expect("create tmp dir");
@@ -17,8 +16,6 @@ fn cleanup(dir: &PathBuf) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Build an engine with the `fs` module registered against `vfs` and run
-/// `script`. Panics on eval error.
 fn run(vfs: &Vfs, script: &str) {
     let mut engine = Engine::new();
     ito::scripting::vfs::register(&mut engine, vfs, false, false);

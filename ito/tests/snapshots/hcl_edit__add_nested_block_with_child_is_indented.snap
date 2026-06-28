@@ -1,0 +1,21 @@
+---
+source: ito/tests/hcl_edit.rs
+expression: "eval_str(&format!(\"{DOC}\\\n         let inner = hcl::block(\\\"lifecycle\\\").with_attribute(\\\"create\\\", true);\\n\\\n         let b = hcl::block(\\\"ebs\\\").with_attribute(\\\"size\\\", 100).with_block(inner);\\n\\\n         h.block(\\\"resource\\\",\\\"aws_instance\\\",\\\"web\\\").add(b);\\n\\\n         h.to_string()\"))"
+---
+region = "us-east-1"
+
+resource "aws_instance" "web" {
+  ami = "old" # keep
+  count = 2
+  ebs {
+    size = 100
+
+    lifecycle {
+      create = true
+    }
+  }
+}
+
+resource "aws_instance" "db" {
+  ami = "old2"
+}
