@@ -284,11 +284,12 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            if self.at_document_start_marker() {
+            let had_marker = self.at_document_start_marker();
+            if had_marker {
                 self.bump_directives_end();
                 self.eat_trivia();
             }
-            self.parse_document_body_if_any()?;
+            self.parse_document_body_if_any(had_marker)?;
 
             // Optional `...` end marker, inside the document. Only absorb
             // the inter-trivia into the document when a `...` actually
@@ -321,7 +322,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_document_body_if_any(&mut self) -> Result<(), ParseError> {
+    fn parse_document_body_if_any(&mut self, had_marker: bool) -> Result<(), ParseError> {
         // A document body may be empty (just `---\n`).
         if self.lex.at_eof() {
             return Ok(());
@@ -330,7 +331,14 @@ impl<'a> Parser<'a> {
         if self.at_document_start_marker() || self.at_document_end_marker() {
             return Ok(());
         }
-        let indent = self.lex.column();
+        // After an explicit `---` marker the document root is always at
+        // indent 0: the marker itself starts at column 0 and the body may
+        // appear at any indentation (e.g. `--- >` puts the `>` at column 4
+        // but its content must only be indented > 0). For bare documents
+        // (no `---`) we use the actual column of the first content token
+        // so that a leading-whitespace sequence (` - a`) is detected at its
+        // true indent level and subsequent entries are validated correctly.
+        let indent = if had_marker { 0 } else { self.lex.column() };
         // At the document root the plain-scalar continuation barrier is −1
         // (document-level indent per YAML 1.2 §7.3.3), so a column-0 line
         // folds into a root plain scalar (`"a\nb\n"` → one scalar "a b").
@@ -429,7 +437,14 @@ impl<'a> Parser<'a> {
         indent: usize,
         scalar_min_indent: isize,
     ) -> Result<(), ParseError> {
-        self.reject_tab_indent_at_line_start()?;
+        // A tab is rejected only where the leading white space is genuine
+        // block *indentation* — i.e. it indents a block collection (a
+        // DASH-led sequence or a mapping key). Where the white space merely
+        // *separates* the node from its surroundings (before a scalar value
+        // or a flow node), a tab is valid separation, not indentation. The
+        // dispatch arms below apply the check at the points that commit to a
+        // block collection; `parse_block_node` itself does not (YAML 1.2
+        // §6.1 / §6.2).
         // Node properties (anchor/alias/tag) may precede any block node.
         // If the property group is an alias, it IS the node — return.
         //
@@ -443,8 +458,14 @@ impl<'a> Parser<'a> {
         // them). For a lone scalar the checkpoint is unused: properties
         // stay a preceding sibling of the SCALAR, unchanged.
         let props_cp = self.builder.checkpoint();
-        let had_props = self.at_node_property_start();
+        // Properties may sit behind the entry-indent WHITESPACE left in place
+        // by `eat_trivia_except_entry_indent` (e.g. a mapping value on the
+        // next line: `top:\n  &a key: v`). Consume that leading WHITESPACE
+        // first — inside the checkpoint — so the property is the current
+        // token and any later entry promotion still encloses the indent.
+        let had_props = self.at_node_property_start() || self.property_follows_leading_whitespace();
         if had_props {
+            self.eat_leading_whitespace();
             let was_alias = self.parse_node_properties_with_alias_check()?;
             if was_alias {
                 return Ok(());
@@ -456,14 +477,33 @@ impl<'a> Parser<'a> {
                 // or `!tag\n  key: val` nested deeper). Peek past trivia
                 // and recurse when content follows. Otherwise treat as
                 // a null value decorated by properties.
+                //
+                // A block sequence is the exception: it may be indented at
+                // its parent container's column (YAML 1.2 §8.2.1), which can
+                // be *less* than the property's own column (`seq:\n &a\n- x`).
+                // For that case the floor is `scalar_min_indent`, not `indent`.
+                // A block scalar value (`folded:\n   !foo\n  >1\n value`) gets
+                // the same relaxed floor: its sigil may sit below the property.
                 if let Some(col) = self.column_past_trivia()
-                    && col >= indent
+                    && (col >= indent
+                        || ((self.peek_past_trivia_is_dash()
+                            || self.peek_past_trivia_is_block_scalar())
+                            && col as isize >= scalar_min_indent))
                 {
                     self.eat_trivia();
                     if self.at_document_start_marker() || self.at_document_end_marker() {
                         return Ok(());
                     }
-                    return self.parse_block_node(col, scalar_min_indent);
+                    // When the decorated value sits *less* indented than the
+                    // property, its real parent indent is the container bound
+                    // (`scalar_min_indent`), not the property column — a block
+                    // scalar's indent indicator is taken relative to that.
+                    let node_indent = if col < indent && scalar_min_indent >= 0 {
+                        scalar_min_indent as usize
+                    } else {
+                        col
+                    };
+                    return self.parse_block_node(node_indent, scalar_min_indent);
                 }
                 return Ok(());
             }
@@ -495,7 +535,11 @@ impl<'a> Parser<'a> {
             }
             Some(LexHint::Token(SyntaxKind::LITERAL_SCALAR | SyntaxKind::FOLDED_SCALAR)) => {
                 self.eat_leading_whitespace();
-                self.parse_block_scalar(indent)
+                // The scalar is this node's own content; its content indent is
+                // bounded by the enclosing container (`scalar_min_indent`; −1
+                // at the document root so column-0 content is valid), not by
+                // the node's own column.
+                self.parse_block_scalar(scalar_min_indent)
             }
             Some(LexHint::Token(SyntaxKind::SINGLE_QUOTED_SCALAR))
             | Some(LexHint::Token(SyntaxKind::DOUBLE_QUOTED_SCALAR))
@@ -508,7 +552,15 @@ impl<'a> Parser<'a> {
             // invariant the flow (`{: v}`) and explicit (`? \n: v`) empty-key
             // paths already maintain.
             Some(LexHint::Token(SyntaxKind::COLON)) => {
-                self.parse_block_mapping_empty_first_key(indent, entry_cp)
+                // A lone `:` with neither a value nor a following key is an
+                // empty node (null), not an empty-key mapping (`{null: null}`).
+                if entry_cp.is_none() && self.colon_has_no_value_or_tail() {
+                    self.bump_simple(); // COLON
+                    self.emit_null();
+                    Ok(())
+                } else {
+                    self.parse_block_mapping_empty_first_key(indent, entry_cp)
+                }
             }
             Some(LexHint::Token(k)) => Err(self.err_here(format!("unexpected token {k:?}"))),
         }
@@ -538,6 +590,20 @@ impl<'a> Parser<'a> {
     fn at_node_property_start(&self) -> bool {
         matches!(
             self.lex.peek(),
+            Some(LexHint::Token(
+                SyntaxKind::ANCHOR | SyntaxKind::ALIAS | SyntaxKind::TAG
+            ))
+        )
+    }
+
+    /// True iff the current token is a WHITESPACE (entry indent) immediately
+    /// followed by a node-property token (anchor/alias/tag).
+    fn property_follows_leading_whitespace(&mut self) -> bool {
+        matches!(
+            self.lex.peek(),
+            Some(LexHint::Token(SyntaxKind::WHITESPACE))
+        ) && matches!(
+            self.peek_after_token(),
             Some(LexHint::Token(
                 SyntaxKind::ANCHOR | SyntaxKind::ALIAS | SyntaxKind::TAG
             ))
@@ -576,8 +642,10 @@ impl<'a> Parser<'a> {
             // If whitespace is next AND another property follows, consume
             // the whitespace inside NODE_PROPERTIES and keep looping.
             // Otherwise stop — the whitespace belongs outside.
-            if matches!(self.lex.peek(), Some(LexHint::Token(SyntaxKind::WHITESPACE)))
-                && self.next_non_ws_byte_is_property_sigil()
+            if matches!(
+                self.lex.peek(),
+                Some(LexHint::Token(SyntaxKind::WHITESPACE))
+            ) && self.next_non_ws_byte_is_property_sigil()
             {
                 self.bump_simple();
             } else {
@@ -605,16 +673,26 @@ impl<'a> Parser<'a> {
 
     fn consume_anchor(&mut self) -> Result<(), ParseError> {
         match self.lex.bump_anchor() {
-            Ok(t) => { self.token(SyntaxKind::ANCHOR, t); Ok(()) }
-            Err(LexError::EmptyAnchorName { start }) => Err(self.err_at(start, "anchor name cannot be empty")),
+            Ok(t) => {
+                self.token(SyntaxKind::ANCHOR, t);
+                Ok(())
+            }
+            Err(LexError::EmptyAnchorName { start }) => {
+                Err(self.err_at(start, "anchor name cannot be empty"))
+            }
             Err(_) => unreachable!(),
         }
     }
 
     fn consume_alias(&mut self) -> Result<(), ParseError> {
         match self.lex.bump_alias() {
-            Ok(t) => { self.token(SyntaxKind::ALIAS, t); Ok(()) }
-            Err(LexError::EmptyAliasName { start }) => Err(self.err_at(start, "alias name cannot be empty")),
+            Ok(t) => {
+                self.token(SyntaxKind::ALIAS, t);
+                Ok(())
+            }
+            Err(LexError::EmptyAliasName { start }) => {
+                Err(self.err_at(start, "alias name cannot be empty"))
+            }
             Err(_) => unreachable!(),
         }
     }
@@ -654,6 +732,9 @@ impl<'a> Parser<'a> {
             self.peek_past_leading_whitespace(),
             Some(LexHint::Token(SyntaxKind::QUESTION))
         ) {
+            // An explicit `?` key is a block mapping: leading white space is
+            // indentation, so a tab in it is rejected.
+            self.reject_tab_indent_at_line_start()?;
             self.start(SyntaxKind::BLOCK_MAPPING);
             self.parse_explicit_block_mapping_entry(indent)?;
             self.parse_block_mapping_tail(indent)?;
@@ -665,6 +746,12 @@ impl<'a> Parser<'a> {
         // NODE_PROPERTIES land inside the entry and decorate the key scalar
         // (D4). Otherwise promote from here.
         let cp = props_cp.unwrap_or_else(|| self.builder.checkpoint());
+        // Before consuming the leading indent, record whether it holds a tab.
+        // It only matters if this turns out to be a block mapping key, where
+        // the leading white space is genuine indentation (a tab is illegal).
+        // For a lone scalar the same white space is mere separation, so the
+        // recorded error is discarded.
+        let indent_tab_err = self.reject_tab_indent_at_line_start().err();
         // Emit any leading entry-indent WHITESPACE inside the checkpoint so
         // it lands inside BLOCK_MAPPING_ENTRY after checkpoint promotion.
         self.eat_leading_whitespace();
@@ -677,6 +764,9 @@ impl<'a> Parser<'a> {
         self.lex.set_pos(save);
 
         if is_mapping {
+            if let Some(e) = indent_tab_err {
+                return Err(e);
+            }
             // Commit scalar as a single-line key, then promote the span
             // since `cp` into BLOCK_MAPPING + BLOCK_MAPPING_ENTRY (so any
             // leading WHITESPACE / NODE_PROPERTIES land inside the entry).
@@ -735,7 +825,11 @@ impl<'a> Parser<'a> {
                     .map_err(|e| self.lex_err_to_parse(e))?;
                 Ok((kind, start))
             }
-            Some(LexHint::PlainStart) => {
+            // A leading `:` that is not a colon indicator for this context
+            // is the first byte of a plain scalar (`:,`, `::x`).
+            Some(LexHint::PlainStart) | Some(LexHint::Token(SyntaxKind::COLON))
+                if !self.colon_is_indicator_for(stop) =>
+            {
                 let start = self.lex.pos();
                 self.lex.read_plain_with(stop, None);
                 if self.lex.pos() == start {
@@ -892,8 +986,18 @@ impl<'a> Parser<'a> {
             | Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
             )) => self.parse_scalar_as_node(PlainStop::BlockValue, Some(indent as isize)),
+            // A `:` not acting as an indicator (`k: :foo`) is the first byte
+            // of a plain scalar value.
+            Some(LexHint::Token(SyntaxKind::COLON))
+                if !self.colon_is_indicator_for(PlainStop::BlockValue) =>
+            {
+                self.parse_scalar_as_node(PlainStop::BlockValue, Some(indent as isize))
+            }
             Some(LexHint::Token(SyntaxKind::LITERAL_SCALAR | SyntaxKind::FOLDED_SCALAR)) => {
-                self.parse_block_scalar(indent)
+                // Same-line block scalar value (`k: |`): its content must be
+                // indented strictly more than the key's column (`indent`), so
+                // a same-column sibling key ends it.
+                self.parse_block_scalar(indent as isize)
             }
             Some(LexHint::Token(k)) => Err(self.err_here(format!("unexpected token {k:?}"))),
         }
@@ -929,13 +1033,29 @@ impl<'a> Parser<'a> {
             | Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
             )) => {
-                self.parse_scalar_as_node(PlainStop::BlockValue, None)?;
+                // An explicit key may be a multi-line plain scalar
+                // (`? a\n  true` → key `a true`). Continuation lines fold
+                // when indented past the entry's `?` column (`indent`); the
+                // matching `:` at `indent` ends the key.
+                self.parse_scalar_as_node(PlainStop::BlockValue, Some(indent as isize))?;
             }
             Some(LexHint::Token(SyntaxKind::L_BRACE)) => self.parse_flow_mapping()?,
             Some(LexHint::Token(SyntaxKind::L_BRACKET)) => self.parse_flow_sequence()?,
+            Some(LexHint::Token(SyntaxKind::LITERAL_SCALAR | SyntaxKind::FOLDED_SCALAR)) => {
+                // Block literal/folded scalar as the explicit key (`? |`);
+                // content must be indented past the `?` column (`indent`).
+                self.parse_block_scalar(indent as isize)?;
+            }
             Some(LexHint::Token(SyntaxKind::QUESTION)) => {
                 // Nested explicit-key mapping as the key (`? ? nested ...`).
                 // Recurse as a block node at this column.
+                let col = self.lex.column();
+                self.parse_block_node(col, col as isize)?;
+            }
+            Some(LexHint::Token(SyntaxKind::ANCHOR | SyntaxKind::ALIAS | SyntaxKind::TAG)) => {
+                // Node properties on the explicit key (`? !!str a`). Delegate
+                // to the block-node path so the property group is consumed and
+                // attached to the key it decorates.
                 let col = self.lex.column();
                 self.parse_block_node(col, col as isize)?;
             }
@@ -957,7 +1077,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_block_scalar(&mut self, parent_indent: usize) -> Result<(), ParseError> {
+    fn parse_block_scalar(&mut self, parent_indent: isize) -> Result<(), ParseError> {
         let (kind, text) = self
             .lex
             .bump_block_scalar(parent_indent)
@@ -1005,6 +1125,12 @@ impl<'a> Parser<'a> {
             } else {
                 self.lex.peek()
             };
+            let key_has_props = matches!(
+                key_hint,
+                Some(LexHint::Token(
+                    SyntaxKind::ANCHOR | SyntaxKind::TAG | SyntaxKind::ALIAS
+                ))
+            );
             match key_hint {
                 Some(LexHint::Token(
                     SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
@@ -1015,6 +1141,7 @@ impl<'a> Parser<'a> {
                     self.parse_explicit_block_mapping_entry(indent)?;
                     continue;
                 }
+                _ if key_has_props => {}
                 _ => break, // not a key; let caller surface the error
             }
 
@@ -1024,6 +1151,12 @@ impl<'a> Parser<'a> {
             self.start(SyntaxKind::BLOCK_MAPPING_ENTRY);
             // Consume leading indent whitespace inside the entry.
             self.eat_leading_whitespace();
+            // Node properties (anchor/tag) preceding the key land inside the
+            // entry as a preceding sibling of the key scalar.
+            if key_has_props {
+                self.parse_node_properties_with_alias_check()?;
+                self.eat_inline_trivia();
+            }
             self.parse_scalar_as_node(PlainStop::BlockKey, None)?;
             self.finish_keyed_mapping_entry(indent)?;
         }
@@ -1091,6 +1224,26 @@ impl<'a> Parser<'a> {
         Self::skip_trivia_bytes(bytes, self.lex.pos(), self.lex.column()).map(|(_, col)| col)
     }
 
+    /// At a block `:` indicator (`self.lex` positioned on the COLON).
+    /// True iff there is no value after the colon and no following
+    /// mapping key — i.e. the colon is the entire remaining body (a lone
+    /// `:` document). Reversible byte lookahead. Used to decode `:` as a
+    /// null node rather than an empty-key `{null: null}` mapping.
+    fn colon_has_no_value_or_tail(&self) -> bool {
+        let bytes = self.lex.source().as_bytes();
+        // Skip the `:` itself, then all trivia (whitespace/newlines/
+        // comments). If only trivia remains, there is neither a value nor a
+        // following key.
+        match Self::skip_trivia_bytes(bytes, self.lex.pos() + 1, self.lex.column() + 1) {
+            None => true,
+            Some((i, _)) => {
+                // A document-end `...` marker also means no further content.
+                bytes.get(i..i + 3) == Some(b"...")
+                    && matches!(bytes.get(i + 3), None | Some(b' ' | b'\t' | b'\n' | b'\r'))
+            }
+        }
+    }
+
     /// True iff, after skipping trivia, the next byte is a DASH acting
     /// as a block-sequence indicator.
     fn peek_past_trivia_is_dash(&self) -> bool {
@@ -1101,6 +1254,18 @@ impl<'a> Parser<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Whether the next significant token (past trivia) starts a block
+    /// scalar (`|` or `>`). Like a block sequence, a block scalar value may
+    /// be indented less than a preceding property on its own line — down to
+    /// the enclosing container's bound — so it needs the same relaxed floor.
+    fn peek_past_trivia_is_block_scalar(&self) -> bool {
+        let bytes = self.lex.source().as_bytes();
+        matches!(
+            Self::skip_trivia_bytes(bytes, self.lex.pos(), 0),
+            Some((i, _)) if matches!(bytes.get(i), Some(b'|' | b'>'))
+        )
     }
 
     fn parse_block_sequence(&mut self, indent: usize) -> Result<(), ParseError> {
@@ -1222,7 +1387,9 @@ impl<'a> Parser<'a> {
             Some(LexHint::Token(SyntaxKind::L_BRACE)) => self.parse_flow_mapping()?,
             Some(LexHint::Token(SyntaxKind::L_BRACKET)) => self.parse_flow_sequence()?,
             Some(LexHint::Token(SyntaxKind::LITERAL_SCALAR | SyntaxKind::FOLDED_SCALAR)) => {
-                self.parse_block_scalar(indent)?;
+                // Same-line block scalar entry (`- |`): content must be
+                // indented past the dash column (`indent`).
+                self.parse_block_scalar(indent as isize)?;
             }
             Some(LexHint::PlainStart)
             | Some(LexHint::Token(
@@ -1233,6 +1400,13 @@ impl<'a> Parser<'a> {
                 // same checkpoint-promote machinery. For a lone scalar,
                 // multi-line continuation is bounded by the dash column
                 // (`indent`), not the key-column of the content.
+                let child_indent = self.lex.column();
+                self.parse_block_mapping_or_scalar_ext(child_indent, indent as isize, entry_cp)?;
+            }
+            // A `:` not acting as a separator (`- :,`, `- ::x`) starts a
+            // plain scalar entry. (A `:` that *is* an indicator means an
+            // empty-key mapping entry and is handled elsewhere.)
+            Some(LexHint::Token(SyntaxKind::COLON)) if !self.lex.is_block_colon_indicator() => {
                 let child_indent = self.lex.column();
                 self.parse_block_mapping_or_scalar_ext(child_indent, indent as isize, entry_cp)?;
             }
@@ -1282,6 +1456,19 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Whether the `:` at the current position acts as a key/value colon
+    /// indicator in the given context (so it must NOT be read as the start
+    /// of a plain scalar). For a non-`:` position this is always false.
+    fn colon_is_indicator_for(&self, stop: PlainStop) -> bool {
+        if self.lex.peek() != Some(LexHint::Token(SyntaxKind::COLON)) {
+            return false;
+        }
+        match stop {
+            PlainStop::FlowKey | PlainStop::FlowValue => self.lex.is_flow_colon_indicator(),
+            PlainStop::BlockKey | PlainStop::BlockValue => self.lex.is_block_colon_indicator(),
+        }
+    }
+
     fn parse_scalar_as_node(
         &mut self,
         stop: PlainStop,
@@ -1293,7 +1480,13 @@ impl<'a> Parser<'a> {
             | Some(LexHint::Token(SyntaxKind::DOUBLE_QUOTED_SCALAR)) => {
                 self.bump_quoted()?;
             }
-            Some(LexHint::PlainStart) => {
+            // A leading `:` that is NOT a colon indicator for this context
+            // starts a plain scalar (`:x`, `::vector`, `:,` in a sequence
+            // entry). The lexer always classifies `:` as a COLON token, so
+            // detect the non-indicator case here and scan it as plain.
+            Some(LexHint::PlainStart) | Some(LexHint::Token(SyntaxKind::COLON))
+                if !self.colon_is_indicator_for(stop) =>
+            {
                 let start = self.lex.pos();
                 let text = self.lex.read_plain_with(stop, min_indent);
                 if text.is_empty() {
@@ -1354,8 +1547,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some(LexHint::Token(k)) if k == close => break,
-                None => return Err(self.err_here(format!("expected '{close_ch}' in flow collection"))),
-                _ => return Err(self.err_here(format!("expected ',' or '{close_ch}' in flow collection"))),
+                None => {
+                    return Err(self.err_here(format!("expected '{close_ch}' in flow collection")));
+                }
+                _ => {
+                    return Err(
+                        self.err_here(format!("expected ',' or '{close_ch}' in flow collection"))
+                    );
+                }
             }
         }
 
@@ -1401,18 +1600,51 @@ impl<'a> Parser<'a> {
             Some(LexHint::Token(SyntaxKind::L_BRACKET)) => {
                 self.parse_flow_sequence()?;
             }
+            // Explicit-key entry (`[? foo : baz]`): a single-pair flow
+            // mapping. `parse_flow_entry_body` consumes the `?`, key, `:`,
+            // and value; wrap it as FLOW_MAPPING > FLOW_MAPPING_ENTRY so the
+            // AST layer sees a mapping value of the sequence entry.
+            Some(LexHint::Token(SyntaxKind::QUESTION)) => {
+                self.start(SyntaxKind::FLOW_MAPPING);
+                self.start(SyntaxKind::FLOW_MAPPING_ENTRY);
+                self.parse_flow_entry_body()?;
+                self.eat_inline_trivia();
+                self.finish(); // FLOW_MAPPING_ENTRY
+                self.finish(); // FLOW_MAPPING
+            }
             Some(LexHint::PlainStart)
             | Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
             )) => {
-                // Checkpoint so we can retroactively wrap as
-                // FLOW_MAPPING_ENTRY if we see a flow-colon indicator.
+                // Checkpoint so we can retroactively wrap as a single-pair
+                // FLOW_MAPPING if we see a flow-colon indicator. The pair
+                // must be a FLOW_MAPPING_ENTRY *inside* a FLOW_MAPPING node
+                // so the AST layer (`Node::cast`/`as_mapping`) recognizes it
+                // as a mapping value of the sequence entry.
                 let cp = self.builder.checkpoint();
                 if self.parse_flow_scalar_then_colon()? {
+                    self.start_at(cp, SyntaxKind::FLOW_MAPPING);
                     self.start_at(cp, SyntaxKind::FLOW_MAPPING_ENTRY);
                     self.finish_flow_entry_after_key()?;
                     self.eat_inline_trivia();
                     self.finish(); // FLOW_MAPPING_ENTRY
+                    self.finish(); // FLOW_MAPPING
+                }
+            }
+            // A `:` not acting as a separator (`[:x]`, `[::vector]`) starts a
+            // plain scalar entry. Use the same scalar-then-colon path so a
+            // trailing `: v` still promotes to a single-pair mapping.
+            Some(LexHint::Token(SyntaxKind::COLON))
+                if !self.colon_is_indicator_for(PlainStop::FlowKey) =>
+            {
+                let cp = self.builder.checkpoint();
+                if self.parse_flow_scalar_then_colon()? {
+                    self.start_at(cp, SyntaxKind::FLOW_MAPPING);
+                    self.start_at(cp, SyntaxKind::FLOW_MAPPING_ENTRY);
+                    self.finish_flow_entry_after_key()?;
+                    self.eat_inline_trivia();
+                    self.finish(); // FLOW_MAPPING_ENTRY
+                    self.finish(); // FLOW_MAPPING
                 }
             }
             // Empty value (e.g., after node properties) — accept.
@@ -1506,7 +1738,11 @@ impl<'a> Parser<'a> {
     /// At a flow-colon indicator. Consume the COLON, any trivia, then the
     /// value (scalar, flow collection) — or nothing if the value is empty.
     fn finish_flow_entry_after_key(&mut self) -> Result<(), ParseError> {
-        self.bump_simple(); // COLON
+        // The `:` here may not be followed by a space (`{a:1}`); emit it
+        // as a COLON token directly rather than via `bump_simple` (whose
+        // `peek()` would classify such a `:` as a plain-scalar start).
+        let (k, t) = self.lex.bump_colon();
+        self.token(k, t);
         self.eat_trivia();
         // Node properties on the value.
         if self.at_node_property_start() {
@@ -1530,6 +1766,13 @@ impl<'a> Parser<'a> {
             | Some(LexHint::Token(
                 SyntaxKind::SINGLE_QUOTED_SCALAR | SyntaxKind::DOUBLE_QUOTED_SCALAR,
             )) => self.parse_scalar_as_node(PlainStop::FlowValue, None),
+            // A `:` not acting as a separator (`{x: :x}`) starts a plain
+            // scalar value.
+            Some(LexHint::Token(SyntaxKind::COLON))
+                if !self.colon_is_indicator_for(PlainStop::FlowValue) =>
+            {
+                self.parse_scalar_as_node(PlainStop::FlowValue, None)
+            }
             Some(LexHint::Token(k)) => {
                 Err(self.err_here(format!("unexpected token {k:?} in flow entry value")))
             }

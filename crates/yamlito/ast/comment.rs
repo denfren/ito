@@ -257,7 +257,10 @@ fn render_payload(comments: &[SyntaxToken]) -> String {
 
 fn strip_hash(raw: &str) -> String {
     let after_hash = raw.strip_prefix('#').unwrap_or(raw);
-    after_hash.strip_prefix(' ').unwrap_or(after_hash).to_string()
+    after_hash
+        .strip_prefix(' ')
+        .unwrap_or(after_hash)
+        .to_string()
 }
 
 /// Read the same-line trailing comment directly attached to `entry`.

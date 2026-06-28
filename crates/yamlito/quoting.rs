@@ -31,8 +31,8 @@
 //! The decision order for either context: plain if allowed, else
 //! single-quoted if it has no control characters, else double-quoted.
 
-use crate::ast::value::infer_plain;
 use crate::ast::Value;
+use crate::ast::value::infer_plain;
 use crate::lexer::{as_yaml_1_1_bool, is_yaml_1_1_octal, is_yaml_1_1_sexagesimal};
 
 /// True iff `s` is safe to emit as a **plain** scalar (block or flow) —
@@ -198,8 +198,8 @@ pub fn quote_scalar_flow(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse;
     use crate::ast::{AstNode, Node, Stream};
+    use crate::parse;
 
     /// Decode the single scalar value emitted for `s` in block context,
     /// asserting it round-trips back to exactly `s`.
@@ -212,7 +212,9 @@ mod tests {
         let Node::Scalar(scalar) = node else {
             panic!("expected scalar for {s:?}, got {node:?}");
         };
-        let decoded = scalar.decoded().unwrap_or_else(|e| panic!("decode {s:?}: {e:?}"));
+        let decoded = scalar
+            .decoded()
+            .unwrap_or_else(|e| panic!("decode {s:?}: {e:?}"));
         assert_eq!(decoded, s, "round-trip via {text:?}");
     }
 
@@ -229,7 +231,9 @@ mod tests {
         let Node::Scalar(scalar) = item else {
             panic!("expected scalar item for {s:?}");
         };
-        let decoded = scalar.decoded().unwrap_or_else(|e| panic!("decode {s:?}: {e:?}"));
+        let decoded = scalar
+            .decoded()
+            .unwrap_or_else(|e| panic!("decode {s:?}: {e:?}"));
         assert_eq!(decoded, s, "flow round-trip via {text:?}");
     }
 
@@ -240,28 +244,40 @@ mod tests {
         let mut v: Vec<String> = Vec::new();
         // Structural / indicator characters and whitespace.
         for s in [
-            "a,b", "a]b", "a}b", "a[b", "a{b", "a:b", "a: b", "a #c", "a#b",
-            "a b", " a", "a ", "\ta", "a\t", ":", "::", "-", "- ", "?", "? ",
-            "[", "]", "{", "}", ",", "#", "&a", "*a", "!a", "|", ">", "%", "@",
-            "`", "'", "\"", "''", "\"\"", "", "a'b", "a\"b", "a\\b",
+            "a,b", "a]b", "a}b", "a[b", "a{b", "a:b", "a: b", "a #c", "a#b", "a b", " a", "a ",
+            "\ta", "a\t", ":", "::", "-", "- ", "?", "? ", "[", "]", "{", "}", ",", "#", "&a",
+            "*a", "!a", "|", ">", "%", "@", "`", "'", "\"", "''", "\"\"", "", "a'b", "a\"b",
+            "a\\b",
         ] {
             v.push(s.to_string());
         }
         // Control characters that force double-quoting.
-        for s in ["a\nb", "line1\nline2", "a\tb", "a\rb", "\n", "\t", "\r", "\x00", "\x7f", "a\x01b"] {
+        for s in [
+            "a\nb",
+            "line1\nline2",
+            "a\tb",
+            "a\rb",
+            "\n",
+            "\t",
+            "\r",
+            "\x00",
+            "\x7f",
+            "a\x01b",
+        ] {
             v.push(s.to_string());
         }
         // Core-schema and YAML 1.1 hazard words.
         for s in [
-            "null", "Null", "NULL", "~", "true", "True", "false", "False",
-            "yes", "Yes", "YES", "no", "No", "on", "On", "ON", "off", "Off",
-            "OFF", "010", "0o17", "1:30", "12:34:56", "42", "-7", "1.5", ".inf",
-            ".nan", "1e3",
+            "null", "Null", "NULL", "~", "true", "True", "false", "False", "yes", "Yes", "YES",
+            "no", "No", "on", "On", "ON", "off", "Off", "OFF", "010", "0o17", "1:30", "12:34:56",
+            "42", "-7", "1.5", ".inf", ".nan", "1e3",
         ] {
             v.push(s.to_string());
         }
         // Plain-safe strings that must stay unquoted.
-        for s in ["hello", "it's", "a/b/c", "http://x", "a#b", "key_name", "v1.2.3"] {
+        for s in [
+            "hello", "it's", "a/b/c", "http://x", "a#b", "key_name", "v1.2.3",
+        ] {
             v.push(s.to_string());
         }
         v
@@ -284,7 +300,10 @@ mod tests {
     #[test]
     fn newline_uses_double_quotes_not_single() {
         let out = quote_scalar_block("a\nb");
-        assert!(out.starts_with('"'), "newline string must double-quote: {out:?}");
+        assert!(
+            out.starts_with('"'),
+            "newline string must double-quote: {out:?}"
+        );
         assert_eq!(out, "\"a\\nb\"");
     }
 

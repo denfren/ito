@@ -5,6 +5,7 @@
 //! or type inference (that's the Value layer's job).
 
 use crate::ast::scalar::{Scalar, ScalarStyle};
+use crate::syntax::tree_utils::observed_block_col;
 
 /// Errors producible while decoding a scalar's raw text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,9 +36,26 @@ impl Scalar {
             ScalarStyle::Plain => Ok(decode_plain(raw)),
             ScalarStyle::SingleQuoted => decode_single_quoted(raw),
             ScalarStyle::DoubleQuoted => decode_double_quoted(raw),
-            ScalarStyle::Literal => decode_block(raw, BlockStyle::Literal),
-            ScalarStyle::Folded => decode_block(raw, BlockStyle::Folded),
+            ScalarStyle::Literal => decode_block(raw, BlockStyle::Literal, self.block_parent_indent()),
+            ScalarStyle::Folded => decode_block(raw, BlockStyle::Folded, self.block_parent_indent()),
         }
+    }
+
+    /// The parent indent for this block scalar: the column of the enclosing
+    /// block collection (BLOCK_MAPPING or BLOCK_SEQUENCE), or 0 if the scalar
+    /// is at the document root.
+    fn block_parent_indent(&self) -> usize {
+        let mut cur = self.0.parent();
+        while let Some(node) = cur {
+            if matches!(
+                node.kind(),
+                crate::SyntaxKind::BLOCK_MAPPING | crate::SyntaxKind::BLOCK_SEQUENCE
+            ) {
+                return observed_block_col(&node);
+            }
+            cur = node.parent();
+        }
+        0
     }
 }
 
@@ -54,7 +72,7 @@ fn decode_single_quoted(raw: &str) -> Result<String, DecodeError> {
         .ok_or(DecodeError::MalformedQuoted)?;
     // Unescape `''` → `'`, then fold lines.
     let unescaped = inner.replace("''", "\x00"); // placeholder to preserve through split
-    let folded = fold_lines(split_lines(&unescaped).map(trim_line_spaces));
+    let folded = fold_quoted_lines(split_lines(&unescaped).collect());
     Ok(folded.replace('\x00', "'"))
 }
 
@@ -76,6 +94,10 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
     // but newlines need the fold rules applied. We'll buffer newline-runs
     // and flush when non-newline content arrives.
     let mut pending_newlines: usize = 0;
+    // Byte length of `out` that must never be trimmed as trailing line
+    // whitespace. Escape sequences advance this (so escaped trailing
+    // whitespace like `\ ` is preserved); literal spaces/tabs do not.
+    let mut protected_len = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         // A raw line break — `\n`, `\r`, or `\r\n` — is normalized to a
@@ -83,6 +105,12 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
         // `\r` escape (`\\r`) is decoded in the escape branch below and is
         // unaffected.
         if b == b'\n' || b == b'\r' {
+            // Trailing whitespace on the line being closed is excluded
+            // from the folded content (YAML 1.2 §7.3.1). Only trim
+            // literal whitespace — escape-produced whitespace is protected.
+            while out.len() > protected_len && matches!(out.as_bytes().last(), Some(b' ' | b'\t')) {
+                out.pop();
+            }
             pending_newlines += 1;
             i += 1;
             // Consume the `\n` of a `\r\n` pair as part of the same break.
@@ -107,6 +135,9 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
                 }
             }
             pending_newlines = 0;
+            // Fold output (the join space / line feeds) is content and
+            // must survive any subsequent trailing-whitespace trim.
+            protected_len = out.len();
         }
         if b == b'\\' {
             // Line-continuation: `\<newline>` drops both the backslash and
@@ -124,9 +155,13 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
                 }
                 continue;
             }
-            // Normal escape.
+            // Normal escape. Escaped content (including escaped white
+            // space like `\t`/`\ `) is never folding white space.
             let (decoded, consumed) = decode_dq_escape(inner, i)?;
             out.push_str(&decoded);
+            // Escape output (including `\ ` → space) is content and must
+            // survive end-of-line trailing-whitespace trimming.
+            protected_len = out.len();
             i += consumed;
             continue;
         }
@@ -135,12 +170,12 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
         out.push(ch);
         i += ch.len_utf8();
     }
-    // Flush any trailing newlines (they were pending at EOL).
+    // Flush any trailing newlines (they were pending at EOL). The same
+    // fold rules apply as for interior breaks: a single trailing break
+    // folds to a space, N breaks to N-1 newlines (YAML 1.2 §7.3.1).
     if pending_newlines > 0 {
         if pending_newlines == 1 {
-            // Trailing newline at end of content; drop (no content follows).
-            // Actually: a trailing newline inside quotes is unusual;
-            // preserve as space would be wrong. Drop silently.
+            out.push(' ');
         } else {
             for _ in 0..(pending_newlines - 1) {
                 out.push('\n');
@@ -237,7 +272,7 @@ enum Chomp {
     Keep,  // `+` : keep all trailing newlines
 }
 
-fn decode_block(raw: &str, style: BlockStyle) -> Result<String, DecodeError> {
+fn decode_block(raw: &str, style: BlockStyle, parent_indent: usize) -> Result<String, DecodeError> {
     // Header parse: sigil is at raw[0]; then up to two of {digit, +/-}
     // in any order; then optional inline whitespace + comment; then
     // the body starts after the first newline. If there's no newline,
@@ -291,8 +326,13 @@ fn decode_block(raw: &str, style: BlockStyle) -> Result<String, DecodeError> {
     // `body.split('\n')` yields one extra empty at the end when body ends
     // in `\n`; keep it — it's significant for "trailing newline present".
 
-    // Determine the effective indent.
-    let base_indent = explicit_indent.unwrap_or_else(|| detect_indent(&lines));
+    // Determine the effective indent. With an explicit indicator digit `n`,
+    // the spec defines the content indent as parent_indent + n. Without one,
+    // auto-detect from the first non-blank body line.
+    let base_indent = match explicit_indent {
+        Some(n) => parent_indent + n,
+        None => detect_indent(&lines),
+    };
 
     // Strip base_indent from each line (leaving more-indented lines' extra
     // indent intact). Blank lines that have less than base_indent just
@@ -316,7 +356,10 @@ fn decode_block(raw: &str, style: BlockStyle) -> Result<String, DecodeError> {
     Ok(apply_chomp(joined, chomp))
 }
 
-/// Auto-detect base indent: the indent of the first non-empty line.
+/// Auto-detect base indent (YAML 1.2 §8.1.1.1): the indent of the first
+/// non-empty line. When the block has no non-empty line, the content
+/// indentation is the number of leading spaces on the longest line, so the
+/// blank lines reduce to empty content (their spaces are all indentation).
 fn detect_indent(lines: &[&str]) -> usize {
     for line in lines {
         let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
@@ -324,32 +367,65 @@ fn detect_indent(lines: &[&str]) -> usize {
             return leading_spaces;
         }
     }
-    0
+    // All lines blank: take the maximum leading-space run.
+    lines
+        .iter()
+        .map(|line| line.bytes().take_while(|&b| b == b' ').count())
+        .max()
+        .unwrap_or(0)
 }
 
-/// Literal: join stripped lines with '\n'.
+/// Literal: join stripped lines, terminating each (including the last)
+/// with a `\n`. This yields a trailing newline so `apply_chomp` can clip
+/// it to one (Clip), keep it (Keep, including trailing blank lines), or
+/// strip it (Strip).
+///
+/// The body's line split yields a trailing empty element when the body
+/// ends in `\n` (the common case); that empty element is the line
+/// terminator of the last content line, so it must not produce its own
+/// `\n` — otherwise every body would gain a spurious blank line. We emit
+/// `\n` after each line *except* a single trailing empty one.
 fn join_literal(lines: &[String]) -> String {
     let mut out = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
+    // Drop a single trailing empty line: it's the terminator of the last
+    // content line, not a blank line of its own.
+    let end = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
+    for line in &lines[..end] {
         out.push_str(line);
+        out.push('\n');
     }
     out
 }
 
-/// Folded block scalar joining per YAML 1.2:
-///   - Two adjacent non-empty, non-more-indented lines join with a space.
-///   - More-indented lines always separate with a newline on both sides.
-///   - A run of N blank lines between content lines contributes N newlines.
-///   - Trailing blank lines are emitted verbatim (chomp handles them).
+/// Folded block scalar joining per YAML 1.2 (after base-indent stripping):
+///   - Leading blank lines each contribute one `\n` (before the content).
+///   - Two adjacent non-blank, non-more-indented lines join with a space.
+///   - A more-indented line is separated by `\n` on both sides.
+///   - A run of N (≥1) blank lines between two content lines contributes
+///     N newlines when both surrounding lines are regular, or N+1 when
+///     either is more-indented (the more-indented break is kept literally
+///     in addition to the blank lines' own newlines).
+///   - The last content line is terminated by one `\n`, plus one `\n` per
+///     trailing blank line. `apply_chomp` then clips/keeps/strips them.
 fn join_folded(lines: &[String]) -> String {
     let is_more_indented = |s: &str| s.starts_with(' ') || s.starts_with('\t');
+    // The body's line split yields a trailing empty element when the body
+    // ends in `\n`; that element is the last content line's terminator,
+    // not a blank line of its own. Drop it before folding.
+    let end = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
+    let lines = &lines[..end];
+
     let mut out = String::new();
     let mut i = 0;
-    // Skip leading blank lines, preserving them literally (they become
-    // leading newlines in the output).
+    // Leading blank lines → one `\n` each.
     while i < lines.len() && lines[i].is_empty() {
         out.push('\n');
         i += 1;
@@ -367,21 +443,12 @@ fn join_folded(lines: &[String]) -> String {
         }
         let blanks = i - run_start;
         if i == lines.len() {
-            // Trailing blanks: emit one newline per blank, plus one to
-            // terminate the previous content line. Chomp adjusts later.
-            for _ in 0..=blanks {
+            // Trailing blanks: one `\n` per blank line. Chomp adjusts later.
+            for _ in 0..blanks {
                 out.push('\n');
-            }
-            // We added one too many if `blanks == 0`; balance below.
-            if blanks == 0 {
-                // No trailing blanks means we just fell off; remove the
-                // extra newline we added.
-                out.pop();
             }
             break;
         }
-        let prev = &lines[run_start.saturating_sub(1).min(run_start)];
-        let _ = prev;
         let cur = &lines[i];
         let prev_content = &lines[run_start - 1];
         let prev_more = is_more_indented(prev_content);
@@ -394,14 +461,22 @@ fn join_folded(lines: &[String]) -> String {
                 out.push(' ');
             }
         } else {
-            // N blank lines → N newlines total separator.
-            for _ in 0..blanks {
+            // N blank lines: N newlines, plus one more when a more-indented
+            // line is involved (its line break is kept literally).
+            let count = if prev_more || cur_more {
+                blanks + 1
+            } else {
+                blanks
+            };
+            for _ in 0..count {
                 out.push('\n');
             }
         }
         out.push_str(cur);
         i += 1;
     }
+    // Terminate the last content line.
+    out.push('\n');
     out
 }
 
@@ -415,12 +490,15 @@ fn apply_chomp(mut s: String, chomp: Chomp) -> String {
             s
         }
         Chomp::Clip => {
-            // Reduce to exactly one trailing newline iff there was one.
+            // Keep the line break of the last non-empty line and drop any
+            // trailing empty lines (YAML 1.2 §8.1.1.2). A block with no
+            // content (only line breaks) chomps to the empty string — clip
+            // keeps a break only when there is content to terminate.
             let had = s.ends_with('\n');
             while s.ends_with('\n') {
                 s.pop();
             }
-            if had {
+            if had && !s.is_empty() {
                 s.push('\n');
             }
             s
@@ -430,6 +508,67 @@ fn apply_chomp(mut s: String, chomp: Chomp) -> String {
 
 fn trim_line_spaces(line: &str) -> &str {
     line.trim_matches(|c: char| c == ' ' || c == '\t')
+}
+
+/// Fold flow-quoted scalar lines (single-quoted; double-quoted handles
+/// its own escapes separately) per YAML 1.2 §7.3.
+///
+/// Each line break strips the trailing whitespace of the line it closes
+/// and the leading whitespace of the next line (that whitespace abuts the
+/// break and is not content). A run of `n` breaks then folds: one break to
+/// a single space, `n` breaks to `n-1` newlines. This holds even when the
+/// scalar has no other content (e.g. `'\n  '` → `" "`, `'\n\n  '` → `"\n"`):
+/// the breaks fold among themselves. Only whitespace not adjacent to any
+/// break — the first line's leading run and the last line's trailing run —
+/// survives as content.
+fn fold_quoted_lines(lines: Vec<&str>) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let last = lines.len() - 1;
+    let mut out = String::new();
+    let mut pending_breaks = 0usize;
+    for (i, &line) in lines.iter().enumerate() {
+        // Strip whitespace that abuts a break: every line's leading run
+        // except the first line's, every line's trailing run except the
+        // last line's.
+        let line = if i == 0 {
+            line
+        } else {
+            line.trim_start_matches([' ', '\t'])
+        };
+        let line = if i == last {
+            line
+        } else {
+            line.trim_end_matches([' ', '\t'])
+        };
+        // Flush the breaks accumulated since the previous emitted content.
+        if i > 0 {
+            pending_breaks += 1;
+        }
+        if !line.is_empty() {
+            flush_flow_breaks(&mut out, pending_breaks);
+            pending_breaks = 0;
+            out.push_str(line);
+        }
+    }
+    // Trailing breaks (after the last content) fold the same way.
+    flush_flow_breaks(&mut out, pending_breaks);
+    out
+}
+
+/// Emit a folded run of `n` flow line breaks: nothing for 0, a single
+/// space for 1, and `n-1` newlines for `n >= 2` (YAML 1.2 §7.3.1).
+fn flush_flow_breaks(out: &mut String, n: usize) {
+    match n {
+        0 => {}
+        1 => out.push(' '),
+        _ => {
+            for _ in 0..(n - 1) {
+                out.push('\n');
+            }
+        }
+    }
 }
 
 /// Split raw scalar text into logical lines, treating `\n`, `\r`, and
@@ -794,10 +933,7 @@ mod tests {
 
     #[test]
     fn single_quoted_crlf_no_carriage_return() {
-        assert_eq!(
-            first_scalar("k: 'a\r\n  b'\r\n").decoded().unwrap(),
-            "a b"
-        );
+        assert_eq!(first_scalar("k: 'a\r\n  b'\r\n").decoded().unwrap(), "a b");
     }
 
     #[test]

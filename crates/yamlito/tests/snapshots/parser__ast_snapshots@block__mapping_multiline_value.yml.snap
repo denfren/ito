@@ -1,7 +1,7 @@
 ---
-source: tests/parser.rs
-expression: "ito::debug::ast_string(&tree)"
-input_file: tests/yaml/block/mapping_multiline_value.yml
+source: crates/yamlito/tests/parser.rs
+expression: "yamlito::debug::ast_string(&tree)"
+input_file: crates/yamlito/tests/yaml/block/mapping_multiline_value.yml
 ---
 Stream
   Document
@@ -11,8 +11,8 @@ Stream
           Scalar [plain] "description"
             decoded="description" value=String("description")
         Value
-          Scalar [literal] "|\n  line one\n  line two"
-            decoded="line one\nline two" value=String("line one\nline two")
+          Scalar [literal] "|\n  line one\n  line two\n"
+            decoded="line one\nline two\n" value=String("line one\nline two\n")
       Entry
         Key
           Scalar [plain] "title"

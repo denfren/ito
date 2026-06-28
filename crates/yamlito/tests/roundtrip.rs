@@ -26,15 +26,11 @@ use yamlito::Yaml;
 /// stressed at every position (leading, trailing, embedded).
 const HOSTILE: &[&str] = &[
     // control characters (B1)
-    "\n", "\r", "\t",
-    // structural / indicators / whitespace
-    ",", "]", "}", "[", "{", ":", "#", " ", "-", "?", "&", "*", "!", "|",
-    ">", "'", "\"", "%", "@", "`", "\\", ": ", " #",
-    // YAML 1.1 / Core-schema hazard words (A4)
-    "yes", "no", "on", "off", "true", "false", "null", "Yes", "No", "On",
-    "Off", "True", "False", "Null", "YES", "NO", "ON", "OFF", "TRUE",
-    "FALSE", "NULL", "~",
-    // number-like (A4)
+    "\n", "\r", "\t", // structural / indicators / whitespace
+    ",", "]", "}", "[", "{", ":", "#", " ", "-", "?", "&", "*", "!", "|", ">", "'", "\"", "%", "@",
+    "`", "\\", ": ", " #", // YAML 1.1 / Core-schema hazard words (A4)
+    "yes", "no", "on", "off", "true", "false", "null", "Yes", "No", "On", "Off", "True", "False",
+    "Null", "YES", "NO", "ON", "OFF", "TRUE", "FALSE", "NULL", "~", // number-like (A4)
     "0", "010", "42", "-7", "1.5", "1:30", "12:34:56", ".inf", ".nan",
     // plain-safe filler
     "a", "b", "hello", "key_name", "it's", "http://x",
@@ -43,8 +39,7 @@ const HOSTILE: &[&str] = &[
 /// A string assembled from 0–6 hostile fragments. The empty join yields
 /// `""`, which the policy must also handle (B2).
 fn hostile_string() -> impl Strategy<Value = String> {
-    prop::collection::vec(prop::sample::select(HOSTILE), 0..6)
-        .prop_map(|parts| parts.concat())
+    prop::collection::vec(prop::sample::select(HOSTILE), 0..6).prop_map(|parts| parts.concat())
 }
 
 /// A finite, exactly-representable float. We avoid NaN (which breaks

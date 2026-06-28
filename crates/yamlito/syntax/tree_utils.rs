@@ -282,9 +282,7 @@ struct ReindentCtx {
 
 impl ReindentCtx {
     fn in_block_scalar(&self, pos: usize) -> bool {
-        self.scalar_ranges
-            .iter()
-            .any(|&(s, e)| pos >= s && pos < e)
+        self.scalar_ranges.iter().any(|&(s, e)| pos >= s && pos < e)
     }
 
     fn rebuild_node(&mut self, green: &GreenNode) -> GreenNode {

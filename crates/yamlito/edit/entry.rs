@@ -199,10 +199,7 @@ fn flow_value_text(value: &Yaml) -> String {
             format!("[{}]", inner.join(", "))
         }
         Yaml::Map(pairs) => {
-            let inner: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| flow_entry_text(k, v))
-                .collect();
+            let inner: Vec<String> = pairs.iter().map(|(k, v)| flow_entry_text(k, v)).collect();
             format!("{{{}}}", inner.join(", "))
         }
     }
@@ -313,12 +310,8 @@ fn remove_flow_entry(tree: &mut SyntaxTree, map: &SyntaxNode, index: usize) -> S
         return replace_node_live(tree, map, empty);
     }
 
-    let is_comma = |i: usize| {
-        matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::COMMA)
-    };
-    let is_ws = |i: usize| {
-        matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE)
-    };
+    let is_comma = |i: usize| matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::COMMA);
+    let is_ws = |i: usize| matches!(children.get(i), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE);
 
     let mut start = entry_idx;
     let mut end = entry_idx + 1;
@@ -689,10 +682,7 @@ mod tests {
 
     #[test]
     fn flow_insert_nested_map_value_reads_back() {
-        assert_flow_insert_round_trips(
-            "m",
-            Yaml::Map(vec![("a: b".into(), Yaml::Int(1))]),
-        );
+        assert_flow_insert_round_trips("m", Yaml::Map(vec![("a: b".into(), Yaml::Int(1))]));
     }
 
     // ---- value fidelity ----

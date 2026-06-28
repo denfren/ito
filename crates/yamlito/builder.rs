@@ -74,7 +74,11 @@ impl Yaml {
     /// still rejected (see [`Yaml::from_tree`]).
     pub fn from_stream(tree: &SyntaxTree) -> Result<Vec<Yaml>, String> {
         let stream = Stream::cast(tree.root().clone()).ok_or("not a YAML stream")?;
-        stream.documents().map(|doc| doc_value(&doc)).collect()
+        stream
+            .documents()
+            .filter(|doc| !is_empty_marker_document(doc))
+            .map(|doc| doc_value(&doc))
+            .collect()
     }
 
     /// Render a slice of values as a multi-document YAML stream. Each
@@ -93,6 +97,25 @@ impl Yaml {
     }
 }
 
+/// A document that carries no actual content: no root node, no node
+/// properties (a lone `!` tag decorates a null node and *does* count),
+/// no directives, and no explicit `---` marker. This is what the parser
+/// produces for a lone `...` end marker (optionally preceded by
+/// comments) — per the YAML spec such a stream has zero documents, so
+/// it must not contribute a spurious null value. A bare `---\n` (with
+/// the explicit marker) is *not* empty: it is one null document.
+fn is_empty_marker_document(doc: &crate::ast::Document) -> bool {
+    use crate::ast::AstNode;
+    let has_properties = doc
+        .syntax()
+        .children()
+        .any(|c| c.kind() == crate::SyntaxKind::NODE_PROPERTIES);
+    doc.root_node().is_none()
+        && !has_properties
+        && doc.directives().is_none()
+        && doc.directives_end_token().is_none()
+}
+
 /// Decode a single document's root node into a `Yaml` value. An empty
 /// document (e.g. `---` with no body) decodes to null.
 fn doc_value(doc: &crate::ast::Document) -> Result<Yaml, String> {
@@ -102,19 +125,57 @@ fn doc_value(doc: &crate::ast::Document) -> Result<Yaml, String> {
     }
 }
 
+/// Whether a scalar's tag forces string interpretation, bypassing YAML 1.2
+/// Core schema type inference. The non-specific `!` tag and the `str` tag
+/// (as `!!str` or its verbatim URI) both force string.
+fn has_str_tag(s: &crate::ast::Scalar) -> bool {
+    match s.properties().and_then(|p| p.tag_value()) {
+        Some(crate::ast::Tag::NonSpecific) => true,
+        Some(crate::ast::Tag::Secondary(ref t)) => t == "str",
+        Some(crate::ast::Tag::Verbatim(ref uri)) => uri == "tag:yaml.org,2002:str",
+        _ => false,
+    }
+}
+
+/// Convert a scalar node to a `Yaml` value, honoring an `!!str` tag.
+fn scalar_to_yaml(s: &crate::ast::Scalar) -> Result<Yaml, String> {
+    if has_str_tag(s) {
+        // `!!str` forces string; an empty/implicit-null scalar is `""`.
+        let text = if s.is_null() {
+            String::new()
+        } else {
+            s.decoded()
+                .map_err(|e| format!("scalar decode error: {e:?}"))?
+        };
+        return Ok(Yaml::Str(text));
+    }
+    match s
+        .to_value()
+        .map_err(|e| format!("scalar decode error: {e:?}"))?
+    {
+        Value::Null => Ok(Yaml::Null),
+        Value::Bool(b) => Ok(Yaml::Bool(b)),
+        Value::Int(n) => Ok(Yaml::Int(n)),
+        Value::Float(f) => Ok(Yaml::Float(f)),
+        Value::String(t) => Ok(Yaml::Str(t)),
+    }
+}
+
+/// Convert a scalar acting as a mapping key into its string form. An
+/// implicit-null / empty key (`!!str :`, `: v`) becomes the empty
+/// string, the JSON-compatible representation of a null key.
+fn key_string(s: &crate::ast::Scalar) -> Result<String, String> {
+    if has_str_tag(s) || s.is_null() {
+        return Ok(s.decoded().unwrap_or_default());
+    }
+    s.decoded()
+        .map_err(|e| format!("mapping key decode error: {e:?}"))
+}
+
 /// Convert one AST node into a `Yaml` value, recursing into collections.
 fn from_node(node: &Node) -> Result<Yaml, String> {
     match node {
-        Node::Scalar(s) => match s
-            .to_value()
-            .map_err(|e| format!("scalar decode error: {e:?}"))?
-        {
-            Value::Null => Ok(Yaml::Null),
-            Value::Bool(b) => Ok(Yaml::Bool(b)),
-            Value::Int(n) => Ok(Yaml::Int(n)),
-            Value::Float(f) => Ok(Yaml::Float(f)),
-            Value::String(t) => Ok(Yaml::Str(t)),
-        },
+        Node::Scalar(s) => scalar_to_yaml(s),
         Node::BlockSequence(_) | Node::FlowSequence(_) => {
             let seq = node.as_sequence().expect("sequence node");
             let mut items = Vec::new();
@@ -128,9 +189,7 @@ fn from_node(node: &Node) -> Result<Yaml, String> {
             let mut pairs = Vec::new();
             for (key, value) in map.pairs() {
                 let key = match &key {
-                    Node::Scalar(s) => s
-                        .decoded()
-                        .map_err(|e| format!("mapping key decode error: {e:?}"))?,
+                    Node::Scalar(s) => key_string(s)?,
                     _ => return Err("non-scalar mapping keys are not supported".to_string()),
                 };
                 let value = match value {
@@ -665,22 +724,81 @@ mod tests {
     fn str_round_trips_hostile_alphabet() {
         let cases = [
             // control characters (B1)
-            "a\nb", "line1\nline2", "a\tb", "a\rb", "\n", "\t",
+            "a\nb",
+            "line1\nline2",
+            "a\tb",
+            "a\rb",
+            "\n",
+            "\t",
             // structural / indicators / whitespace
-            "a,b", "a]b", "a}b", "a: b", "a:b", "a #c", "a#b", "a b",
-            " a", "a ", ":", "-", "- ", "?", "[", "]", "{", "}", ",", "#",
-            "&a", "*a", "!a", "|", ">", "%", "@", "`", "'", "\"", "", "a'b",
-            "a\"b", "a\\b",
+            "a,b",
+            "a]b",
+            "a}b",
+            "a: b",
+            "a:b",
+            "a #c",
+            "a#b",
+            "a b",
+            " a",
+            "a ",
+            ":",
+            "-",
+            "- ",
+            "?",
+            "[",
+            "]",
+            "{",
+            "}",
+            ",",
+            "#",
+            "&a",
+            "*a",
+            "!a",
+            "|",
+            ">",
+            "%",
+            "@",
+            "`",
+            "'",
+            "\"",
+            "",
+            "a'b",
+            "a\"b",
+            "a\\b",
             // Core-schema and YAML 1.1 hazard words (A4)
-            "null", "true", "false", "~", "yes", "Yes", "YES", "no", "off",
-            "on", "On", "010", "1:30", "12:34:56", "42", "-7", "1.5", ".inf",
+            "null",
+            "true",
+            "false",
+            "~",
+            "yes",
+            "Yes",
+            "YES",
+            "no",
+            "off",
+            "on",
+            "On",
+            "010",
+            "1:30",
+            "12:34:56",
+            "42",
+            "-7",
+            "1.5",
+            ".inf",
             // plain-safe
-            "hello", "it's", "http://x", "key_name",
+            "hello",
+            "it's",
+            "http://x",
+            "key_name",
         ];
         for s in cases {
             let y = Yaml::Str(s.to_string());
             let back = from_yaml(&y.to_yaml_string());
-            assert_eq!(back, y, "round-trip failed for {s:?} via {:?}", y.to_yaml_string());
+            assert_eq!(
+                back,
+                y,
+                "round-trip failed for {s:?} via {:?}",
+                y.to_yaml_string()
+            );
         }
     }
 

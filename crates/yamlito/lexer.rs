@@ -110,7 +110,19 @@ impl<'a> Lexer<'a> {
             {
                 Some(LexHint::Token(SyntaxKind::BOM))
             }
-            b':' => Some(LexHint::Token(SyntaxKind::COLON)),
+            // `:` is a mapping value indicator only when followed by
+            // space/tab/newline/EOF (block context). Otherwise (`:foo`,
+            // `::`) the leading `:` is a plain-scalar character.
+            b':' => {
+                if matches!(
+                    self.byte_at(self.pos + 1),
+                    None | Some(b' ' | b'\t' | b'\n' | b'\r')
+                ) {
+                    Some(LexHint::Token(SyntaxKind::COLON))
+                } else {
+                    Some(LexHint::PlainStart)
+                }
+            }
             b',' => Some(LexHint::Token(SyntaxKind::COMMA)),
             b'{' => Some(LexHint::Token(SyntaxKind::L_BRACE)),
             b'}' => Some(LexHint::Token(SyntaxKind::R_BRACE)),
@@ -229,6 +241,18 @@ impl<'a> Lexer<'a> {
         (kind, &self.src[start..self.pos])
     }
 
+    /// Bump a `:` as a COLON token unconditionally. Unlike `bump_simple`,
+    /// this does not consult `peek()` (which classifies `:` not followed by
+    /// space/newline/EOF as the start of a plain scalar). Flow-context
+    /// callers have already established via `is_flow_colon_indicator*` that
+    /// the `:` here is a value indicator, even when no space follows.
+    pub fn bump_colon(&mut self) -> (SyntaxKind, &'a str) {
+        debug_assert_eq!(self.peek_byte(), Some(b':'));
+        let start = self.pos;
+        self.pos += 1;
+        (SyntaxKind::COLON, &self.src[start..self.pos])
+    }
+
     /// Consume a single- or double-quoted scalar starting at `pos`.
     /// Returns the whole token including the surrounding quotes.
     ///
@@ -342,11 +366,28 @@ impl<'a> Lexer<'a> {
                     self.pos = line_end;
                     break;
                 };
+                // A continuation line whose first non-blank byte is `#` is a
+                // comment line, not scalar content — terminate the scalar and
+                // leave the comment as trivia (applies in flow and block).
+                if self.src.as_bytes().get(self.pos) == Some(&b'#') {
+                    self.pos = line_end;
+                    break;
+                }
                 if !is_flow && (cont_indent as isize) <= min {
                     self.pos = line_end;
                     break;
                 }
-                if !is_flow && self.line_starts_with_block_indicator_or_key(stop) {
+                // A `- `/`? ` block indicator only ends the scalar when the
+                // line sits at the owning container's indent (a real
+                // sibling). The text-fold barrier `min` is −1 at the
+                // document root, so the structural level there is column 0;
+                // a deeper `- ` (e.g. `- a\n - b` at column 1) is folded
+                // scalar text, not a nested sequence.
+                let structural_indent = min.max(0);
+                let break_on_dash_question = (cont_indent as isize) <= structural_indent;
+                if !is_flow
+                    && self.line_starts_with_block_indicator_or_key(stop, break_on_dash_question)
+                {
                     self.pos = line_end;
                     break;
                 }
@@ -446,6 +487,13 @@ impl<'a> Lexer<'a> {
     /// line, or `None` at EOF.
     fn skip_blank_lines_for_continuation(&mut self) -> Option<usize> {
         let bytes = self.src.as_bytes();
+        // Skip trailing whitespace on the current line before checking for the
+        // newline. `scan_plain_line` stops at trailing spaces (they are not
+        // part of the scalar value), so `self.pos` may be at a space rather
+        // than directly on the `\n`.
+        while matches!(bytes.get(self.pos), Some(b' ' | b'\t')) {
+            self.pos += 1;
+        }
         // Must be on a newline to start.
         if !matches!(bytes.get(self.pos), Some(b'\n' | b'\r')) {
             return None;
@@ -469,14 +517,23 @@ impl<'a> Lexer<'a> {
     /// Assuming `self.pos` is at the first non-whitespace byte of a line,
     /// return true if that line is not a valid plain-scalar continuation:
     /// it starts with a block indicator or contains a `key: ` pattern.
-    fn line_starts_with_block_indicator_or_key(&self, stop: PlainStop) -> bool {
+    ///
+    /// `break_on_dash_question` gates the `- `/`? ` sibling check: it is
+    /// only a structural break when the line is at the container's indent.
+    /// A deeper `- ` is folded scalar text (see `read_plain_with`).
+    fn line_starts_with_block_indicator_or_key(
+        &self,
+        stop: PlainStop,
+        break_on_dash_question: bool,
+    ) -> bool {
         let bytes = self.src.as_bytes();
         let b = match bytes.get(self.pos) {
             Some(&b) => b,
             None => return false,
         };
         // Block sequence `-`, explicit key `?`.
-        if matches!(b, b'-' | b'?')
+        if break_on_dash_question
+            && matches!(b, b'-' | b'?')
             && matches!(
                 bytes.get(self.pos + 1),
                 None | Some(b' ' | b'\t' | b'\n' | b'\r')
@@ -600,9 +657,15 @@ impl<'a> Lexer<'a> {
     /// Returns the full slice from the `|`/`>` through the last byte of
     /// the scalar (which may or may not be a newline). The returned
     /// token kind is `LITERAL_SCALAR` or `FOLDED_SCALAR`.
+    /// `parent_indent` is the indentation of the node this scalar is the
+    /// value of, as a *signed* column: a block scalar at the document root
+    /// has no enclosing node, modeled as column −1 (so content at column 0
+    /// is valid). A block scalar that is a mapping value or sequence entry
+    /// passes the key/dash column, so its content must be indented strictly
+    /// more than that column and a same-column sibling (`next: ...`) ends it.
     pub fn bump_block_scalar(
         &mut self,
-        parent_indent: usize,
+        parent_indent: isize,
     ) -> Result<(SyntaxKind, &'a str), LexError> {
         let start = self.pos;
         let bytes = self.src.as_bytes();
@@ -658,22 +721,28 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        // Body scan. We keep `last_included_pos` as the end of the last
-        // byte that belongs to the scalar. Lines are included if:
-        //   - blank (all whitespace to newline), OR
-        //   - indent > parent_indent (when effective_indent not yet set
-        //     by an explicit digit); once effective_indent is known, the
-        //     line must have indent >= effective_indent.
-        let effective_indent = explicit_indent.map(|n| parent_indent + n);
+        // Body scan. `last_included_pos` is the end of the last byte that
+        // belongs to the scalar. Each iteration handles one line *including*
+        // its terminating newline, so a trailing run of blank lines is fully
+        // captured (significant for keep-chomp) without depending on a
+        // following content line to pull the newline in.
+        //
+        // A line belongs to the scalar if it is:
+        //   - blank (whitespace only, with indent <= content indent), OR
+        //   - a content line with indent >= the content indent (auto-detected
+        //     from the first content line, or fixed by an explicit digit).
+        // The first non-blank line whose indent is too small ends the block;
+        // any blank lines already consumed before it stay in the token (the
+        // decoder chomps them per the chomping indicator).
+        // An explicit indent digit `n` sets the content indent to
+        // parent_indent + n (clamped at 0 for a root parent at column −1).
+        let effective_indent = explicit_indent.map(|n| (parent_indent + n as isize).max(0) as usize);
         let mut detected_indent = effective_indent;
         let mut last_included_pos = self.pos;
+        // Consume the header's terminating newline before the first line.
+        self.consume_newline(bytes);
 
         loop {
-            // Consume the terminator of the previous line.
-            match bytes.get(self.pos) {
-                None => break,
-                _ => self.consume_newline(bytes),
-            }
             let line_start = self.pos;
             // Count indent.
             while matches!(bytes.get(self.pos), Some(b' ')) {
@@ -681,27 +750,52 @@ impl<'a> Lexer<'a> {
             }
             let indent = self.pos - line_start;
 
-            // Is the line blank?
-            match bytes.get(self.pos) {
-                None => {
-                    // EOF after whitespace-only line; include whatever
-                    // newlines we consumed but not the trailing spaces.
+            // Is the line blank (whitespace only, up to a newline or EOF)?
+            //
+            // A whitespace-only line whose indent exceeds the block content
+            // indent is NOT blank: the spaces past the indent are significant
+            // content (e.g. a literal block whose last line is a lone space).
+            // Such a line is treated like any other content line below.
+            let is_blank = matches!(bytes.get(self.pos), None | Some(b'\n' | b'\r'))
+                && match detected_indent {
+                    Some(n) => indent <= n,
+                    None => true,
+                };
+            if is_blank {
+                if bytes.get(self.pos).is_none() {
+                    // EOF on a blank line: the spaces are not content (the
+                    // line has no terminator), so stop before them.
                     last_included_pos = line_start;
                     break;
                 }
-                Some(b'\n' | b'\r') => {
-                    // Blank line — tentatively include newlines up to here.
-                    // The trailing spaces on this blank line belong with it.
-                    last_included_pos = self.pos;
-                    continue;
-                }
-                _ => {}
+                // Blank line: include it through its terminating newline.
+                self.consume_newline(bytes);
+                last_included_pos = self.pos;
+                continue;
             }
 
-            // Non-blank line. Determine if it belongs to the scalar.
+            // A column-0 document marker (`---` or `...` followed by a space,
+            // tab, newline, or EOF) ends the block scalar — it frames the
+            // document, it is never content. This only bites a root block
+            // scalar, where column-0 content is otherwise valid.
+            if indent == 0
+                && matches!(bytes.get(line_start..line_start + 3), Some(b"---" | b"..."))
+                && matches!(
+                    bytes.get(line_start + 3),
+                    None | Some(b' ' | b'\t' | b'\n' | b'\r')
+                )
+            {
+                self.pos = line_start;
+                break;
+            }
+
+            // Non-blank line. Determine if it belongs to the scalar. The
+            // first content line must be indented strictly more than the
+            // parent node (root parent is column −1, so column 0 qualifies);
+            // it fixes the content indent for every following line.
             let belongs = match detected_indent {
                 Some(n) => indent >= n,
-                None => indent > parent_indent,
+                None => (indent as isize) > parent_indent,
             };
             if !belongs {
                 // Roll back to line_start (so caller sees this line).
@@ -711,13 +805,18 @@ impl<'a> Lexer<'a> {
             if detected_indent.is_none() {
                 detected_indent = Some(indent);
             }
-            // Include through the rest of this line.
+            // Include through the rest of this line and its terminator.
             while let Some(&b) = bytes.get(self.pos) {
                 if b == b'\n' || b == b'\r' {
                     break;
                 }
                 self.pos += 1;
             }
+            if bytes.get(self.pos).is_none() {
+                last_included_pos = self.pos;
+                break;
+            }
+            self.consume_newline(bytes);
             last_included_pos = self.pos;
         }
 
@@ -964,9 +1063,11 @@ mod tests {
 
     #[test]
     fn colon_and_punctuation() {
-        let mut l = lex(":,{}[]");
+        // A `:` followed by whitespace is the COLON indicator.
+        let mut l = lex(": ,{}[]");
         for expected in [
             SyntaxKind::COLON,
+            SyntaxKind::WHITESPACE,
             SyntaxKind::COMMA,
             SyntaxKind::L_BRACE,
             SyntaxKind::R_BRACE,
@@ -976,6 +1077,22 @@ mod tests {
             let (k, _) = bump(&mut l);
             assert_eq!(k, expected);
         }
+    }
+
+    #[test]
+    fn colon_indicator_vs_plain() {
+        // `:` followed by whitespace/newline/EOF is the COLON indicator.
+        let l = lex(": v");
+        assert_eq!(l.peek(), Some(LexHint::Token(SyntaxKind::COLON)));
+        let l = lex(":\n");
+        assert_eq!(l.peek(), Some(LexHint::Token(SyntaxKind::COLON)));
+        let l = lex(":");
+        assert_eq!(l.peek(), Some(LexHint::Token(SyntaxKind::COLON)));
+        // `:` followed by a non-space (`::`, `:foo`) is a plain scalar.
+        let l = lex("::");
+        assert_eq!(l.peek(), Some(LexHint::PlainStart));
+        let l = lex(":foo");
+        assert_eq!(l.peek(), Some(LexHint::PlainStart));
     }
 
     #[test]
@@ -1060,9 +1177,11 @@ mod tests {
     fn bump_block_scalar_terminated_by_lower_indent() {
         let mut l = lex("|\n  a\n  b\nnext\n");
         let (_, t) = l.bump_block_scalar(0).unwrap();
-        // Stops at the newline before "next"; the newline stays as trivia.
-        assert_eq!(t, "|\n  a\n  b");
-        assert_eq!(l.peek_byte(), Some(b'\n'));
+        // The last content line's terminating newline belongs to the scalar
+        // (it is the line break of "b"); the lexer stops at the start of the
+        // dedented "next" line.
+        assert_eq!(t, "|\n  a\n  b\n");
+        assert_eq!(l.peek_byte(), Some(b'n'));
     }
 
     #[test]

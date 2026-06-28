@@ -53,7 +53,11 @@ fn ast_document(doc: &Document, depth: usize, out: &mut String) {
     if let Some(dirs) = doc.directives() {
         out.push_str(&format!("{}Directives\n", indent(depth + 1)));
         for d in dirs.directives() {
-            out.push_str(&format!("{}Directive {}\n", indent(depth + 2), escape(d.text())));
+            out.push_str(&format!(
+                "{}Directive {}\n",
+                indent(depth + 2),
+                escape(d.text())
+            ));
         }
     }
     if let Some(root) = doc.root_node() {
@@ -69,7 +73,11 @@ fn ast_node(node: &Node, depth: usize, out: &mut String) {
         Node::BlockSequence(s) => ast_sequence("BlockSequence", s, depth, out),
         Node::FlowSequence(s) => ast_sequence("FlowSequence", s, depth, out),
         Node::Alias(a) => {
-            out.push_str(&format!("{}Alias *{}\n", indent(depth), a.name().unwrap_or_default()));
+            out.push_str(&format!(
+                "{}Alias *{}\n",
+                indent(depth),
+                a.name().unwrap_or_default()
+            ));
         }
     }
 }
@@ -91,7 +99,11 @@ fn ast_scalar(s: &Scalar, depth: usize, out: &mut String) {
         None => "?",
     };
     let raw = s.raw_text().unwrap_or_default();
-    out.push_str(&format!("{}Scalar [{style}] {}\n", indent(depth), escape(&raw)));
+    out.push_str(&format!(
+        "{}Scalar [{style}] {}\n",
+        indent(depth),
+        escape(&raw)
+    ));
     if let Some(props) = s.properties() {
         ast_properties(&props, depth + 1, out);
     }
