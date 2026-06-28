@@ -166,16 +166,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Consume trivia between block-collection entries: eats all
-    /// NEWLINE/COMMENT/WHITESPACE tokens EXCEPT for the final WHITESPACE
-    /// that immediately precedes the next non-trivia token (the entry-
-    /// leading indent). That last WHITESPACE is left for the entry to
-    /// consume so that it ends up inside the entry node.
-    ///
-    /// Specifically: a WHITESPACE token is eaten only if what follows it
-    /// is another trivia token (NEWLINE, COMMENT, or WHITESPACE). If the
-    /// next token after the WHITESPACE is non-trivia, the WHITESPACE is
-    /// the entry indent and we stop before it.
+    /// Consume trivia between block-collection entries, but leave the
+    /// WHITESPACE immediately preceding the next non-trivia token in place:
+    /// that is the next entry's leading indent, which the entry node must
+    /// own (see the entry-indent ownership invariant). A WHITESPACE is thus
+    /// eaten only when more trivia follows it.
     fn eat_trivia_except_entry_indent(&mut self) {
         loop {
             match self.lex.peek() {
@@ -185,15 +180,14 @@ impl<'a> Parser<'a> {
                 Some(LexHint::Token(SyntaxKind::WHITESPACE)) => {
                     let after = self.peek_after_token();
                     match after {
-                        // Followed by more trivia — eat the whitespace now.
+                        // More trivia follows: eat the whitespace now.
                         Some(LexHint::Token(
                             SyntaxKind::WHITESPACE | SyntaxKind::NEWLINE | SyntaxKind::COMMENT,
                         ))
                         | None => {
                             self.bump_simple();
                         }
-                        // Followed by non-trivia — this is the entry-leading
-                        // indent; stop here and let the entry consume it.
+                        // Non-trivia follows: this is the entry-leading indent.
                         _ => break,
                     }
                 }
@@ -710,12 +704,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read a scalar (could be the key of a mapping OR a lone scalar
-    /// document). Uses rowan's checkpoint to retroactively wrap in
-    /// `scalar_min_indent` is the indent barrier for multi-line plain
-    /// scalar continuation when this node turns out to be a lone scalar.
-    /// It's typically the parent container's indent (the dash column for
-    /// a sequence entry, or the key's indent for a mapping value).
+    /// Read a scalar that may be a mapping key or a lone scalar: scan it,
+    /// then on seeing a `:` retroactively promote it to a BLOCK_MAPPING via
+    /// a checkpoint. `scalar_min_indent` is the continuation barrier for a
+    /// lone multi-line plain scalar — typically the parent container's
+    /// indent (the dash column of a sequence entry, or the key's indent for
+    /// a mapping value).
     fn parse_block_mapping_or_scalar_ext(
         &mut self,
         indent: usize,
@@ -929,8 +923,7 @@ impl<'a> Parser<'a> {
     /// Consumes the colon, optional value, and any indented block value.
     /// Does NOT close BLOCK_MAPPING_ENTRY.
     fn finish_block_mapping_entry_body(&mut self, indent: usize) -> Result<(), ParseError> {
-        // Consume COLON.
-        self.bump_simple();
+        self.bump_simple(); // COLON
         self.eat_inline_trivia();
 
         // Node properties on the value.
@@ -1007,10 +1000,8 @@ impl<'a> Parser<'a> {
     /// Positioned at the leading indent WHITESPACE or the `?` token.
     fn parse_explicit_block_mapping_entry(&mut self, indent: usize) -> Result<(), ParseError> {
         self.start(SyntaxKind::BLOCK_MAPPING_ENTRY);
-        // Consume leading indent whitespace inside the entry.
         self.eat_leading_whitespace();
-        // Consume `?`.
-        self.bump_simple();
+        self.bump_simple(); // `?`
         self.eat_inline_trivia();
         // Key: single-line scalar, or newline-then-indented block, or empty.
         // An empty key emits a zero-width NULL_SCALAR stand-in so the
@@ -1331,14 +1322,11 @@ impl<'a> Parser<'a> {
     fn parse_block_sequence_entry(&mut self, indent: usize) -> Result<(), ParseError> {
         self.start(SyntaxKind::BLOCK_SEQUENCE_ENTRY);
 
-        // Consume leading indent whitespace (absent for the first entry
-        // since the parent already consumed it before opening the sequence).
+        // Leading indent whitespace is absent for the first entry: the
+        // parent already consumed it before opening the sequence.
         self.eat_leading_whitespace();
 
-        // Consume DASH.
-        self.bump_simple();
-
-        // Inline trivia after the dash (usually a single space).
+        self.bump_simple(); // DASH
         self.eat_inline_trivia();
 
         // Node properties on the entry's value. Checkpoint *before* them so
@@ -1421,8 +1409,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Error if the bytes from the start of the current line up to `pos`
-    /// contain a tab. This enforces "tabs not allowed in block indentation"
-    /// per user-selected scope decision.
+    /// contain a tab: tabs are not allowed in block indentation.
     fn reject_tab_indent_at_line_start(&self) -> Result<(), ParseError> {
         let bytes = self.lex.source().as_bytes();
         let pos = self.lex.pos();

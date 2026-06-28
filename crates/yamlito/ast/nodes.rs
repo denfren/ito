@@ -195,8 +195,8 @@ impl Document {
         if let Some(inner) = self.leading_comment_inner_anchor() {
             comment_impl::read_leading(&inner)
         } else {
-            // Implicit document: the anchor is the DOCUMENT itself; its
-            // leading trivia sits in the parent STREAM.
+            // Implicit document: anchor on the DOCUMENT itself; its leading
+            // trivia sits in the parent STREAM.
             comment_impl::read_leading(&self.0)
         }
     }
@@ -214,10 +214,6 @@ impl Document {
     /// implicit (no `---`).
     fn leading_comment_inner_anchor(&self) -> Option<SyntaxNode> {
         self.directives_end_token()?;
-        // Anchor is the first child AFTER `---` that is either the root
-        // node or something that would be the target. We use the root
-        // node when present; otherwise fall through to None (nothing to
-        // anchor on).
         self.0.children().find(|c| {
             matches!(
                 c.kind(),
@@ -559,22 +555,18 @@ pub enum Tag {
 
 impl Tag {
     fn parse(raw: &str) -> Self {
-        // Non-specific: bare `!`.
         if raw == "!" {
             return Tag::NonSpecific;
         }
-        // Verbatim: `!<...>`.
         if let Some(rest) = raw.strip_prefix("!<") {
             if let Some(uri) = rest.strip_suffix('>') {
                 return Tag::Verbatim(uri.to_string());
             }
             return Tag::Unknown(raw.to_string());
         }
-        // Secondary: `!!...`.
         if let Some(rest) = raw.strip_prefix("!!") {
             return Tag::Secondary(rest.to_string());
         }
-        // Named handle: `!handle!suffix`.
         if let Some(rest) = raw.strip_prefix('!') {
             if let Some(bang) = rest.find('!') {
                 let (handle, suffix) = rest.split_at(bang);
@@ -583,7 +575,6 @@ impl Tag {
                     suffix: suffix[1..].to_string(),
                 };
             }
-            // Primary: `!suffix`.
             return Tag::Primary(rest.to_string());
         }
         Tag::Unknown(raw.to_string())

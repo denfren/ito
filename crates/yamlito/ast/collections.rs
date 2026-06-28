@@ -1,5 +1,5 @@
-//! S-A6: shared `Mapping` and `Sequence` traits for block- and flow-
-//! style collections, plus convenience accessors (`.get`, `.keys`, etc.).
+//! Shared `Mapping` and `Sequence` traits for block- and flow-style
+//! collections, plus convenience accessors (`.get`, `.keys`, etc.).
 
 use crate::SyntaxTree;
 use crate::ast::nodes::{
@@ -82,9 +82,7 @@ pub trait Mapping {
     /// Value is `None` only for key-only entries with no `:` slot; an
     /// empty value after a colon yields `Some` zero-width null scalar.
     fn pairs(&self) -> Box<dyn Iterator<Item = (Node, Option<Node>)> + '_>;
-    /// Lookup by string key. Compares the decoded `Value::String` form of
-    /// each key (plain keys also match because Core inference still
-    /// produces strings for non-numeric/bool text like arbitrary keys).
+    /// Lookup by string key, comparing each key's decoded string form.
     ///
     /// Returns `None` when the key is absent or the entry is key-only
     /// (no `:`). A present-but-empty value returns `Some` null scalar.

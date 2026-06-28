@@ -117,13 +117,11 @@ pub(crate) fn write_leading(tree: &mut SyntaxTree, anchor: &SyntaxNode, text: Op
 
     let anchor_index = anchor.index();
     let indent = indent_of(anchor);
-    // Uniform entry-indent ownership (Phase 2): a block entry either owns
-    // its leading indent WHITESPACE as its first child (line-start entry)
-    // or has no indent at all (col-0 / mid-line entry, where `indent_of`
-    // returns ""). In both cases we emit the indent before every comment
-    // line and omit a trailing indent — when the anchor owns the indent
-    // it re-establishes its own column, and when it doesn't the indent is
-    // empty so there's nothing to duplicate.
+    // A block entry either owns its leading indent WHITESPACE as its first
+    // child (line-start entry) or has no indent at all (col-0 / mid-line
+    // entry, where `indent_of` returns ""). Either way, emit the indent
+    // before every comment line and no trailing indent: the anchor still
+    // owns its own indent after the splice point (or has none).
     let replacement = build_leading_elements(Some(text), &indent, LeadingMode::InsertBeforeAnchor);
     let new_green = splice_children_green(&parent, anchor_index..anchor_index, replacement);
     apply_edit(
@@ -223,9 +221,6 @@ fn build_leading_elements(
         }
     };
     for line in text.split('\n') {
-        // Both modes emit the indent on every comment line: the anchor
-        // either owns its indent (so the comment lines must match its
-        // column) or has none (push_ws is a no-op).
         push_ws(&mut out);
         let comment_text = if line.is_empty() {
             "#".to_string()

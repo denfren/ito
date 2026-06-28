@@ -173,16 +173,6 @@ A couple of notes that aren't obvious from any single file:
 
 ### `yamlito` crate (`crates/yamlito/`)
 
-A standalone YAML parser and lossless CST editor (lexer, parser, rowan
-syntax tree, typed AST, surgical edits, fixers, and Rhai cursor glue
-under `scripting/`). Internal paths use `crate::*`. The library layer
-(parse, AST, edits, fixers) is fully enabled. `ito` depends on it for
-the `yaml` module via `builder::Yaml` (a serde value model, plus
-`Yaml::from_tree` for text→value); the rest — surgical edits, fixers,
-and the Rhai **scripting** glue (`scripting/`) — compiles but is not
-consumed by any binary yet.
-
-Tests live in `crates/yamlito/tests/`: `parser.rs` (CST/AST insta
-snapshot tests over `tests/yaml/**/*.yml`, snapshots in
-`tests/snapshots/`). These are the library-only tests and run via
-`cargo test -p yamlito`.
+A standalone YAML parser and lossless CST editor. `ito` depends on it
+for the `yaml` module via `builder::Yaml`. See
+`crates/yamlito/CLAUDE.md` for its layout and details.

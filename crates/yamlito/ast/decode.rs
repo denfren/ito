@@ -90,9 +90,8 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
     let bytes = inner.as_bytes();
     let mut out = String::with_capacity(inner.len());
     let mut i = 0;
-    // `lines` collects the fold-sequence: we emit into `out` as we go,
-    // but newlines need the fold rules applied. We'll buffer newline-runs
-    // and flush when non-newline content arrives.
+    // Newlines need the fold rules applied, so buffer newline-runs and
+    // flush them when non-newline content arrives.
     let mut pending_newlines: usize = 0;
     // Byte length of `out` that must never be trimmed as trailing line
     // whitespace. Escape sequences advance this (so escaped trailing
@@ -136,7 +135,7 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
             }
             pending_newlines = 0;
             // Fold output (the join space / line feeds) is content and
-            // must survive any subsequent trailing-whitespace trim.
+            // must survive a subsequent trailing-whitespace trim.
             protected_len = out.len();
         }
         if b == b'\\' {
@@ -155,12 +154,10 @@ fn decode_double_quoted(raw: &str) -> Result<String, DecodeError> {
                 }
                 continue;
             }
-            // Normal escape. Escaped content (including escaped white
-            // space like `\t`/`\ `) is never folding white space.
+            // Escaped content (including `\t`/`\ ` → space) is never
+            // folding whitespace; protect it from end-of-line trimming.
             let (decoded, consumed) = decode_dq_escape(inner, i)?;
             out.push_str(&decoded);
-            // Escape output (including `\ ` → space) is content and must
-            // survive end-of-line trailing-whitespace trimming.
             protected_len = out.len();
             i += consumed;
             continue;

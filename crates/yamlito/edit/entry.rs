@@ -22,10 +22,10 @@
 //! `BLOCK_MAPPING` into a flow `{}`, keeping the tree valid and
 //! round-trippable (mirroring the `BLOCK_SEQUENCE` → `[]` collapse).
 //!
-//! Entry fragments are produced through the value-model builder
-//! (strategy A): we serialize the entry to canonical YAML, parse it, and
-//! splice the resulting green subtree — so an inserted entry is always
-//! parse- and round-trip-consistent.
+//! Entry fragments are produced through the value-model builder: we
+//! serialize the entry to canonical YAML, parse it, and splice the
+//! resulting green subtree — so an inserted entry is always parse- and
+//! round-trip-consistent.
 
 use rowan::NodeOrToken;
 
@@ -180,7 +180,7 @@ fn build_flow_entry_green(key: &str, value: Yaml) -> rowan::GreenNode {
 /// policy ([`quote_scalar_flow`]); collections recurse through
 /// [`flow_value_text`]. Quoting the key AND value protects against the
 /// flow terminators (`,` `[` `]` `{` `}`) and the `: ` mapping indicator
-/// corrupting the surrounding collection (FINDINGS.md B2/B3).
+/// corrupting the surrounding collection.
 fn flow_entry_text(key: &str, value: &Yaml) -> String {
     format!("{}: {}", quote_scalar_flow(key), flow_value_text(value))
 }
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(tree.emit(), "{a: 1, b: 2}\n");
     }
 
-    // ---- flow: hostile keys/values quote correctly (B3) ----
+    // ---- flow: hostile keys/values quote correctly ----
 
     /// Insert a `key: value` into a `{x: 0}` flow map and assert it
     /// reparses and decodes back to the expected map exactly.

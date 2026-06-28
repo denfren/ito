@@ -1,4 +1,4 @@
-//! S-A5: YAML 1.2 Core schema type inference.
+//! YAML 1.2 Core schema type inference.
 
 use crate::ast::decode::DecodeError;
 use crate::ast::scalar::{Scalar, ScalarStyle};
@@ -17,8 +17,6 @@ impl Scalar {
     /// schema. Only plain scalars are type-inferred; quoted and block
     /// scalars are always `Value::String`.
     pub fn to_value(&self) -> Result<Value, DecodeError> {
-        // The zero-width null stand-in (and any styleless scalar) decodes
-        // to null directly.
         if self.is_null() {
             return Ok(Value::Null);
         }

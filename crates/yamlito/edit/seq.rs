@@ -29,10 +29,10 @@
 //! round-trippable. Conversely, pushing into that `[]` grows the flow
 //! sequence.
 //!
-//! Item fragments are produced through the value-model builder
-//! (strategy A): the value is serialized to canonical YAML, parsed, and
-//! the resulting green subtree spliced — so an inserted item is always
-//! parse- and round-trip-consistent.
+//! Item fragments are produced through the value-model builder: the
+//! value is serialized to canonical YAML, parsed, and the resulting
+//! green subtree spliced — so an inserted item is always parse- and
+//! round-trip-consistent.
 
 use rowan::NodeOrToken;
 
@@ -190,13 +190,12 @@ fn build_flow_item_green(value: Yaml) -> rowan::GreenNode {
 /// Strings are quoted with the strict **flow** policy
 /// ([`quote_scalar_flow`]) so flow terminators (`,` `[` `]` `{` `}`) and
 /// the `: ` mapping indicator can never leak through and corrupt the
-/// surrounding collection (FINDINGS.md B2/B3). Other scalars use the
-/// builder's canonical form. Collections recurse, quoting keys *and*
-/// values the same way.
+/// surrounding collection. Other scalars use the builder's canonical
+/// form. Collections recurse, quoting keys *and* values the same way.
 fn flow_scalar_text(value: &Yaml) -> String {
     match value {
-        // A string is quoted for flow context directly — `to_yaml_string`
-        // applies only block rules, which do not protect flow terminators.
+        // Flow-quoted directly: `to_yaml_string` applies only block rules,
+        // which do not protect flow terminators.
         Yaml::Str(s) => quote_scalar_flow(s),
         Yaml::Null | Yaml::Bool(_) | Yaml::Int(_) | Yaml::Float(_) => {
             value.to_yaml_string().trim_end_matches('\n').to_string()
@@ -1241,7 +1240,7 @@ mod tests {
         assert_eq!(v, Yaml::Seq(vec![Yaml::Int(1), Yaml::Int(2)]));
     }
 
-    // ---- flow: hostile scalar values quote correctly (B2/B3) ----
+    // ---- flow: hostile scalar values quote correctly ----
     //
     // A string containing a flow terminator (`,` `]` `}`) or the `: `
     // mapping indicator must be quoted when spliced into a flow sequence,
@@ -1281,8 +1280,8 @@ mod tests {
 
     #[test]
     fn flow_push_map_with_hostile_key_round_trips() {
-        // Flow-map key `"a: b"` must be quoted (B3): unquoted it reparses
-        // as key `a`, value `b: 1`.
+        // Flow-map key `"a: b"` must be quoted: unquoted it reparses as
+        // key `a`, value `b: 1`.
         assert_flow_push_round_trips(Yaml::Map(vec![("a: b".into(), Yaml::Int(1))]));
     }
 

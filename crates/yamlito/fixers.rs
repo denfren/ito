@@ -255,13 +255,9 @@ fn collect_indent_targets(block: &SyntaxNode, col: usize, out: &mut Vec<IndentTa
     ));
 
     // Normalize the leading indent WHITESPACE of every entry that lives
-    // on its own line. Per the entry-indent ownership invariant, a
-    // line-start entry owns its indent as its first child. An entry is
-    // "on its own line" when:
-    //   (a) it has a WHITESPACE token as its first child (owns its
-    //       indent), OR
-    //   (b) the token immediately before it at the collection level is
-    //       a NEWLINE (subsequent entries always fall here).
+    // on its own line. An entry is "on its own line" when either it has a
+    // WHITESPACE token as its first child (owns its indent), or the token
+    // immediately before it at the collection level is a NEWLINE.
     let children: Vec<_> = block.children_with_tokens().collect();
     for (i, el) in children.iter().enumerate() {
         let NodeOrToken::Node(entry) = el else {
@@ -352,13 +348,11 @@ fn visit_entry(entry: &SyntaxNode, parent_col: usize, out: &mut Vec<IndentTarget
         }
         // Is this block launched on its own line?
         if let Some((_nl_idx, ws_idx)) = preceding_newline_and_ws(&children, i) {
-            // Determine the canonical column for entries of this child block.
-            // Because each entry owns its leading indent WHITESPACE,
-            // `observed_block_col` returns 0 for the collection itself.
-            // Instead read the actual indent from the first entry.
-            // `None` means the first entry has no leading WHITESPACE — it's
-            // a genuinely indentless sequence at col 0, keep it there.
-            // `Some(_)` means it's explicitly indented — normalise to parent+2.
+            // Canonical column for entries of this child block. Each entry
+            // owns its leading indent WHITESPACE, so read the actual indent
+            // from the first entry: `None` means an indentless sequence at
+            // col 0 (keep it); `Some(_)` means explicitly indented
+            // (normalise to parent+2).
             let child_col = match first_entry_col(child) {
                 None => 0,
                 Some(_) => parent_col + 2,
@@ -379,12 +373,7 @@ fn visit_entry(entry: &SyntaxNode, parent_col: usize, out: &mut Vec<IndentTarget
                 // The entry contains a block scalar so we must not shift
                 // anything — pass the *actual* column from the first entry's
                 // own leading whitespace so collect_indent_targets sees no
-                // diff and leaves every child alone. `observed_block_col`
-                // returns 0 here because entries own their indent whitespace
-                // (it is no longer a sibling at the collection level).
-                // `observed_block_col` would return 0 here because each
-                // entry owns its indent whitespace (not a sibling at the
-                // collection level), so read it from the first entry.
+                // diff and leaves every child alone.
                 let observed = first_entry_col(child).unwrap_or(0);
                 collect_indent_targets(child, observed, out);
             }
@@ -439,7 +428,6 @@ fn collapse_intra_entry_whitespace(
     children: &[rowan::NodeOrToken<SyntaxNode, SyntaxToken>],
     out: &mut Vec<IndentTarget>,
 ) {
-    // Find the marker token (DASH or COLON), then check what follows.
     let mut saw_marker = false;
     for el in children {
         match el {

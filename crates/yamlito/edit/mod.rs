@@ -101,12 +101,9 @@ pub fn apply_edit(tree: &mut SyntaxTree, edit: TreeEdit) {
 
 /// Wrap a fresh `GreenToken` in a throwaway single-token parent so we
 /// can obtain a mutable `SyntaxToken` suitable for `splice_children`.
-/// The wrapper parent is immediately discarded when the returned token
-/// is attached elsewhere.
 fn wrap_token_for_splice(tok: GreenToken) -> SyntaxToken {
-    // Any node kind works as the transient wrapper; STREAM is arbitrary
-    // but always valid. The wrapper is detached as soon as splice_children
-    // reattaches the token to its real parent.
+    // STREAM is an arbitrary wrapper kind; `splice_children` detaches the
+    // token from it when reattaching to the real parent.
     let wrapper_green = GreenNode::new(
         YamlLang::kind_to_raw(SyntaxKind::STREAM),
         [NodeOrToken::Token(tok)],
@@ -193,8 +190,8 @@ mod tests {
     #[test]
     fn splice_children_green_replaces_range() {
         let (_tree, entry) = first_entry("k: v\n");
-        // Replace `COLON WS` with `=`. Indices 1..3 span those tokens
-        // because the parser emits: [SCALAR(k), COLON, WS, SCALAR(v)].
+        // Entry children are [SCALAR(k), COLON, WS, SCALAR(v)]; replace
+        // `COLON WS` (1..3) with `=`.
         let repl = NodeOrToken::Token(mk_token(COLON, "="));
         let green = splice_children_green(&entry, 1..3, vec![repl]);
         let new_root = SyntaxNode::new_root(green);

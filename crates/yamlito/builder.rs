@@ -1,4 +1,4 @@
-//! Value-model builder (Phase 3, strategy A).
+//! Value-model builder.
 //!
 //! Build a YAML CST by constructing a [`Yaml`] value model, serializing
 //! it to canonical YAML **text**, and running that text through

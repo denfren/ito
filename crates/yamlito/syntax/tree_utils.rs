@@ -83,8 +83,6 @@ pub(crate) fn indent_of(anchor: &SyntaxNode) -> String {
     let Some(first) = anchor.first_token() else {
         return String::new();
     };
-    // If the entry's own first token is a WHITESPACE (the leading indent
-    // now lives inside the entry), use it directly.
     if first.kind() == SyntaxKind::WHITESPACE {
         return first.text().to_string();
     }
@@ -119,7 +117,7 @@ pub(crate) fn observed_block_col(block: &SyntaxNode) -> usize {
 /// own absolute start is used). On the first hop into the ancestor chain
 /// the caller folds the original block's intra-parent column into `offset`
 /// (`block_start - parent_start`); further hops carry that same `offset`
-/// unchanged, exactly as the previous two-function form did.
+/// unchanged.
 fn observed_block_col_with_offset(node: &SyntaxNode, offset: usize) -> usize {
     let node_start: usize = node.text_range().start().into();
     let mut t = node.prev_sibling_or_token();

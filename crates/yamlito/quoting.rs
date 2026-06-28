@@ -3,8 +3,7 @@
 //!
 //! Emitting a string scalar means choosing a style that survives a
 //! round-trip: a plain scalar where it is unambiguous, otherwise a quoted
-//! one. Two pitfalls historically lived in separate, weaker copies of this
-//! decision (see FINDINGS.md A4):
+//! one. Two invariants drive the decision:
 //!
 //! - A plain scalar must not re-infer as a non-string under the YAML 1.2
 //!   Core schema (`null`/`true`/`42`/`1.5`), and — because the crate also
@@ -15,7 +14,6 @@
 //! - Single-quoted style cannot represent control characters (`\n`, `\t`,
 //!   …): a literal newline inside `'...'` line-folds back to a space on
 //!   re-read. Such strings must use **double-quoted** style with escapes.
-//!   This module owns the only double-quote *emitter* in the crate.
 //!
 //! Two contexts are distinguished:
 //!
