@@ -7,6 +7,14 @@ use std::path::PathBuf;
 use crate::cli::{Command, LoadedScript, RunArgs, ScriptArgsFlags, Shell, UtilCommand};
 use clap::{CommandFactory, Parser};
 use cli::Cli;
+
+/// Minimal parser wrapper so `RunArgs` (an `Args` struct) can be parsed
+/// from a raw arg list for `ito <name> [flags]`.
+#[derive(Parser)]
+struct ScriptRunArgs {
+    #[command(flatten)]
+    run: RunArgs,
+}
 use ito::scripting::{ScriptArg, Vfs};
 
 fn main() {
@@ -18,7 +26,24 @@ fn main() {
             let source = ScriptSource::Inline(expression);
             run_script(source, run)
         }
-        Command::Run { script_path, run } => run_script(ScriptSource::File(script_path), run),
+        Command::Run { script_path, run } => {
+            let source = if script_path.as_os_str() == "-" {
+                ScriptSource::Stdin
+            } else {
+                ScriptSource::File(script_path)
+            };
+            run_script(source, run)
+        }
+        Command::Script(args) => {
+            let name = args[0].clone();
+            let rest = &args[1..];
+            let run = ScriptRunArgs::try_parse_from(
+                std::iter::once("ito").chain(rest.iter().map(|s| s.as_str())),
+            )
+            .unwrap_or_else(|e| e.exit())
+            .run;
+            run_script(ScriptSource::Named(name), run)
+        }
         Command::Help {
             topic,
             plain,
@@ -78,7 +103,7 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
     }
     let vfs_root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
 
-    // Resolve the script source after `-C` is applied: default discovery
+    // Resolve the script source after `-C` is applied: named discovery
     // is relative to the resolved working directory.
     let loaded = match source {
         ScriptSource::Inline(s) => LoadedScript {
@@ -86,9 +111,10 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
             source: s,
             base_dir: None,
         },
-        ScriptSource::File(Some(p)) => load_script_file(&p).map_err(RunError::from)?,
-        ScriptSource::File(None) => {
-            let p = discover_default_script(&vfs_root)?;
+        ScriptSource::File(ref p) => load_script_file(p).map_err(RunError::from)?,
+        ScriptSource::Stdin => load_script_file(std::path::Path::new("-")).map_err(RunError::from)?,
+        ScriptSource::Named(ref name) => {
+            let p = discover_named_script(&vfs_root, name)?;
             load_script_file(&p).map_err(RunError::from)?
         }
     };
@@ -200,9 +226,12 @@ fn run_script(source: ScriptSource, run: RunArgs) -> Result<Outcome, RunError> {
 enum ScriptSource {
     /// An inline expression/program (`ito exec`).
     Inline(String),
-    /// A path from `ito run` (`Some` is the given PATH, `-` is stdin;
-    /// `None` means discover a default in the working directory).
-    File(Option<PathBuf>),
+    /// A path from `ito run` ('-' means stdin).
+    File(std::path::PathBuf),
+    /// Read from stdin (`ito run -`).
+    Stdin,
+    /// Discover by name in the working directory (`ito <name>`).
+    Named(String),
 }
 
 /// What a script run reports back to `main` for exit-code purposes.
@@ -253,9 +282,53 @@ fn generate_completions(shell: Shell) {
     );
 }
 
-/// The default script names `ito run` looks for (no PATH), in listing
-/// order. It is an error for more than one to exist.
-const DEFAULT_SCRIPTS: [&str; 4] = ["ito.rhai", ".ito.rhai", "ito/main.rhai", ".ito/main.rhai"];
+/// Returns the candidate paths for a named script, in priority order.
+/// Candidates: `<name>.ito.rhai`, `.<name>.ito.rhai`, `ito/<name>.rhai`,
+/// `.ito/<name>.rhai`.
+fn script_candidates(root: &std::path::Path, name: &str) -> Vec<PathBuf> {
+    vec![
+        root.join(format!("{name}.ito.rhai")),
+        root.join(format!(".{name}.ito.rhai")),
+        root.join(format!("ito/{name}.rhai")),
+        root.join(format!(".ito/{name}.rhai")),
+    ]
+}
+
+/// Find the single script for `name` in `root`. Errors (exit `2`) if none
+/// or more than one candidate exists.
+fn discover_named_script(root: &std::path::Path, name: &str) -> Result<PathBuf, RunError> {
+    let found: Vec<PathBuf> = script_candidates(root, name)
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect();
+    match found.as_slice() {
+        [p] => Ok(p.clone()),
+        [] => {
+            let candidates = script_candidates(root, name);
+            Err(format!(
+                "no script found for '{}' in {} (looked for {})",
+                name,
+                root.display(),
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+            .into())
+        }
+        many => Err(format!(
+            "ambiguous script for '{}' in {}: {} all exist; remove duplicates",
+            name,
+            root.display(),
+            many.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+        .into()),
+    }
+}
 
 pub(crate) fn load_script_file(p: &std::path::Path) -> Result<LoadedScript, String> {
     if p.as_os_str() == "-" {
@@ -286,33 +359,6 @@ pub(crate) fn load_script_file(p: &std::path::Path) -> Result<LoadedScript, Stri
     })
 }
 
-/// Find the single default script in `root`. Errors (exit `2`) if none
-/// or more than one of [`DEFAULT_SCRIPTS`] exists.
-fn discover_default_script(root: &std::path::Path) -> Result<PathBuf, RunError> {
-    let found: Vec<PathBuf> = DEFAULT_SCRIPTS
-        .iter()
-        .map(|name| root.join(name))
-        .filter(|p| p.is_file())
-        .collect();
-    match found.as_slice() {
-        [p] => Ok(p.clone()),
-        [] => Err(format!(
-            "no script given and no default found in {} (looked for {})",
-            root.display(),
-            DEFAULT_SCRIPTS.join(", "),
-        )
-        .into()),
-        many => Err(format!(
-            "ambiguous default script in {}: {} all exist; pass an explicit path",
-            root.display(),
-            many.iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
-        .into()),
-    }
-}
 
 pub(crate) fn collect_script_args(
     flags: ScriptArgsFlags,

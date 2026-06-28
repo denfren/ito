@@ -53,21 +53,21 @@ pub enum Command {
         #[command(flatten)]
         run: RunArgs,
     },
-    /// Run a Rhai script from a file (or '-' for stdin).
-    ///
-    /// With no PATH, discovers a default script in the working
-    /// directory: one of `ito.rhai`, `.ito.rhai`, `ito/main.rhai`, or
-    /// `.ito/main.rhai`. It is an error for more than one to exist.
+    /// Run a Rhai script file ('-' reads from stdin).
     Run {
-        /// Script file to run, '-' for stdin, or omit to discover a
-        /// default (`ito.rhai`, `.ito.rhai`, `ito/main.rhai`, or
-        /// `.ito/main.rhai`) in the working directory.
+        /// Script file to run, or '-' for stdin.
         #[arg(value_name = "PATH")]
-        script_path: Option<PathBuf>,
+        script_path: PathBuf,
 
         #[command(flatten)]
         run: RunArgs,
     },
+    /// Run a named script discovered in the working directory.
+    ///
+    /// Looks for `<name>.ito.rhai`, `.<name>.ito.rhai`, `ito/<name>.rhai`,
+    /// or `.ito/<name>.rhai`. It is an error for more than one to exist.
+    #[command(external_subcommand)]
+    Script(Vec<String>),
     /// Utility subcommands (shell completions, …).
     Util {
         #[command(subcommand)]
