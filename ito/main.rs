@@ -25,18 +25,26 @@ fn main() {
     let result: Result<Outcome, RunError> = (|| {
         for dir in &cli.directory {
             std::env::set_current_dir(dir).map_err(|e| format!("-C {}: {e}", dir.display()))?;
+            let dir = dir.as_display();
+            tracing::debug!(%dir, "Changed CWD");
         }
+
         let Some(command) = cli.command else {
+            tracing::debug!("No subcommand specified");
             let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
             list_available_scripts(&root);
             return Ok(Outcome::default());
         };
+
         match command {
             Command::Exec { expression, run } => run_script(ScriptSource::Inline(expression), run),
             Command::Run { script_path, run } => {
                 let source = if script_path.as_os_str() == "-" {
+                    tracing::trace!("Read from STDIN");
                     ScriptSource::Stdin
                 } else {
+                    let file = script_path.as_display();
+                    tracing::trace!(%file, "Read from FILE");
                     ScriptSource::File(script_path)
                 };
                 run_script(source, run)
@@ -58,12 +66,12 @@ fn main() {
             } => ito::help::doc(topic.as_deref(), plain, no_pager)
                 .map(|()| Outcome::default())
                 .map_err(RunError::from),
-            Command::Util { command } => match command {
-                UtilCommand::Completions { shell } => {
-                    generate_completions(shell);
-                    Ok(Outcome::default())
-                }
-            },
+            Command::Util {
+                command: UtilCommand::Completions { shell },
+            } => {
+                generate_completions(shell);
+                Ok(Outcome::default())
+            }
         }
     })();
 
@@ -73,7 +81,7 @@ fn main() {
             std::process::exit(e.code);
         }
         // `--exit-code`: 1 when the run produced changes, else 0.
-        Ok(outcome) if outcome.exit_code && outcome.changed => std::process::exit(1),
+        Ok(outcome) if outcome.exit_code & &outcome.changed => std::process::exit(1),
         Ok(_) => {}
     }
 }
