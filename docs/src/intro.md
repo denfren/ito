@@ -7,13 +7,26 @@ inspecting and generating config files. Scripts get a virtual filesystem
 structured data, and rendering templates, an opt-in `proc` module for
 running processes, and an `ito` module for guarding the running version.
 
-There is no positional input — the only relevant path is the working
-directory, which becomes the root of the `fs` module (override with `-C`).
-File I/O happens through `fs`; buffered writes are flushed to disk after
-the script returns. Exit codes: `0` success, `1` success with changes
-(only under `-e`/`--exit-code`), `2` a generic failure (usage,
-environment, output), and `3` a failure in the script itself (parse or
-runtime error).
+The only relevant path is the working directory, which becomes the root
+of the `fs` module (override with `-C`). File I/O happens through `fs`;
+buffered writes are flushed to disk after the script returns. Exit codes:
+`0` success, `1` success with changes (only under `-e`/`--exit-code`),
+`2` a generic failure (usage, environment, output), and `3` a failure in
+the script itself (parse or runtime error).
+
+## Running scripts
+
+```sh
+ito run <path>      # run a script file ('-' for stdin)
+ito exec '<expr>'   # run an inline expression
+ito <name>          # discover and run a named script in the working directory
+```
+
+`ito <name>` looks for the script in four locations (in order):
+`<name>.ito.rhai`, `.<name>.ito.rhai`, `ito/<name>.rhai`,
+`.ito/<name>.rhai`. It is an error if more than one exists. Running
+`ito` with no arguments (or an unknown name) lists the available named
+scripts.
 
 ## Help from the CLI
 

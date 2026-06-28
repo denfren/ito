@@ -81,8 +81,8 @@ are off by default.
 The CLI is subcommand-based:
 
 - `ito exec <str>` — run an inline expression/program.
-- `ito run [<path>]` — run a script file (or `-` for stdin); with no
-  path, discovers a single default script in the working directory.
+- `ito run <path>` — run a script file (or `-` for stdin)
+- `ito <name>` — discovers by name convention and essentially does an `ito run ...`
 - `ito help [<topic>]` — print scripting help (no topic lists topics,
   `all` dumps everything); pages styled markdown through `$PAGER`/`less`.
 - `ito util <command>` — utility subcommands; currently
