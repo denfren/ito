@@ -1,4 +1,4 @@
-//! Adapter: map a Rhai cursor's `SyntaxNode` to the nearest AST node
+//! Adapter: map a cursor's `SyntaxNode` to the nearest AST node
 //! that owns comments (`BlockMappingEntry`, `BlockSequenceEntry`,
 //! `Document`) and dispatch the call. All per-variant quirks live on
 //! those AST types.

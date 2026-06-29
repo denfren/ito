@@ -3,24 +3,100 @@ members = ["ito", "crates/yamlito"]
 resolver = "3"
 
 [workspace.dependencies]
-annotate-snippets = "0.12.16"
-clap = { version = "4.6.1", features = ["derive"] }
+aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
+aws-sdk-autoscaling = "1.125.0"
+aws-sdk-ec2 = "1.244.0"
+aws-sdk-s3 = "1.135.0"
+aws-smithy-types = "1.6.1"
+clap = { version = "4.6.5", features = ["derive"] }
 clap_complete = "4.6"
+# `tablefmt`'s renderer. Default features (`tty`) bring in `crossterm` for
+# terminal-width auto-detection under `:print()`/`:to_string()` when no width
+# is given. `custom_styling` (`ansi-str` + `console`) makes width measurement
+# and wrapping ANSI-aware, needed because cell content may already carry
+# color codes from ito's own `string:red()` etc.
+comfy-table = { version = "8.0.0", features = ["custom_styling"] }
+# `ui.prompt.*` -- interactive terminal prompts (confirm/input/password/
+# select/multi_select). Blocking terminal I/O with no async form, so calls
+# are run through `spawn_blocking` the way `hash.*_file` runs its blocking
+# reads. `default-features = false` drops the `editor`/`fuzzy-select`/
+# `history` extras ito's surface doesn't expose; `password` (zeroized input
+# buffers) is kept since `ui.prompt.password` uses it.
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
+# `ui.progress.*` -- progress bars and spinners. `ProgressBar` is internally
+# synchronized and cheaply `Clone`, so its methods stay plain sync calls; only
+# the spinner's redraw loop needs a background tick, driven through `task`'s
+# own runtime rather than indicatif's built-in thread.
+indicatif = "0.18"
 globset = "0.4"
+# `fs.finder():grep()`'s search engine -- ripgrep's own, and deliberately not a
+# hand-rolled loop over `regex`: it brings line splitting, binary-file detection
+# and mmap, which are the parts of "grep a tree" that are tedious to get right.
+# No second dialect comes with it: `grep-regex` builds a `regex-automata`
+# matcher from `regex-syntax`, so a pattern means exactly what `re` says it
+# means, and both crates were already in the tree under `ignore`.
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
 hcl-rs = "0.19"
+# `hash`'s digests, from the RustCrypto family so all four share one `Digest`
+# trait and the module is one generic function per input shape rather than four
+# near-copies. `hex` renders them: the encoding is the whole of what a hash is
+# usually wanted for, and hand-rolling it is the sort of loop that gets an
+# uppercase/lowercase decision wrong somewhere.
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+hex = "0.4"
+humantime = "2.4"
+ignore = "0.4.33"
+# `proc`'s `Child:signal()` and `ito.pid()`. tokio's `Child` exposes only
+# `start_kill` (SIGKILL), so sending any other signal means `kill(2)` by hand;
+# `libc` rather than `nix` because that is the whole of what is needed, and it
+# is already in the tree under tokio.
+libc = "0.2"
+# `time`'s parser/formatter. The tzdb is *bundled* rather than read from the
+# system (`tzdb-zoneinfo`): a named zone must resolve to the same instant on
+# every machine, or `time.format_tz` would be ambient state and could not live
+# in `iq`/`ied`. The cost is ~310KB and rules frozen at build time, which a
+# release refreshes. `tz-system` is separate -- it reports the host's own
+# *offset*, for the ito-only local readers.
+jiff = { version = "0.2", default-features = false, features = [
+    "std",
+    "perf-inline",
+    "tz-system",
+    "tzdb-bundle-always",
+] }
 minijinja = { version = "2", features = ["custom_syntax", "loader"] }
+# `ito.slug()`'s word generator -- an adjective-noun pair, e.g. "rusty-nail".
+# Random, so host-only like `math.random`/`os.getenv`.
+names = { version = "0.14.0", default-features = false }
 num_enum = "0.7"
+openssh = "0.11.6"
 regex = "1"
-rhai = { version = "1.25.1", features = ["serde"] }
-rowan = "0.16"
+mlua = { version = "0.12.0", features = ["luau", "vendored", "serde", "async"] }
+rowan = "0.17"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-wait-timeout = "0.2"
-similar = "3.1.1"
-termimad = "0.34.1"
+similar = "3.1.2"
+termimad = "0.35.1"
 thiserror = "2"
-toml = "1.1.2"
+tokio = { version = "1.53.1", features = [
+    "rt",
+    "macros",
+    "time",
+    # `proc` spawns children on tokio::process; the merged-capture pipe is read
+    # through tokio::net::unix::pipe, which is what "net" is here for.
+    "process",
+    "net",
+    "io-util",
+    # `enable_all` already starts the signal driver (tokio::process needs it),
+    # which is what takes SIGINT off its default disposition in the first place.
+    # "signal" is what lets us handle the signal we thereby started swallowing.
+    "signal",
+] }
+futures-util = "0.3"
+toml = "1.1.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 yamlito = { path = "crates/yamlito" }

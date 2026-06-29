@@ -1,9 +1,25 @@
 //! Structured tree edits.
 //!
-//! Edits mutate the tree in place via rowan's `splice_children`. Every
-//! parsed tree is mutable (see `parser::parse`), and mutation uses
-//! interior mutability — handles held by the caller automatically see
-//! the result.
+//! Edits rebuild the tree immutably: the target's replacement is
+//! spliced into its parent's green node, and that rebuild is propagated
+//! up the ancestor chain to a fresh root, which is swapped into the
+//! `SyntaxTree`.
+//!
+//! Because rowan trees are persistent, an edit invalidates every
+//! `SyntaxNode`/`SyntaxToken` handle taken before it: the handles still
+//! point into the *old* root. Callers routinely collect a batch of
+//! targets up front and then apply edits one at a time, so `apply_edit`
+//! re-resolves each target against the current root by its root-relative
+//! child-index path (see `index_path`). That keeps stale-but-structurally
+//! valid handles working, exactly as the old in-place `splice_children`
+//! did.
+//!
+//! The path is only stable if edits preserve the indices of the nodes
+//! that later edits target. `ReplaceToken`/`ReplaceNode` are 1-for-1 and
+//! always safe; the `Remove*` variants shift the indices of their later
+//! siblings, so batches that remove must be applied back-to-front (as
+//! `fixers` does by collecting in document order and removing tokens
+//! whose siblings are not themselves targets).
 //!
 //! # Edit kinds
 //!
@@ -20,7 +36,7 @@
 use rowan::{GreenNode, GreenToken, Language, NodeOrToken};
 
 use crate::SyntaxTree;
-use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, YamlLang};
+use crate::syntax::{SyntaxElement, SyntaxNode, SyntaxToken, YamlLang};
 
 mod build;
 mod collection;
@@ -65,9 +81,11 @@ pub fn apply_edit(tree: &mut SyntaxTree, edit: TreeEdit) {
                 .parent()
                 .expect("ReplaceToken: token must have a parent");
             let index = target.index();
-            parent.splice_children(
+            splice_into(
+                tree,
+                &parent,
                 index..index + 1,
-                std::iter::once(SyntaxElement::Token(wrap_token_for_splice(new))),
+                vec![NodeOrToken::Token(new)],
             );
         }
         TreeEdit::ReplaceNode { target, new } => {
@@ -79,39 +97,87 @@ pub fn apply_edit(tree: &mut SyntaxTree, edit: TreeEdit) {
             match target.parent() {
                 None => {
                     // Root replacement — swap the tree's handle.
-                    tree.set_root(SyntaxNode::new_root_mut(new));
+                    tree.set_root(SyntaxNode::new_root(new));
                 }
                 Some(parent) => {
                     let index = target.index();
-                    parent.splice_children(
+                    splice_into(
+                        tree,
+                        &parent,
                         index..index + 1,
-                        std::iter::once(SyntaxElement::Node(SyntaxNode::new_root_mut(new))),
+                        vec![NodeOrToken::Node(new)],
                     );
                 }
             }
         }
         TreeEdit::RemoveToken { target } => {
-            target.detach();
+            let parent = target
+                .parent()
+                .expect("RemoveToken: token must have a parent");
+            let index = target.index();
+            splice_into(tree, &parent, index..index + 1, Vec::new());
         }
-        TreeEdit::RemoveNode { target } => {
-            target.detach();
-        }
+        TreeEdit::RemoveNode { target } => match target.parent() {
+            None => panic!("RemoveNode: cannot remove the tree root"),
+            Some(parent) => {
+                let index = target.index();
+                splice_into(tree, &parent, index..index + 1, Vec::new());
+            }
+        },
     }
 }
 
-/// Wrap a fresh `GreenToken` in a throwaway single-token parent so we
-/// can obtain a mutable `SyntaxToken` suitable for `splice_children`.
-fn wrap_token_for_splice(tok: GreenToken) -> SyntaxToken {
-    // STREAM is an arbitrary wrapper kind; `splice_children` detaches the
-    // token from it when reattaching to the real parent.
-    let wrapper_green = GreenNode::new(
-        YamlLang::kind_to_raw(SyntaxKind::STREAM),
-        [NodeOrToken::Token(tok)],
-    );
-    let wrapper = SyntaxNode::new_root_mut(wrapper_green);
-    wrapper
-        .first_token()
-        .expect("single-token wrapper has a token")
+/// The child indices leading from the tree root down to `node`, root
+/// first. `[]` means `node` is the root.
+///
+/// Indices are into `children_with_tokens()`, i.e. they count tokens as
+/// well as nodes — the same space `splice_children_green` operates in.
+pub(crate) fn index_path(node: &SyntaxNode) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut cur = node.clone();
+    while let Some(parent) = cur.parent() {
+        path.push(cur.index());
+        cur = parent;
+    }
+    path.reverse();
+    path
+}
+
+/// Re-resolve `path` (from `index_path`) against `root`.
+pub(crate) fn node_at_path(root: &SyntaxNode, path: &[usize]) -> SyntaxNode {
+    let mut cur = root.clone();
+    for &i in path {
+        cur = match cur.children_with_tokens().nth(i) {
+            Some(NodeOrToken::Node(n)) => n,
+            _ => panic!("stale edit target: no node at child index {i}"),
+        };
+    }
+    cur
+}
+
+/// Replace `parent.children_with_tokens()[range]` with `new`, rebuilding
+/// every ancestor up to a fresh root and installing it in `tree`.
+///
+/// `parent` may be a handle into an older revision of the tree; it is
+/// re-resolved by index path against the current root first.
+fn splice_into(
+    tree: &mut SyntaxTree,
+    parent: &SyntaxNode,
+    range: std::ops::Range<usize>,
+    new: Vec<GreenElement>,
+) {
+    let path = index_path(parent);
+    let live = node_at_path(tree.root(), &path);
+    let mut green = splice_children_green(&live, range, new);
+
+    // Walk back up, rebuilding each ancestor around the new child green.
+    let mut cur = live;
+    while let Some(ancestor) = cur.parent() {
+        let idx = cur.index();
+        green = splice_children_green(&ancestor, idx..idx + 1, vec![NodeOrToken::Node(green)]);
+        cur = ancestor;
+    }
+    tree.set_root(SyntaxNode::new_root(green));
 }
 
 /// Build a new green node from `parent` with `parent.children_with_tokens()[range]`
@@ -142,7 +208,7 @@ pub fn splice_children_green(
 
 fn element_to_green(el: SyntaxElement) -> GreenElement {
     match el {
-        NodeOrToken::Node(n) => NodeOrToken::Node(n.green().into_owned()),
+        NodeOrToken::Node(n) => NodeOrToken::Node(n.green().to_owned()),
         NodeOrToken::Token(t) => NodeOrToken::Token(t.green().to_owned()),
     }
 }
@@ -151,6 +217,7 @@ fn element_to_green(el: SyntaxElement) -> GreenElement {
 mod tests {
     use super::*;
     use crate::ast::{AstNode, Node, Stream};
+    use crate::syntax::SyntaxKind;
     use crate::syntax::SyntaxKind::*;
 
     fn all_scalars_in(root: &SyntaxNode) -> Vec<crate::ast::Scalar> {
@@ -345,7 +412,7 @@ mod tests {
         // Build a fresh STREAM with different content by cloning green
         // from a fresh parse.
         let other = crate::parse("b: 2\n").expect("parse");
-        let other_green: rowan::GreenNode = other.root().green().into_owned();
+        let other_green: rowan::GreenNode = other.root().green().to_owned();
         // Kinds match (both STREAM) so the assertion holds.
         let target = tree.root().clone();
         apply_edit(

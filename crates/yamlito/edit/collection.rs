@@ -36,8 +36,12 @@ pub(crate) fn replace_node_live(
     target: &SyntaxNode,
     new: rowan::GreenNode,
 ) -> SyntaxNode {
-    let parent = target.parent();
-    let idx = target.index();
+    // Record the target's position *before* the edit: the tree is
+    // rebuilt immutably, so every handle taken now — `target` and its
+    // ancestors alike — points into the old root afterwards. The
+    // child-index path is what survives, and `ReplaceNode` is 1-for-1,
+    // so the replacement lands at exactly the same path.
+    let path = crate::edit::index_path(target);
     apply_edit(
         tree,
         TreeEdit::ReplaceNode {
@@ -45,13 +49,7 @@ pub(crate) fn replace_node_live(
             new,
         },
     );
-    match parent {
-        Some(p) => match p.children_with_tokens().nth(idx) {
-            Some(NodeOrToken::Node(n)) => n,
-            _ => unreachable!("ReplaceNode put a node back at the target's child index"),
-        },
-        None => tree.root().clone(),
-    }
+    crate::edit::node_at_path(tree.root(), &path)
 }
 
 /// Child indices (within `node`) of the entries of kind `entry_kind`.

@@ -1,5 +1,5 @@
 //! `HclDoc`: the editable, format-preserving HCL handle returned by
-//! `hcl::edit(text)`. A cursor/path model over a single `hcl::edit`
+//! `hcl.edit(text)`. A cursor/path model over a single `hcl::edit`
 //! `Body`: traversal calls build up a `path`, and read/write/add/remove
 //! resolve that path against the shared body. Ported from the `hrs`
 //! crate's `Hcl` type, adapted to a single root body.
@@ -10,11 +10,26 @@ use std::rc::Rc;
 use hcl::edit::expr::{Expression, ObjectKey};
 use hcl::edit::structure::{Attribute, Body, Structure};
 use hcl::edit::{Decorate, Ident};
-use rhai::{Dynamic, EvalAltResult, Position};
+use mlua::{Lua, MetaMethod, UserData, UserDataMethods, Value, Variadic};
 
-use super::convert::{hcl_to_rhai, rhai_to_hcl};
+use super::convert::{hcl_to_lua, lua_to_hcl};
 use super::types::{HclError, Segment, Target, labels_match};
 use super::visit;
+
+type Result<T> = mlua::Result<T>;
+
+/// Convert a script-facing 1-based index to the 0-based position the
+/// underlying `hcl::edit` array/path primitives expect (matching Lua's
+/// own `string.sub`/`table.insert` convention — index `1` is the first
+/// element). Rejects `0` and negative indices.
+fn zero_based(index: i64) -> Result<usize> {
+    if index < 1 {
+        return Err(mlua::Error::runtime(format!(
+            "index must be >= 1, got {index}"
+        )));
+    }
+    Ok((index - 1) as usize)
+}
 
 /// An editable HCL document. Cloning yields a handle that shares the same
 /// underlying body (via `Rc<RefCell<..>>`) but carries its own navigation
@@ -30,18 +45,13 @@ impl HclDoc {
         Self { root, path: vec![] }
     }
 
-    pub fn rhai_traverse_str(&mut self, path: &str) -> Result<Self, Box<EvalAltResult>> {
-        Ok(self.traverse(path))
+    fn traverse_str(&self, path: &str) -> Self {
+        self.traverse(path)
     }
 
-    pub fn rhai_traverse_index(&mut self, index: i64) -> Result<Self, Box<EvalAltResult>> {
-        if index < 0 {
-            return Err(Box::new(EvalAltResult::ErrorRuntime(
-                format!("Index cannot be negative: {}", index).into(),
-                Position::NONE,
-            )));
-        }
-        Ok(self.traverse(index as usize))
+    /// `index` is 1-based, matching Lua's own indexing convention.
+    fn traverse_index(&self, index: i64) -> Result<Self> {
+        Ok(self.traverse(zero_based(index)?))
     }
 
     pub fn traverse_block(&self, ident: String, labels: Vec<String>, nth: Option<usize>) -> Self {
@@ -58,37 +68,12 @@ impl HclDoc {
         vec!["**".to_string()]
     }
 
-    /// The same "any labels" default as a Rhai array, for the
-    /// `blocks`/`block_count` entry points that take a `rhai::Array`.
-    pub fn any_labels_array() -> rhai::Array {
-        vec![Dynamic::from("**".to_string())]
+    /// `nth` is 1-based, matching Lua's own indexing convention.
+    fn check_nth(nth: i64) -> Result<usize> {
+        zero_based(nth)
     }
 
-    pub fn check_nth(nth: i64) -> Result<usize, Box<EvalAltResult>> {
-        if nth < 0 {
-            return Err(Box::new(EvalAltResult::ErrorRuntime(
-                format!("Block index cannot be negative: {}", nth).into(),
-                Position::NONE,
-            )));
-        }
-        Ok(nth as usize)
-    }
-
-    pub fn parse_labels_array(labels: rhai::Array) -> Result<Vec<String>, Box<EvalAltResult>> {
-        labels
-            .into_iter()
-            .map(|v| {
-                v.into_string().map_err(|e| {
-                    Box::new(EvalAltResult::ErrorRuntime(
-                        format!("Labels must be strings: {}", e).into(),
-                        Position::NONE,
-                    ))
-                })
-            })
-            .collect()
-    }
-
-    pub fn rhai_attr(&mut self, key: &str) -> Self {
+    fn attr(&self, key: &str) -> Self {
         let mut new = self.clone();
         new.path.push(Segment::Attr {
             key: key.to_string(),
@@ -102,7 +87,94 @@ impl HclDoc {
         new
     }
 
-    pub fn to_string(&self) -> Result<String, String> {
+    // ---- flexible-argument parsing for the `block*` overload sets ------
+    //
+    // mlua has no overloading, so a single variadic tail is parsed
+    // positionally here. The accepted shapes are:
+    //   - (no args)                         -> any labels, no nth
+    //   - (label...)                        -> 1..=3 string labels, no nth
+    //   - (nth)                             -> any labels, at nth
+    //   - (label..., nth)                   -> string labels + trailing nth
+    //   - ([labels])                        -> array of labels, no nth
+    //   - ([labels], nth)                   -> array of labels + nth
+
+    /// Parse a variadic tail into `(labels, nth)`. `default_any` controls
+    /// what an *absent* labels argument means: `["**"]` (match any) for the
+    /// `block(...)` navigator, or `["**"]` likewise for filters — callers
+    /// that need the "empty = zero labels" semantics pass an explicit array.
+    fn parse_labels_and_nth(args: &[Value]) -> Result<(Vec<String>, Option<usize>)> {
+        // Split off an optional trailing integer as `nth`.
+        let (labels_part, nth) = match args.last() {
+            Some(Value::Integer(n)) => (&args[..args.len() - 1], Some(Self::check_nth(*n)?)),
+            _ => (args, None),
+        };
+
+        // A single table argument is the `[labels]` array form.
+        if labels_part.len() == 1
+            && let Value::Table(t) = &labels_part[0]
+        {
+            return Ok((Self::table_labels(t)?, nth));
+        }
+
+        // Otherwise every element must be a string label.
+        let mut labels = Vec::with_capacity(labels_part.len());
+        for v in labels_part {
+            match v {
+                Value::String(s) => labels.push(s.to_str()?.to_string()),
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "Labels must be strings (or a single array of strings)",
+                    ));
+                }
+            }
+        }
+        // No labels given -> match any labels.
+        if labels.is_empty() && nth.is_none() && args.is_empty() {
+            return Ok((Self::any_labels(), None));
+        }
+        if labels.is_empty() {
+            // `(nth)` alone, or `([])`-less empty tail with an nth: match any.
+            return Ok((Self::any_labels(), nth));
+        }
+        Ok((labels, nth))
+    }
+
+    fn table_labels(t: &mlua::Table) -> Result<Vec<String>> {
+        t.clone()
+            .sequence_values::<String>()
+            .collect::<Result<Vec<_>>>()
+            .map_err(|_| mlua::Error::runtime("Labels must be strings"))
+    }
+
+    /// Parse the labels-only variadic tail for `blocks`/`block_count`: the
+    /// same shapes minus a trailing `nth`. An absent labels argument means
+    /// "match any" (`["**"]`); an explicit empty array means zero labels.
+    fn parse_filter_labels(args: &[Value]) -> Result<Vec<String>> {
+        if args.is_empty() {
+            return Ok(Self::any_labels());
+        }
+        if args.len() == 1
+            && let Value::Table(t) = &args[0]
+        {
+            return Ok(Self::table_labels(t)?);
+        }
+        let mut labels = Vec::with_capacity(args.len());
+        for v in args {
+            match v {
+                Value::String(s) => labels.push(s.to_str()?.to_string()),
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "Labels must be strings (or a single array of strings)",
+                    ));
+                }
+            }
+        }
+        Ok(labels)
+    }
+
+    // ---- to_string ----------------------------------------------------
+
+    pub fn render_to_string(&self) -> std::result::Result<String, String> {
         let mut body = self.root.borrow_mut();
         if self.path.is_empty() {
             return Ok(body.to_string());
@@ -123,19 +195,20 @@ impl HclDoc {
         })
     }
 
-    pub fn rhai_to_string(&mut self) -> Result<String, Box<EvalAltResult>> {
-        self.to_string()
-            .map_err(|e| Box::new(EvalAltResult::ErrorRuntime(e.into(), Position::NONE)))
+    fn to_string(&self) -> Result<String> {
+        self.render_to_string().map_err(mlua::Error::runtime)
     }
 
-    pub fn rhai_read(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
+    // ---- read ---------------------------------------------------------
+
+    fn read(&self, lua: &Lua) -> Result<Value> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
         match target {
-            Target::Expr(expression) => Ok(hcl_to_rhai(expression)?),
-            Target::Object(object) => Ok(hcl_to_rhai(&Expression::Object(object.clone()))?),
-            Target::Array(array) => Ok(hcl_to_rhai(&Expression::Array(array.clone()))?),
+            Target::Expr(expression) => Ok(hcl_to_lua(lua, expression)?),
+            Target::Object(object) => Ok(hcl_to_lua(lua, &Expression::Object(object.clone()))?),
+            Target::Array(array) => Ok(hcl_to_lua(lua, &Expression::Array(array.clone()))?),
             _ => Err(HclError::InvalidType {
                 expected: "Expr, Object, or Array",
                 actual: target.type_name(),
@@ -144,12 +217,12 @@ impl HclDoc {
     }
 
     /// Read the expression at the path **verbatim**, as a raw `HclExpr`
-    /// (the same value `hcl::expr`/`hcl::ident` produce). Unlike `read`,
+    /// (the same value `hcl.expr`/`hcl.ident` produce). Unlike `read`,
     /// this works for computed expressions — `var.x`, function calls,
     /// `string`, `list(string)`, conditionals — and round-trips straight
     /// back into `write`/`add`. The handle must point at an expression
     /// (attribute value / array element), not a body or block.
-    pub fn rhai_read_raw(&mut self) -> Result<super::HclExpr, Box<EvalAltResult>> {
+    fn read_raw(&self) -> Result<super::HclExpr> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -167,17 +240,15 @@ impl HclDoc {
         Ok(super::HclExpr::from_expression(hcl::Expression::from(cst)))
     }
 
-    pub fn rhai_try_read_raw(&mut self) -> Dynamic {
-        self.rhai_read_raw()
-            .map(Dynamic::from)
-            .unwrap_or(Dynamic::UNIT)
-    }
+    // ---- write --------------------------------------------------------
 
-    pub fn rhai_write(&mut self, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
+    fn write(&self, lua: &Lua, value: Value) -> Result<()> {
         // A builder block replaces the block the cursor points at, keeping
         // the original's position and indentation.
-        if value.is::<super::HclBlock>() {
-            let builder = value.cast::<super::HclBlock>();
+        if let Value::UserData(ud) = &value
+            && ud.is::<super::HclBlock>()
+        {
+            let builder = ud.borrow::<super::HclBlock>()?.clone();
             let mut root = self.root.borrow_mut();
             let path_depth = self.path.len();
             let (target, segment) = visit::VisitPath::find_parent(self.path.clone(), &mut root)?;
@@ -214,7 +285,7 @@ impl HclDoc {
         let mut root = self.root.borrow_mut();
         let (target, segment) = visit::VisitPath::find_parent(self.path.clone(), &mut root)?;
 
-        let value = rhai_to_hcl(value)?;
+        let value = lua_to_hcl(lua, value)?;
 
         match target {
             Target::Body(body) => {
@@ -286,7 +357,9 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_exists(&mut self) -> bool {
+    // ---- exists / type checks ----------------------------------------
+
+    fn exists(&self) -> bool {
         if self.path.is_empty() {
             return true;
         }
@@ -294,13 +367,13 @@ impl HclDoc {
         visit::VisitPath::find(self.path.clone(), &mut root).is_ok()
     }
 
-    fn attr_keys_from_body(body: &Body) -> rhai::Array {
+    fn attr_keys_from_body(body: &Body) -> Vec<String> {
         body.attributes()
-            .map(|attr| Dynamic::from(attr.key.as_str().to_string()))
+            .map(|attr| attr.key.as_str().to_string())
             .collect()
     }
 
-    pub fn rhai_attribute_keys(&mut self) -> Result<rhai::Array, Box<EvalAltResult>> {
+    fn attribute_keys(&self) -> Result<Vec<String>> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -314,7 +387,7 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_len(&mut self) -> Result<i64, Box<EvalAltResult>> {
+    fn len(&self) -> Result<i64> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -355,10 +428,8 @@ impl HclDoc {
     }
 
     /// Remove the single block matching `ident` + `labels` (label-glob aware)
-    /// at index `nth` (default 0) from `body`. Unlike `Body::remove_blocks`,
-    /// which is ident-only and removes *all* matching blocks, this targets the
-    /// exact label-addressed block by computing its absolute structure index.
-    /// Returns `false` if no such block exists.
+    /// at index `nth` (default 0) from `body`. Returns `false` if no such
+    /// block exists.
     fn remove_block_from_body(
         body: &mut Body,
         ident: &str,
@@ -374,7 +445,7 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_remove(&mut self) -> Result<(), Box<EvalAltResult>> {
+    fn remove(&self) -> Result<()> {
         let mut root = self.root.borrow_mut();
         let (target, segment) = visit::VisitPath::find_parent(self.path.clone(), &mut root)?;
 
@@ -491,14 +562,14 @@ impl HclDoc {
         Self::structure_indent(body.iter().last().cloned()).unwrap_or_else(|| "  ".repeat(depth))
     }
 
-    /// Build an `hcl::block(…)` builder into an edit-CST block laid out at
+    /// Build an `hcl.block(…)` builder into an edit-CST block laid out at
     /// `indent` (its inner body rendered one step deeper, its own header
     /// prefixed with `indent`). Shared by `add`/`write` so both indent a
     /// spliced-in block identically.
     fn block_at_indent(
         builder: &super::HclBlock,
         indent: &str,
-    ) -> Result<hcl::edit::structure::Block, Box<EvalAltResult>> {
+    ) -> Result<hcl::edit::structure::Block> {
         let mut block = builder.to_edit_block(indent.len() / 2)?;
         block.decor_mut().set_prefix(indent.to_string());
         Ok(block)
@@ -511,11 +582,11 @@ impl HclDoc {
         s
     }
 
-    pub fn rhai_add_kv(&mut self, key: &str, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
+    fn add_kv(&self, lua: &Lua, key: &str, value: Value) -> Result<()> {
         let mut root = self.root.borrow_mut();
         let depth = self.path.len();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
-        let value = rhai_to_hcl(value)?;
+        let value = lua_to_hcl(lua, value)?;
 
         match target {
             Target::Body(body) => {
@@ -546,17 +617,20 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_add_index(&mut self, index: i64, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
+    /// `index` is 1-based, matching Lua's own indexing convention;
+    /// out-of-range (including `<= 0`) clamps to the nearest end rather
+    /// than erroring.
+    fn add_index(&self, lua: &Lua, index: i64, value: Value) -> Result<()> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
-        let value = rhai_to_hcl(value)?;
+        let value = lua_to_hcl(lua, value)?;
 
         match target {
             Target::Array(array) => {
-                let idx = if index < 0 {
+                let idx = if index < 1 {
                     0usize
                 } else {
-                    (index as usize).min(array.len())
+                    ((index - 1) as usize).min(array.len())
                 };
                 array.insert(idx, value);
                 Ok(())
@@ -568,11 +642,13 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_add_value(&mut self, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
-        // A builder block (`hcl::block(..)`) appends a nested block to a
+    fn add_value(&self, lua: &Lua, value: Value) -> Result<()> {
+        // A builder block (`hcl.block(..)`) appends a nested block to a
         // body/block target, indented to match its siblings.
-        if value.is::<super::HclBlock>() {
-            let builder = value.cast::<super::HclBlock>();
+        if let Value::UserData(ud) = &value
+            && ud.is::<super::HclBlock>()
+        {
+            let builder = ud.borrow::<super::HclBlock>()?.clone();
             let mut root = self.root.borrow_mut();
             let path_depth = self.path.len();
             let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
@@ -584,9 +660,6 @@ impl HclDoc {
                     actual: target.type_name(),
                 })?,
             };
-            // Render at the body's actual indent depth (inferred from an
-            // existing sibling when present, else from the path depth), so
-            // the block and its nested content line up.
             let indent = Self::body_indent(body, depth);
             body.push(Self::block_at_indent(&builder, &indent)?);
             return Ok(());
@@ -594,7 +667,7 @@ impl HclDoc {
 
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
-        let value = rhai_to_hcl(value)?;
+        let value = lua_to_hcl(lua, value)?;
 
         match target {
             Target::Array(array) => {
@@ -608,7 +681,51 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_remove_key(&mut self, key: &str) -> Result<(), Box<EvalAltResult>> {
+    /// The `add` dispatch: `add(index, value)` for arrays, `add(key, value)`
+    /// for maps/bodies/blocks, `add(value)` for array-append or block-append.
+    fn add(&self, lua: &Lua, args: Variadic<Value>) -> Result<()> {
+        match args.len() {
+            1 => self.add_value(lua, args.into_iter().next().unwrap()),
+            2 => {
+                let mut it = args.into_iter();
+                let first = it.next().unwrap();
+                let value = it.next().unwrap();
+                match first {
+                    Value::Integer(i) => self.add_index(lua, i, value),
+                    Value::String(s) => self.add_kv(lua, &s.to_str()?, value),
+                    other => Err(mlua::Error::runtime(format!(
+                        "add: first argument must be an index or key, got {}",
+                        other.type_name()
+                    ))),
+                }
+            }
+            n => Err(mlua::Error::runtime(format!(
+                "add: expected 1 or 2 arguments, got {n}"
+            ))),
+        }
+    }
+
+    /// The `remove` dispatch: `remove()` uses the cursor's own path,
+    /// `remove(index)` removes an array element, `remove(key)` removes a
+    /// body/block/object member.
+    fn remove_dispatch(&self, args: Variadic<Value>) -> Result<()> {
+        match args.len() {
+            0 => self.remove(),
+            1 => match args.into_iter().next().unwrap() {
+                Value::Integer(i) => self.remove_index(i),
+                Value::String(s) => self.remove_key(&s.to_str()?),
+                other => Err(mlua::Error::runtime(format!(
+                    "remove: argument must be an index or key, got {}",
+                    other.type_name()
+                ))),
+            },
+            n => Err(mlua::Error::runtime(format!(
+                "remove: expected 0 or 1 arguments, got {n}"
+            ))),
+        }
+    }
+
+    fn remove_key(&self, key: &str) -> Result<()> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -660,14 +777,15 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_remove_index(&mut self, index: i64) -> Result<(), Box<EvalAltResult>> {
+    /// `index` is 1-based, matching Lua's own indexing convention.
+    fn remove_index(&self, index: i64) -> Result<()> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
         match target {
             Target::Array(array) => {
-                if index >= 0 && (index as usize) < array.len() {
-                    array.remove(index as usize);
+                if index >= 1 && ((index - 1) as usize) < array.len() {
+                    array.remove((index - 1) as usize);
                     Ok(())
                 } else {
                     Err(HclError::IndexOutOfBounds {
@@ -683,7 +801,7 @@ impl HclDoc {
         }
     }
 
-    fn block_types_from_body(body: &Body) -> rhai::Array {
+    fn block_types_from_body(body: &Body) -> Vec<String> {
         let mut seen = Vec::new();
         for block in body.blocks() {
             let ident = block.ident.as_str().to_string();
@@ -691,10 +809,10 @@ impl HclDoc {
                 seen.push(ident);
             }
         }
-        seen.into_iter().map(Dynamic::from).collect()
+        seen
     }
 
-    pub fn rhai_block_types(&mut self) -> Result<rhai::Array, Box<EvalAltResult>> {
+    fn block_types(&self) -> Result<Vec<String>> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -708,7 +826,7 @@ impl HclDoc {
         }
     }
 
-    fn block_labels_from_body(body: &Body, ident: &str) -> rhai::Array {
+    fn block_labels_from_body(body: &Body, ident: &str) -> Vec<Vec<String>> {
         let mut seen = Vec::<Vec<String>>::new();
         for block in body.blocks() {
             if block.ident.as_str() != ident {
@@ -723,12 +841,10 @@ impl HclDoc {
                 seen.push(labels);
             }
         }
-        seen.into_iter()
-            .map(|labels| Dynamic::from_array(labels.into_iter().map(Dynamic::from).collect()))
-            .collect()
+        seen
     }
 
-    pub fn rhai_block_labels(&mut self, ident: &str) -> Result<rhai::Array, Box<EvalAltResult>> {
+    fn block_labels(&self, ident: &str) -> Result<Vec<Vec<String>>> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -747,7 +863,7 @@ impl HclDoc {
         body: &Body,
         filter_ident: Option<&str>,
         filter_labels: &[String],
-    ) -> rhai::Array {
+    ) -> Vec<HclDoc> {
         let mut counters: std::collections::HashMap<(String, Vec<String>), usize> =
             std::collections::HashMap::new();
         body.blocks()
@@ -771,16 +887,16 @@ impl HclDoc {
                 let nth = counters.entry(key).or_insert(0);
                 let hcl = self.traverse_block(ident, labels, Some(*nth));
                 *nth += 1;
-                Dynamic::from(hcl)
+                hcl
             })
             .collect()
     }
 
     fn resolve_and_collect_blocks(
-        &mut self,
+        &self,
         filter_ident: Option<&str>,
         filter_labels: &[String],
-    ) -> Result<rhai::Array, Box<EvalAltResult>> {
+    ) -> Result<Vec<HclDoc>> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -796,32 +912,40 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_blocks(&mut self) -> Result<rhai::Array, Box<EvalAltResult>> {
-        self.resolve_and_collect_blocks(None, &[])
+    /// `blocks()` (all), or `blocks(ident, [labels...])` (filtered), via
+    /// variadic parsing.
+    fn blocks(&self, args: Variadic<Value>) -> Result<Vec<HclDoc>> {
+        if args.is_empty() {
+            return self.resolve_and_collect_blocks(None, &[]);
+        }
+        let mut it = args.into_iter();
+        let ident = match it.next().unwrap() {
+            Value::String(s) => s.to_str()?.to_string(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "blocks: ident must be a string, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        let rest: Vec<Value> = it.collect();
+        let labels = Self::parse_filter_labels(&rest)?;
+        self.resolve_and_collect_blocks(Some(&ident), &labels)
     }
 
-    pub fn rhai_blocks_filtered(
-        &mut self,
-        ident: &str,
-        labels: rhai::Array,
-    ) -> Result<rhai::Array, Box<EvalAltResult>> {
-        let labels = Self::parse_labels_array(labels)?;
-        self.resolve_and_collect_blocks(Some(ident), &labels)
-    }
-
-    fn attributes_from_body(&self, body: &Body) -> rhai::Array {
+    fn attributes_from_body(&self, body: &Body) -> Vec<HclDoc> {
         body.attributes()
             .map(|attr| {
                 let mut new = self.clone();
                 new.path.push(Segment::Attr {
                     key: attr.key.as_str().to_string(),
                 });
-                Dynamic::from(new)
+                new
             })
             .collect()
     }
 
-    pub fn rhai_attributes(&mut self) -> Result<rhai::Array, Box<EvalAltResult>> {
+    fn attributes(&self) -> Result<Vec<HclDoc>> {
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
@@ -844,18 +968,28 @@ impl HclDoc {
             .count() as i64
     }
 
-    pub fn rhai_block_count(
-        &mut self,
-        ident: &str,
-        labels: rhai::Array,
-    ) -> Result<i64, Box<EvalAltResult>> {
-        let labels = Self::parse_labels_array(labels)?;
+    /// `block_count(ident)` / `block_count(ident, label...)` /
+    /// `block_count(ident, [labels])`, via variadic parsing.
+    fn block_count(&self, args: Variadic<Value>) -> Result<i64> {
+        let mut it = args.into_iter();
+        let ident = match it.next() {
+            Some(Value::String(s)) => s.to_str()?.to_string(),
+            _ => {
+                return Err(mlua::Error::runtime("block_count: ident must be a string"));
+            }
+        };
+        let rest: Vec<Value> = it.collect();
+        let labels = Self::parse_filter_labels(&rest)?;
         let mut root = self.root.borrow_mut();
         let target = visit::VisitPath::find(self.path.clone(), &mut root)?;
 
         match target {
-            Target::Body(body) => Ok(Self::block_count_from_body(body, ident, &labels)),
-            Target::Block(block) => Ok(Self::block_count_from_body(&block.body, ident, &labels)),
+            Target::Body(body) => Ok(Self::block_count_from_body(body, ident.as_str(), &labels)),
+            Target::Block(block) => Ok(Self::block_count_from_body(
+                &block.body,
+                ident.as_str(),
+                &labels,
+            )),
             _ => Err(HclError::InvalidType {
                 expected: "Body or Block",
                 actual: target.type_name(),
@@ -863,7 +997,7 @@ impl HclDoc {
         }
     }
 
-    pub fn rhai_is_array(&mut self) -> bool {
+    fn is_array(&self) -> bool {
         if self.path.is_empty() {
             return false;
         }
@@ -876,7 +1010,7 @@ impl HclDoc {
         )
     }
 
-    pub fn rhai_is_object(&mut self) -> bool {
+    fn is_object(&self) -> bool {
         if self.path.is_empty() {
             return false;
         }
@@ -889,7 +1023,7 @@ impl HclDoc {
         )
     }
 
-    pub fn rhai_is_expr(&mut self) -> bool {
+    fn is_expr(&self) -> bool {
         if self.path.is_empty() {
             return false;
         }
@@ -902,7 +1036,7 @@ impl HclDoc {
         )
     }
 
-    pub fn rhai_is_block(&mut self) -> bool {
+    fn is_block(&self) -> bool {
         if self.path.is_empty() {
             return false;
         }
@@ -915,7 +1049,7 @@ impl HclDoc {
         )
     }
 
-    pub fn rhai_is_body(&mut self) -> bool {
+    fn is_body(&self) -> bool {
         if self.path.is_empty() {
             return true;
         }
@@ -927,92 +1061,109 @@ impl HclDoc {
             Ok(Target::Body(_) | Target::Block(_))
         )
     }
+}
 
-    // Read-like try_ variants: return value on success, () on failure
-    pub fn rhai_try_read(&mut self) -> Dynamic {
-        self.rhai_read().unwrap_or(Dynamic::UNIT)
+/// Traversal via bracket syntax: `h["key"]` (string) or `h[0]` (index).
+/// Registered as the fallback `__index`; named methods (`read`, `block`,
+/// …) are looked up first by mlua's generated `__index`.
+fn index(h: &HclDoc, key: Value) -> Result<HclDoc> {
+    match key {
+        Value::String(s) => Ok(h.traverse_str(&s.to_str()?)),
+        Value::Integer(i) => h.traverse_index(i),
+        other => Err(mlua::Error::runtime(format!(
+            "hcl.edit index must be a string key or integer index, got {}",
+            other.type_name()
+        ))),
     }
+}
 
-    pub fn rhai_try_attribute_keys(&mut self) -> Dynamic {
-        self.rhai_attribute_keys()
-            .map(Dynamic::from_array)
-            .unwrap_or(Dynamic::UNIT)
-    }
+impl UserData for HclDoc {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // Bracket-syntax traversal (fallback after named-method lookup).
+        methods.add_meta_method(MetaMethod::Index, |_, h, key: Value| index(h, key));
 
-    pub fn rhai_try_len(&mut self) -> Dynamic {
-        self.rhai_len()
-            .map(Dynamic::from_int)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        // Traversal navigators.
+        methods.add_method("attr", |_, h, key: String| Ok(h.attr(&key)));
+        methods.add_method("attribute", |_, h, key: String| Ok(h.attr(&key)));
 
-    pub fn rhai_try_to_string(&mut self) -> Dynamic {
-        self.rhai_to_string()
-            .map(Dynamic::from)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        methods.add_method("block", |_, h, args: Variadic<Value>| {
+            let mut it = args.into_iter();
+            let ident = match it.next() {
+                Some(Value::String(s)) => s.to_str()?.to_string(),
+                _ => return Err(mlua::Error::runtime("block: ident must be a string")),
+            };
+            let rest: Vec<Value> = it.collect();
+            let (labels, nth) = HclDoc::parse_labels_and_nth(&rest)?;
+            Ok(h.traverse_block(ident, labels, nth))
+        });
 
-    // Write-like try_ variants: return bool
-    pub fn rhai_try_write(&mut self, value: Dynamic) -> bool {
-        self.rhai_write(value).is_ok()
-    }
+        methods.add_method("exists", |_, h, ()| Ok(h.exists()));
 
-    pub fn rhai_try_remove(&mut self) -> bool {
-        self.rhai_remove().is_ok()
-    }
+        methods.add_method("attrs", |_, h, ()| h.attributes());
+        methods.add_method("attributes", |_, h, ()| h.attributes());
+        methods.add_method("try_attrs", |_, h, ()| Ok(h.attributes().ok()));
+        methods.add_method("try_attributes", |_, h, ()| Ok(h.attributes().ok()));
 
-    pub fn rhai_try_remove_key(&mut self, key: &str) -> bool {
-        self.rhai_remove_key(key).is_ok()
-    }
+        methods.add_method("attr_keys", |_, h, ()| h.attribute_keys());
+        methods.add_method("attribute_keys", |_, h, ()| h.attribute_keys());
+        methods.add_method("try_attr_keys", |_, h, ()| Ok(h.attribute_keys().ok()));
+        methods.add_method("try_attribute_keys", |_, h, ()| Ok(h.attribute_keys().ok()));
 
-    pub fn rhai_try_remove_index(&mut self, index: i64) -> bool {
-        self.rhai_remove_index(index).is_ok()
-    }
+        methods.add_method("blocks", |_, h, args: Variadic<Value>| h.blocks(args));
+        methods.add_method("try_blocks", |_, h, args: Variadic<Value>| {
+            Ok(h.blocks(args).ok())
+        });
 
-    pub fn rhai_try_add_kv(&mut self, key: &str, value: Dynamic) -> bool {
-        self.rhai_add_kv(key, value).is_ok()
-    }
+        methods.add_method("block_types", |_, h, ()| h.block_types());
+        methods.add_method("try_block_types", |_, h, ()| Ok(h.block_types().ok()));
 
-    pub fn rhai_try_add_index(&mut self, index: i64, value: Dynamic) -> bool {
-        self.rhai_add_index(index, value).is_ok()
-    }
+        methods.add_method("block_labels", |_, h, ident: String| h.block_labels(&ident));
+        methods.add_method("try_block_labels", |_, h, ident: String| {
+            Ok(h.block_labels(&ident).ok())
+        });
 
-    pub fn rhai_try_add_value(&mut self, value: Dynamic) -> bool {
-        self.rhai_add_value(value).is_ok()
-    }
+        methods.add_method("block_count", |_, h, args: Variadic<Value>| {
+            h.block_count(args)
+        });
+        methods.add_method("try_block_count", |_, h, args: Variadic<Value>| {
+            Ok(h.block_count(args).ok())
+        });
 
-    pub fn rhai_try_blocks(&mut self) -> Dynamic {
-        self.rhai_blocks()
-            .map(Dynamic::from_array)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        // Type checks.
+        methods.add_method("is_array", |_, h, ()| Ok(h.is_array()));
+        methods.add_method("is_object", |_, h, ()| Ok(h.is_object()));
+        methods.add_method("is_expr", |_, h, ()| Ok(h.is_expr()));
+        methods.add_method("is_block", |_, h, ()| Ok(h.is_block()));
+        methods.add_method("is_body", |_, h, ()| Ok(h.is_body()));
 
-    pub fn rhai_try_blocks_filtered(&mut self, ident: &str, labels: rhai::Array) -> Dynamic {
-        self.rhai_blocks_filtered(ident, labels)
-            .map(Dynamic::from_array)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        // Read / modify.
+        methods.add_method("read", |lua, h, ()| h.read(lua));
+        methods.add_method("try_read", |lua, h, ()| Ok(h.read(lua).ok()));
+        methods.add_method("read_raw", |_, h, ()| h.read_raw());
+        methods.add_method("try_read_raw", |_, h, ()| Ok(h.read_raw().ok()));
 
-    pub fn rhai_try_attributes(&mut self) -> Dynamic {
-        self.rhai_attributes()
-            .map(Dynamic::from_array)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        methods.add_method("write", |lua, h, value: Value| h.write(lua, value));
+        methods.add_method("try_write", |lua, h, value: Value| {
+            Ok(h.write(lua, value).is_ok())
+        });
 
-    pub fn rhai_try_block_types(&mut self) -> Dynamic {
-        self.rhai_block_types()
-            .map(Dynamic::from_array)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        methods.add_method("len", |_, h, ()| h.len());
+        methods.add_method("try_len", |_, h, ()| Ok(h.len().ok()));
 
-    pub fn rhai_try_block_labels(&mut self, ident: &str) -> Dynamic {
-        self.rhai_block_labels(ident)
-            .map(Dynamic::from_array)
-            .unwrap_or(Dynamic::UNIT)
-    }
+        methods.add_method("add", |lua, h, args: Variadic<Value>| h.add(lua, args));
+        methods.add_method("try_add", |lua, h, args: Variadic<Value>| {
+            Ok(h.add(lua, args).is_ok())
+        });
 
-    pub fn rhai_try_block_count(&mut self, ident: &str, labels: rhai::Array) -> Dynamic {
-        self.rhai_block_count(ident, labels)
-            .map(Dynamic::from_int)
-            .unwrap_or(Dynamic::UNIT)
+        methods.add_method("remove", |_, h, args: Variadic<Value>| {
+            h.remove_dispatch(args)
+        });
+        methods.add_method("try_remove", |_, h, args: Variadic<Value>| {
+            Ok(h.remove_dispatch(args).is_ok())
+        });
+
+        methods.add_method("to_string", |_, h, ()| h.to_string());
+        methods.add_method("try_to_string", |_, h, ()| Ok(h.to_string().ok()));
+        methods.add_meta_method(MetaMethod::ToString, |_, h, ()| h.to_string());
     }
 }

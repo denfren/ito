@@ -1,323 +1,142 @@
-//! String method extensions.
+//! String helper functions.
 //!
-//! Rather than overriding Rhai's built-in mutating methods (which surprised
-//! users expecting the mutate-in-place semantics), ito adds two explicit
-//! variants for each operation:
+//! Lua strings are immutable values, so each of these is a pure function
+//! that takes a string (plus any arguments) and returns a new string. They
+//! extend Luau's built-in `string` library table with a handful of
+//! character-aware helpers (crop/set/pad operate on Unicode `chars()`, not
+//! bytes):
 //!
-//! - `to_*` — pure: returns the result as a new string, never mutates the receiver.
-//! - `make_*` — mutates the string in place and returns nothing.
+//! - `trimmed` / `trimmed_start` / `trimmed_end` — strip whitespace.
+//! - `truncated(s, len)` — keep the first `len` chars.
+//! - `cropped(s, start[, len])` — substring by 1-based char index, matching
+//!   `string.sub`'s convention (negative `start` counts from the end, `-1`
+//!   is the last char; `len` is optional / nilable). Unlike `string.sub`
+//!   (which indexes bytes and can split a multi-byte UTF-8 codepoint in
+//!   two), these index whole characters, so they are always safe on
+//!   non-ASCII text.
+//! - `set(s, index, sub)` — replace the char at 1-based `index` with `sub`
+//!   (negative `index` counts from the end, same convention as `cropped`).
+//! - `padded(s, len, pad)` — pad on the right with `pad` up to `len` chars.
+//! - `removed(s, sub)` — remove every occurrence of `sub`.
+//! - `replaced(s, from, to)` — replace every occurrence of `from` with `to`.
 //!
-//! Rhai already provides `to_upper`/`to_lower` (pure copies) and
-//! `make_upper`/`make_lower` (mutate, return unit) — ito keeps the
-//! `make_upper`/`make_lower` unit semantics and adds the rest to match.
-//!
-//! `join` is added to arrays as a method (no Rhai built-in for it).
+//! `upper`/`lower` are intentionally not registered: Luau's built-in
+//! `string.upper`/`string.lower` already cover them.
 
-use rhai::{Array, Engine, ImmutableString};
+use mlua::{Lua, Table};
 
-pub fn register(engine: &mut Engine) {
-    // --- join (array method, unchanged) ---
+/// Register the string helpers on Luau's built-in `string` table.
+pub fn register(lua: &Lua) -> mlua::Result<()> {
+    let string_table: Table = lua.globals().get("string")?;
 
-    engine.register_fn(
-        "join",
-        |arr: Array, sep: ImmutableString| -> ImmutableString {
-            arr.into_iter()
-                .map(|v| v.into_string().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(sep.as_str())
-                .into()
-        },
-    );
+    string_table.set(
+        "trimmed",
+        lua.create_function(|_, s: String| Ok(s.trim().to_string()))?,
+    )?;
 
-    // --- trim ---
+    string_table.set(
+        "trimmed_start",
+        lua.create_function(|_, s: String| Ok(s.trim_start().to_string()))?,
+    )?;
 
-    engine.register_fn("to_trimmed", |s: ImmutableString| -> ImmutableString {
-        s.trim().into()
-    });
+    string_table.set(
+        "trimmed_end",
+        lua.create_function(|_, s: String| Ok(s.trim_end().to_string()))?,
+    )?;
 
-    engine.register_fn("make_trimmed", |s: &mut ImmutableString| {
-        *s = s.trim().into();
-    });
-
-    // --- trim_start ---
-
-    engine.register_fn(
-        "to_trimmed_start",
-        |s: ImmutableString| -> ImmutableString { s.trim_start().into() },
-    );
-
-    engine.register_fn("make_trimmed_start", |s: &mut ImmutableString| {
-        *s = s.trim_start().into();
-    });
-
-    // --- trim_end ---
-
-    engine.register_fn("to_trimmed_end", |s: ImmutableString| -> ImmutableString {
-        s.trim_end().into()
-    });
-
-    engine.register_fn("make_trimmed_end", |s: &mut ImmutableString| {
-        *s = s.trim_end().into();
-    });
-
-    // --- upper (Rhai has `to_upper`; we add `make_upper` returning the string) ---
-
-    engine.register_fn("make_upper", |s: &mut ImmutableString| {
-        *s = s.to_uppercase().into();
-    });
-
-    // --- lower (Rhai has `to_lower`; we add `make_lower` returning the string) ---
-
-    engine.register_fn("make_lower", |s: &mut ImmutableString| {
-        *s = s.to_lowercase().into();
-    });
-
-    // --- clear ---
-
-    engine.register_fn("to_cleared", |_s: ImmutableString| -> ImmutableString {
-        "".into()
-    });
-
-    engine.register_fn("make_cleared", |s: &mut ImmutableString| {
-        *s = "".into();
-    });
-
-    // --- truncate ---
-
-    engine.register_fn(
-        "to_truncated",
-        |s: ImmutableString, len: i64| -> ImmutableString {
+    string_table.set(
+        "truncated",
+        lua.create_function(|_, (s, len): (String, i64)| {
             let len = len.max(0) as usize;
-            s.chars().take(len).collect::<String>().into()
-        },
-    );
+            Ok(s.chars().take(len).collect::<String>())
+        })?,
+    )?;
 
-    engine.register_fn("make_truncated", |s: &mut ImmutableString, len: i64| {
-        let len = len.max(0) as usize;
-        *s = s.chars().take(len).collect::<String>().into();
-    });
+    string_table.set(
+        "cropped",
+        lua.create_function(|_, (s, start, len): (String, i64, Option<i64>)| {
+            Ok(crop_range(&s, start, len))
+        })?,
+    )?;
 
-    // --- crop ---
+    string_table.set(
+        "set",
+        lua.create_function(|_, (s, index, sub): (String, i64, String)| {
+            Ok(set_at(&s, index, &sub))
+        })?,
+    )?;
 
-    engine.register_fn(
-        "to_cropped",
-        |s: ImmutableString, start: i64| -> ImmutableString {
-            let mut tmp = s;
-            crop_range(&mut tmp, start, None);
-            tmp
-        },
-    );
+    string_table.set(
+        "padded",
+        lua.create_function(|_, (s, len, pad): (String, i64, String)| Ok(pad_with(&s, len, &pad)))?,
+    )?;
 
-    engine.register_fn(
-        "to_cropped",
-        |s: ImmutableString, start: i64, len: i64| -> ImmutableString {
-            let mut tmp = s;
-            crop_range(&mut tmp, start, Some(len));
-            tmp
-        },
-    );
-
-    engine.register_fn("make_cropped", |s: &mut ImmutableString, start: i64| {
-        crop_range(s, start, None)
-    });
-
-    engine.register_fn(
-        "make_cropped",
-        |s: &mut ImmutableString, start: i64, len: i64| crop_range(s, start, Some(len)),
-    );
-
-    // --- set ---
-
-    engine.register_fn(
-        "to_set",
-        |s: ImmutableString, index: i64, ch: char| -> ImmutableString {
-            let mut tmp = s;
-            set_at(&mut tmp, index, &ch.to_string());
-            tmp
-        },
-    );
-
-    engine.register_fn(
-        "to_set",
-        |s: ImmutableString, index: i64, sub: ImmutableString| -> ImmutableString {
-            let mut tmp = s;
-            set_at(&mut tmp, index, sub.as_str());
-            tmp
-        },
-    );
-
-    engine.register_fn(
-        "make_set",
-        |s: &mut ImmutableString, index: i64, ch: char| set_at(s, index, &ch.to_string()),
-    );
-
-    engine.register_fn(
-        "make_set",
-        |s: &mut ImmutableString, index: i64, sub: ImmutableString| set_at(s, index, sub.as_str()),
-    );
-
-    // --- pad ---
-
-    engine.register_fn(
-        "to_padded",
-        |s: ImmutableString, len: i64, ch: char| -> ImmutableString {
-            let mut tmp = s;
-            pad_with(&mut tmp, len, &ch.to_string());
-            tmp
-        },
-    );
-
-    engine.register_fn(
-        "to_padded",
-        |s: ImmutableString, len: i64, pad: ImmutableString| -> ImmutableString {
-            let mut tmp = s;
-            pad_with(&mut tmp, len, pad.as_str());
-            tmp
-        },
-    );
-
-    engine.register_fn(
-        "make_padded",
-        |s: &mut ImmutableString, len: i64, ch: char| pad_with(s, len, &ch.to_string()),
-    );
-
-    engine.register_fn(
-        "make_padded",
-        |s: &mut ImmutableString, len: i64, pad: ImmutableString| pad_with(s, len, pad.as_str()),
-    );
-
-    // --- remove ---
-
-    engine.register_fn(
-        "to_removed",
-        |s: ImmutableString, ch: char| -> ImmutableString { s.replace(&ch.to_string(), "").into() },
-    );
-
-    engine.register_fn(
-        "to_removed",
-        |s: ImmutableString, sub: ImmutableString| -> ImmutableString {
+    string_table.set(
+        "removed",
+        lua.create_function(|_, (s, sub): (String, String)| {
             if sub.is_empty() {
-                s
+                Ok(s)
             } else {
-                s.replace(sub.as_str(), "").into()
+                Ok(s.replace(sub.as_str(), ""))
             }
-        },
-    );
+        })?,
+    )?;
 
-    engine.register_fn("make_removed", |s: &mut ImmutableString, ch: char| {
-        remove_all(s, &ch.to_string())
-    });
-
-    engine.register_fn(
-        "make_removed",
-        |s: &mut ImmutableString, sub: ImmutableString| remove_all(s, sub.as_str()),
-    );
-
-    // --- replace ---
-
-    engine.register_fn(
-        "to_replaced",
-        |s: ImmutableString, from: char, to: char| -> ImmutableString {
-            s.replace(&from.to_string(), &to.to_string()).into()
-        },
-    );
-
-    engine.register_fn(
-        "to_replaced",
-        |s: ImmutableString, from: char, to: ImmutableString| -> ImmutableString {
-            s.replace(&from.to_string(), to.as_str()).into()
-        },
-    );
-
-    engine.register_fn(
-        "to_replaced",
-        |s: ImmutableString, from: ImmutableString, to: char| -> ImmutableString {
+    string_table.set(
+        "replaced",
+        lua.create_function(|_, (s, from, to): (String, String, String)| {
             if from.is_empty() {
-                s
+                Ok(s)
             } else {
-                s.replace(from.as_str(), &to.to_string()).into()
+                Ok(s.replace(from.as_str(), to.as_str()))
             }
-        },
-    );
+        })?,
+    )?;
 
-    engine.register_fn(
-        "to_replaced",
-        |s: ImmutableString, from: ImmutableString, to: ImmutableString| -> ImmutableString {
-            if from.is_empty() {
-                s
-            } else {
-                s.replace(from.as_str(), to.as_str()).into()
-            }
-        },
-    );
-
-    engine.register_fn(
-        "make_replaced",
-        |s: &mut ImmutableString, from: char, to: char| {
-            replace_all(s, &from.to_string(), &to.to_string())
-        },
-    );
-
-    engine.register_fn(
-        "make_replaced",
-        |s: &mut ImmutableString, from: char, to: ImmutableString| {
-            replace_all(s, &from.to_string(), to.as_str())
-        },
-    );
-
-    engine.register_fn(
-        "make_replaced",
-        |s: &mut ImmutableString, from: ImmutableString, to: char| {
-            replace_all(s, from.as_str(), &to.to_string())
-        },
-    );
-
-    engine.register_fn(
-        "make_replaced",
-        |s: &mut ImmutableString, from: ImmutableString, to: ImmutableString| {
-            replace_all(s, from.as_str(), to.as_str())
-        },
-    );
+    Ok(())
 }
 
-fn crop_range(s: &mut ImmutableString, start: i64, len: Option<i64>) {
+/// Convert a Lua-style 1-based char index (negative counts from the end,
+/// `-1` is the last char) to a 0-based offset into `chars`, clamped to
+/// `[0, total]`.
+fn char_index(index: i64, total: i64) -> i64 {
+    let idx = if index < 0 { total + index } else { index - 1 };
+    idx.clamp(0, total)
+}
+
+fn crop_range(s: &str, start: i64, len: Option<i64>) -> String {
     let chars: Vec<char> = s.chars().collect();
     let total = chars.len() as i64;
-    let start = if start < 0 {
-        (total + start).max(0)
-    } else {
-        start.min(total)
-    };
+    let start = char_index(start, total);
     let end = match len {
         Some(len) => (start + len.max(0)).min(total),
         None => total,
     };
-    let cropped: String = chars[start as usize..end as usize].iter().collect();
-    if cropped != s.as_str() {
-        *s = cropped.into();
-    }
+    chars[start as usize..end as usize].iter().collect()
 }
 
-fn set_at(s: &mut ImmutableString, index: i64, sub: &str) {
+fn set_at(s: &str, index: i64, sub: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
-    let idx = if index < 0 { len + index } else { index };
+    let idx = if index < 0 { len + index } else { index - 1 };
     if idx >= 0 && idx < len {
         let mut out: String = chars[..idx as usize].iter().collect();
         out.push_str(sub);
         out.extend(chars[idx as usize + 1..].iter());
-        *s = out.into();
+        out
+    } else {
+        s.to_string()
     }
 }
 
-fn pad_with(s: &mut ImmutableString, len: i64, pad: &str) {
+fn pad_with(s: &str, len: i64, pad: &str) -> String {
     if len <= 0 || pad.is_empty() {
-        return;
+        return s.to_string();
     }
     let target = len as usize;
     let mut chars: Vec<char> = s.chars().collect();
     if chars.len() >= target {
-        return;
+        return s.to_string();
     }
     let pad_chars: Vec<char> = pad.chars().collect();
     let mut i = 0;
@@ -325,17 +144,5 @@ fn pad_with(s: &mut ImmutableString, len: i64, pad: &str) {
         chars.push(pad_chars[i % pad_chars.len()]);
         i += 1;
     }
-    *s = chars.into_iter().collect::<String>().into();
-}
-
-fn remove_all(s: &mut ImmutableString, sub: &str) {
-    if !sub.is_empty() && s.contains(sub) {
-        *s = s.replace(sub, "").into();
-    }
-}
-
-fn replace_all(s: &mut ImmutableString, from: &str, to: &str) {
-    if !from.is_empty() && s.contains(from) {
-        *s = s.replace(from, to).into();
-    }
+    chars.into_iter().collect()
 }

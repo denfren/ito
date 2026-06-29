@@ -4,7 +4,6 @@
 
 use hcl::edit::expr::{Array, Expression, Object};
 use hcl::edit::structure::{Block, Body};
-use rhai::{EvalAltResult, Position};
 use std::fmt::{Debug, Formatter};
 
 /// A single step in a navigation path built up by traversal calls.
@@ -143,18 +142,17 @@ pub enum HclError {
         "Ambiguous key '{key}': matches both attribute and block, use attr() or block() to disambiguate"
     )]
     AmbiguousKey { key: String },
-    #[error("HCL expression type '{0}' cannot be converted to Rhai")]
+    #[error("HCL expression type '{0}' cannot be converted to a Lua value")]
     UnsupportedHclType(&'static str),
-    #[error("Rhai type '{0}' cannot be converted to HCL")]
-    UnsupportedRhaiType(String),
+    #[error("Lua type '{0}' cannot be converted to HCL")]
+    UnsupportedLuaType(String),
+    #[error("HCL value cannot be converted to a Lua value: {0}")]
+    LuaConversion(String),
 }
 
-impl From<HclError> for Box<EvalAltResult> {
+impl From<HclError> for mlua::Error {
     fn from(value: HclError) -> Self {
-        Box::new(EvalAltResult::ErrorRuntime(
-            value.to_string().into(),
-            Position::NONE,
-        ))
+        mlua::Error::runtime(value.to_string())
     }
 }
 

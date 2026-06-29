@@ -183,7 +183,7 @@ fn build_flow_item_green(value: Yaml) -> rowan::GreenNode {
         .find(|n| n.kind() == SyntaxKind::FLOW_SEQUENCE_ENTRY)
         .expect("fragment has a flow sequence entry")
         .green()
-        .into_owned()
+        .to_owned()
 }
 
 /// Render `value` as inline flow text suitable for placing inside `[]`.

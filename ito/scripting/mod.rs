@@ -1,24 +1,38 @@
-//! Rhai scripting binding.
+//! Lua/Luau scripting binding.
 //!
 //! The YAML-specific cursor / fs / lint / resolver layer has moved
 //! under `crate::yamlito::scripting`. Only the generic runner support
-//! (typed script args, virtual filesystem) lives here.
+//! (script arguments, virtual filesystem) lives here.
 
-pub mod args;
+pub mod ansi;
+pub mod argv;
+pub mod aws;
+pub mod cli;
+pub mod finder;
+pub mod hash;
 pub mod hcl;
+pub mod io;
 pub mod ito;
 pub mod j2;
 pub mod json;
+pub mod log;
 pub mod path;
 pub mod pathmap;
 pub mod proc;
 pub mod re;
+pub mod redirect;
+pub mod require;
+pub mod rfs;
+pub mod ssh;
 pub mod string;
+pub mod tablefmt;
+pub mod task;
+pub mod time;
 pub mod toml;
+pub mod ui;
 pub mod vfs;
 pub mod yaml;
 
-pub use args::ScriptArg;
-pub use ito::ScriptFlags;
+pub use argv::Argv;
 pub use pathmap::PathMapper;
 pub use vfs::Vfs;

@@ -28,10 +28,12 @@ for TARGET in "${TARGETS[@]}"; do
 
     tar -xf "$TARBALL" -C "$DEST" --strip-components=1
 
-    # cargo deb expects the binary at target/<target>/release/<bin>
+    # cargo deb expects the binaries at target/<target>/release/<bin>
     RELEASE_DIR="target/$TARGET/release"
     mkdir -p "$RELEASE_DIR"
-    cp "$DEST/ito" "$RELEASE_DIR/ito"
+    for BIN in ito irun iq ied; do
+        cp "$DEST/$BIN" "$RELEASE_DIR/$BIN"
+    done
 
     # aarch64: strip doesn't work cross-arch on the host x86_64 runner
     EXTRA_FLAGS=""

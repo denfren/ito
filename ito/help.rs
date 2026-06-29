@@ -2,14 +2,21 @@
 //!
 //! The help topics are mdbook chapter files under `../docs/src`, embedded
 //! at compile time. The same files build the documentation website. A
-//! single static registry (`TOPICS`) drives the `ito help` listing,
-//! single-topic lookup, and the `ito help all` dump.
+//! single static registry (`TOPICS`) drives the `ito --doc` listing,
+//! single-topic lookup, and the `ito --doc all` dump.
 
 use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Group {
+    /// The per-program overview chapters (`iq`, `ied`, `ito`, `irun`).
+    ///
+    /// Every program with a `--doc` embeds all of them, so the book is the same
+    /// everywhere; only which one a bare `--doc` opens with differs. `irun` has
+    /// a chapter but no `--doc` to print it — it parses no flags at all — so its
+    /// page is reached as `ito --doc irun`.
+    Program,
     Module,
     Language,
     Other,
@@ -27,22 +34,46 @@ pub struct Topic {
 
 pub static TOPICS: &[Topic] = &[
     Topic {
+        name: "iq",
+        title: "iq — query structured files",
+        group: Group::Program,
+        body: include_str!("../docs/src/binaries/iq.md"),
+    },
+    Topic {
+        name: "ied",
+        title: "ied — edit files in a sandbox",
+        group: Group::Program,
+        body: include_str!("../docs/src/binaries/ied.md"),
+    },
+    Topic {
+        name: "ito",
+        title: "ito — the full toolset",
+        group: Group::Program,
+        body: include_str!("../docs/src/binaries/ito.md"),
+    },
+    Topic {
+        name: "irun",
+        title: "irun — scripts as programs",
+        group: Group::Program,
+        body: include_str!("../docs/src/binaries/irun.md"),
+    },
+    Topic {
         name: "string",
         title: "string — strings",
         group: Group::Module,
         body: include_str!("../docs/src/modules/string.md"),
     },
     Topic {
-        name: "array",
-        title: "array — arrays",
+        name: "table",
+        title: "table — arrays and objects",
         group: Group::Module,
-        body: include_str!("../docs/src/modules/array.md"),
+        body: include_str!("../docs/src/modules/table.md"),
     },
     Topic {
-        name: "map",
-        title: "map — object maps",
+        name: "tablefmt",
+        title: "tablefmt — render tables",
         group: Group::Module,
-        body: include_str!("../docs/src/modules/map.md"),
+        body: include_str!("../docs/src/modules/tablefmt.md"),
     },
     Topic {
         name: "fs",
@@ -55,6 +86,12 @@ pub static TOPICS: &[Topic] = &[
         title: "path — path manipulation",
         group: Group::Module,
         body: include_str!("../docs/src/modules/path.md"),
+    },
+    Topic {
+        name: "time",
+        title: "time — timestamps and deltas",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/time.md"),
     },
     Topic {
         name: "re",
@@ -94,31 +131,118 @@ pub static TOPICS: &[Topic] = &[
     },
     Topic {
         name: "proc",
-        title: "proc — process execution",
+        title: "proc — running commands",
         group: Group::Module,
         body: include_str!("../docs/src/modules/proc.md"),
     },
     Topic {
-        name: "ito",
-        title: "ito — runtime guard",
+        name: "redirect",
+        title: "redirect — where command output goes",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/redirect.md"),
+    },
+    Topic {
+        name: "ssh",
+        title: "ssh — running commands remotely",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/ssh.md"),
+    },
+    Topic {
+        name: "aws.config",
+        title: "aws.config — explicit AWS clients",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/aws-config.md"),
+    },
+    Topic {
+        name: "aws.ec2",
+        title: "aws.ec2 — AWS EC2",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/aws-ec2.md"),
+    },
+    Topic {
+        name: "aws.s3",
+        title: "aws.s3 — AWS S3",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/aws-s3.md"),
+    },
+    Topic {
+        name: "aws.autoscaling",
+        title: "aws.autoscaling — AWS EC2 Auto Scaling",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/aws-autoscaling.md"),
+    },
+    Topic {
+        name: "task",
+        title: "task — concurrent tasks",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/task.md"),
+    },
+    Topic {
+        name: "ui.prompt",
+        title: "ui.prompt — interactive prompts",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/ui-prompt.md"),
+    },
+    Topic {
+        name: "ui.progress",
+        title: "ui.progress — progress bars and spinners",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/ui-progress.md"),
+    },
+    // The `ito` *module* is reached as `ito-module`: the bare name `ito` belongs
+    // to the program chapter above, which is what someone typing `--doc ito`
+    // is far more likely to want.
+    Topic {
+        name: "ito-module",
+        title: "ito-module — the version guard, import anchors, and the null sentinel",
         group: Group::Module,
         body: include_str!("../docs/src/modules/ito.md"),
     },
     Topic {
-        name: "ito-vs-rhai",
-        title: "ito vs vanilla Rhai",
+        name: "hash",
+        title: "hash — cryptographic digests",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/hash.md"),
+    },
+    Topic {
+        name: "log",
+        title: "log — logging",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/log.md"),
+    },
+    Topic {
+        name: "io",
+        title: "io — raw stream writes",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/io.md"),
+    },
+    Topic {
+        name: "cli",
+        title: "cli — command-line interfaces",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/cli.md"),
+    },
+    Topic {
+        name: "intro",
+        title: "intro — what these programs are, and how scripts are run",
         group: Group::Other,
-        body: include_str!("../docs/src/ito-vs-rhai.md"),
+        body: include_str!("../docs/src/intro.md"),
+    },
+    Topic {
+        name: "ito-vs-luau",
+        title: "ito vs vanilla Luau",
+        group: Group::Other,
+        body: include_str!("../docs/src/ito-vs-luau.md"),
     },
     Topic {
         name: "conventions",
-        title: "conventions — method naming (to_*/make_*/with_*)",
+        title: "conventions — method naming (with_* builders)",
         group: Group::Other,
         body: include_str!("../docs/src/conventions.md"),
     },
     Topic {
         name: "args",
-        title: "args — injected globals",
+        title: "args — passing values to scripts (argv)",
         group: Group::Other,
         body: include_str!("../docs/src/args.md"),
     },
@@ -126,31 +250,31 @@ pub static TOPICS: &[Topic] = &[
         name: "operators",
         title: "Operators",
         group: Group::Language,
-        body: include_str!("../docs/src/rhai/operators.md"),
+        body: include_str!("../docs/src/luau/operators.md"),
     },
     Topic {
         name: "control-flow",
         title: "Control flow",
         group: Group::Language,
-        body: include_str!("../docs/src/rhai/control-flow.md"),
+        body: include_str!("../docs/src/luau/control-flow.md"),
     },
     Topic {
         name: "functions",
         title: "Functions",
         group: Group::Language,
-        body: include_str!("../docs/src/rhai/functions.md"),
+        body: include_str!("../docs/src/luau/functions.md"),
     },
     Topic {
         name: "closures",
         title: "Closures",
         group: Group::Language,
-        body: include_str!("../docs/src/rhai/closures.md"),
+        body: include_str!("../docs/src/luau/closures.md"),
     },
     Topic {
-        name: "imports",
-        title: "Imports",
+        name: "require",
+        title: "require — module loading",
         group: Group::Language,
-        body: include_str!("../docs/src/rhai/imports.md"),
+        body: include_str!("../docs/src/luau/require.md"),
     },
     Topic {
         name: "changelog",
@@ -160,17 +284,36 @@ pub static TOPICS: &[Topic] = &[
     },
 ];
 
-/// The `ito help` entry point: resolve `topic` to markdown (or the topic
-/// listing when `topic` is `None`), then emit it. `plain` forces raw
-/// markdown (no ANSI); `no_pager` writes straight to stdout instead of
-/// paging.
-pub fn doc(topic: Option<&str>, plain: bool, no_pager: bool) -> Result<(), String> {
+/// The `--doc` entry point: resolve `topic` to markdown, then emit it.
+///
+/// With no topic this opens with `program`'s own chapter, followed by the topic
+/// listing — someone reaching for `--doc` wants to know what this program does
+/// before they want an index of everything. Every program embeds every chapter,
+/// so only the starting page differs.
+///
+/// `plain` forces raw markdown (no ANSI); `no_pager` writes straight to stdout
+/// instead of paging.
+pub fn doc(program: &str, topic: Option<&str>, plain: bool, no_pager: bool) -> Result<(), String> {
     let md = match topic {
         Some(name) => topic_markdown(name)?,
-        None => list_markdown(),
+        None => default_markdown(program),
     };
     emit(&md, plain, no_pager);
     Ok(())
+}
+
+/// The bare-`--doc` page: the program's own chapter, then the topic listing.
+///
+/// Falls back to the listing alone if the program has no chapter, so an
+/// unexpected `argv[0]` degrades rather than failing.
+fn default_markdown(program: &str) -> String {
+    match TOPICS
+        .iter()
+        .find(|t| t.group == Group::Program && t.name == program)
+    {
+        Some(chapter) => format!("{}\n\n---\n\n{}", chapter.body.trim_end(), list_markdown()),
+        None => list_markdown(),
+    }
 }
 
 /// Resolve a topic name to its markdown body. `all` concatenates every
@@ -187,12 +330,12 @@ fn topic_markdown(name: &str) -> Result<String, String> {
         .iter()
         .find(|t| t.name == name)
         .map(|t| t.body.to_string())
-        .ok_or_else(|| format!("unknown topic '{name}'; try `ito help`"))
+        .ok_or_else(|| format!("unknown topic '{name}'; try `ito --doc`"))
 }
 
 /// Build the grouped topic listing as markdown.
 fn list_markdown() -> String {
-    let mut md = String::from("# ito help topics\n\n");
+    let mut md = String::from("# Documentation topics\n\n");
     let section = |md: &mut String, heading: &str, group: Group| {
         md.push_str(&format!("## {heading}\n\n"));
         for t in TOPICS.iter().filter(|t| t.group == group) {
@@ -203,16 +346,17 @@ fn list_markdown() -> String {
         }
         md.push('\n');
     };
+    section(&mut md, "Programs", Group::Program);
     section(&mut md, "Modules", Group::Module);
-    section(&mut md, "Rhai language", Group::Language);
+    section(&mut md, "Luau language", Group::Language);
     md.push_str("## Other\n\n");
     for t in TOPICS.iter().filter(|t| t.group == Group::Other) {
         let desc = t.title.split_once(" — ").map(|(_, d)| d).unwrap_or(t.title);
         md.push_str(&format!("* `{}` — {}\n", t.name, desc));
     }
     md.push_str("* `all` — all topics in one output\n\n");
-    md.push_str("Print a topic with `ito help <topic>`.\n");
-    md.push_str("For the command-line flags themselves, see `ito --help`.\n");
+    md.push_str("Print a topic with `--doc <topic>`.\n");
+    md.push_str("For the command-line flags themselves, see `--help`.\n");
     md
 }
 

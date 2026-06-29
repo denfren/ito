@@ -1,29 +1,29 @@
-//! `hcl` module: parse HCL into native Rhai values, and build HCL
+//! `hcl` module: parse HCL into native Lua values, and build HCL
 //! documents with a fluent builder.
 //!
 //! Parsing:
-//! - `hcl::parse(text)` deserializes via the `hcl-rs` crate into an
-//!   `hcl::Value`, then converts to a Rhai `Dynamic` (maps, arrays,
-//!   strings, ints/floats, bools, ()), so scripts can inspect HCL
-//!   content with ordinary Rhai indexing and iteration.
+//! - `hcl.parse(text)` deserializes via the `hcl-rs` crate into an
+//!   `hcl::Value`, then converts to a Lua value (tables, strings,
+//!   numbers, bools, nil), so scripts can inspect HCL content with
+//!   ordinary Lua indexing and iteration.
 //!
 //! Building:
-//! - `hcl::builder()` starts a body (the top-level document).
-//! - `hcl::block(ident)` starts a block.
-//! - Both expose chainable `.with_attribute(key, value)` and
-//!   `.with_block(child)`; blocks additionally have `.with_label(text)`.
+//! - `hcl.builder()` starts a body (the top-level document).
+//! - `hcl.block(ident)` starts a block.
+//! - Both expose chainable `:with_attribute(key, value)` and
+//!   `:with_block(child)`; blocks additionally have `:with_label(text)`.
 //!   These `with_*` methods mutate the builder and return it for chaining.
-//! - `body.to_string()` renders the document as HCL text.
+//! - `body:to_string()` renders the document as HCL text.
 //!
 //! Builders carry shared (`Rc<RefCell<..>>`) state, so they behave like
 //! handles: chaining and aliasing both observe the same accumulator.
-//! Attribute values accept any Rhai value (maps, arrays, scalars) and
+//! Attribute values accept any Lua value (tables, arrays, scalars) and
 //! are converted to HCL expressions.
 //!
 //! Editing:
-//! - `hcl::edit(text)` parses HCL into an editable, format-preserving
+//! - `hcl.edit(text)` parses HCL into an editable, format-preserving
 //!   handle (`HclDoc`). A cursor/path API navigates and mutates it
-//!   in place while keeping layout and comments intact; `.to_string()`
+//!   in place while keeping layout and comments intact; `:to_string()`
 //!   renders the result. See the `edit` submodule.
 
 mod convert;
@@ -34,29 +34,37 @@ mod visit;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Module};
+use mlua::{Lua, LuaSerdeExt, UserData, UserDataMethods, UserDataRef, Value};
 
 use edit::HclDoc;
 
+type Result<T> = mlua::Result<T>;
+
+fn to_err(msg: impl std::fmt::Display) -> mlua::Error {
+    mlua::Error::runtime(msg.to_string())
+}
+
 /// A raw HCL expression value (bare keyword, traversal, function call,
-/// etc.), produced by `hcl::expr`/`hcl::ident`. Unlike a plain string
+/// etc.), produced by `hcl.expr`/`hcl.ident`. Unlike a plain string
 /// attribute value (which is emitted quoted), this is rendered verbatim.
 #[derive(Clone)]
 pub struct HclExpr(hcl::Expression);
 
 impl HclExpr {
-    /// The wrapped value-model expression. Used by the `hcl::edit` cursor
-    /// to bridge an `hcl::expr`/`hcl::ident` value into the edit CST.
+    /// The wrapped value-model expression. Used by the `hcl.edit` cursor
+    /// to bridge an `hcl.expr`/`hcl.ident` value into the edit CST.
     pub(super) fn into_inner(self) -> hcl::Expression {
         self.0
     }
 
-    /// Wrap a value-model expression. Used by the `hcl::edit` cursor's
+    /// Wrap a value-model expression. Used by the `hcl.edit` cursor's
     /// `read_raw` to hand back a computed expression as an `HclExpr`.
     pub(super) fn from_expression(expr: hcl::Expression) -> Self {
         HclExpr(expr)
     }
 }
+
+impl UserData for HclExpr {}
 
 /// In-progress HCL block: an identifier, ordered labels, a body, and an
 /// optional leading comment on the block's own header line.
@@ -89,29 +97,27 @@ pub struct HclBody {
     header: Rc<RefCell<Option<String>>>,
 }
 
-fn to_err(msg: impl std::fmt::Display) -> Box<EvalAltResult> {
-    msg.to_string().into()
-}
-
-/// Convert a Rhai value into an HCL expression. A raw `HclExpr` wrapper
-/// (from `hcl::expr`/`hcl::ident`) passes through verbatim; anything
-/// else goes through serde and is treated as a literal value.
-fn to_expr(value: Dynamic) -> Result<hcl::Expression, Box<EvalAltResult>> {
-    if value.is::<HclExpr>() {
-        return Ok(value.cast::<HclExpr>().0);
+/// Convert a Lua value into an HCL expression. A raw `HclExpr` wrapper
+/// (from `hcl.expr`/`hcl.ident`) passes through verbatim; anything else
+/// goes through serde and is treated as a literal value.
+fn to_expr(lua: &Lua, value: Value) -> Result<hcl::Expression> {
+    if let Value::UserData(ud) = &value
+        && ud.is::<HclExpr>()
+    {
+        return Ok(ud.borrow::<HclExpr>()?.clone().0);
     }
-    let json: serde_json::Value = rhai::serde::from_dynamic(&value)?;
+    let json: serde_json::Value = lua.from_value(value)?;
     hcl::to_expression(json).map_err(|e| to_err(format!("hcl value error: {e}")))
 }
 
-fn ident(name: &str) -> Result<hcl::Identifier, Box<EvalAltResult>> {
+fn ident(name: &str) -> Result<hcl::Identifier> {
     hcl::Identifier::new(name).map_err(|e| to_err(format!("hcl identifier error: {e}")))
 }
 
 /// Validate a comment string: non-empty, and every line (after optional
 /// leading whitespace) must start with an HCL line-comment marker (`#`
 /// or `//`). The caller supplies the markers; we never add them.
-fn validate_comment(text: &str) -> Result<(), Box<EvalAltResult>> {
+fn validate_comment(text: &str) -> Result<()> {
     if text.is_empty() {
         return Err(to_err("hcl comment error: empty comment"));
     }
@@ -152,21 +158,20 @@ fn render_comment(out: &mut String, comment: &Option<String>, pad: &str) {
 }
 
 impl HclBody {
-    fn add_attribute(&mut self, key: &str, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
-        let attr = hcl::Attribute::new(ident(key)?, to_expr(value)?);
+    fn add_attribute(&mut self, lua: &Lua, key: &str, value: Value) -> Result<()> {
+        let attr = hcl::Attribute::new(ident(key)?, to_expr(lua, value)?);
         self.items.borrow_mut().push(Item::Attribute(attr, None));
         Ok(())
     }
 
-    fn add_block(&mut self, block: &HclBlock) -> Result<(), Box<EvalAltResult>> {
+    fn add_block(&mut self, block: &HclBlock) {
         self.items.borrow_mut().push(Item::Block(block.clone()));
-        Ok(())
     }
 
     /// Attach a comment per the placement rules: empty body → set the
     /// standalone `header` (case (a)); otherwise comment the last item
     /// (case (c)).
-    fn add_comment(&mut self, text: &str) -> Result<(), Box<EvalAltResult>> {
+    fn add_comment(&mut self, text: &str) -> Result<()> {
         validate_comment(text)?;
         let mut items = self.items.borrow_mut();
         match items.last_mut() {
@@ -178,7 +183,7 @@ impl HclBody {
     }
 
     /// Render the body to HCL text at the given indent depth.
-    fn render(&self, depth: usize) -> Result<String, Box<EvalAltResult>> {
+    fn render(&self, depth: usize) -> Result<String> {
         let pad = "  ".repeat(depth);
         let mut out = String::new();
         render_comment(&mut out, &self.header.borrow(), &pad);
@@ -219,7 +224,7 @@ impl HclBlock {
     /// Attach a comment per the placement rules: empty inner body →
     /// comment the block's own header (case (b)); otherwise comment the
     /// last inner item (case (c)).
-    fn add_comment(&mut self, text: &str) -> Result<(), Box<EvalAltResult>> {
+    fn add_comment(&mut self, text: &str) -> Result<()> {
         validate_comment(text)?;
         if self.body.items.borrow().is_empty() {
             *self.comment.borrow_mut() = Some(text.to_string());
@@ -231,7 +236,7 @@ impl HclBlock {
 
     /// Render the block's header line (`ident "label"… {`) at `pad`,
     /// validating the identifier and quoting labels.
-    fn render_header(&self, pad: &str) -> Result<String, Box<EvalAltResult>> {
+    fn render_header(&self, pad: &str) -> Result<String> {
         // Validate the identifier (same fallible path as elsewhere).
         let id = ident(&self.ident)?;
         let mut header = format!("{pad}{id}");
@@ -244,8 +249,8 @@ impl HclBlock {
 
     /// Render this block to standalone HCL text (header, body, closing
     /// brace) at the given indent `depth`. Used to bridge a builder block
-    /// into the `hcl::edit` CST at the right nesting level.
-    pub(super) fn render(&self, depth: usize) -> Result<String, Box<EvalAltResult>> {
+    /// into the `hcl.edit` CST at the right nesting level.
+    pub(super) fn render(&self, depth: usize) -> Result<String> {
         let pad = "  ".repeat(depth);
         let mut out = String::new();
         render_comment(&mut out, &self.comment.borrow(), &pad);
@@ -259,10 +264,7 @@ impl HclBlock {
     /// Parse this builder block into an `hcl::edit` CST `Block`, rendered at
     /// indent `depth` so it inserts cleanly into an editable document. The
     /// resulting block's decor already carries the correct indentation.
-    pub(super) fn to_edit_block(
-        &self,
-        depth: usize,
-    ) -> Result<hcl::edit::structure::Block, Box<EvalAltResult>> {
+    pub(super) fn to_edit_block(&self, depth: usize) -> Result<hcl::edit::structure::Block> {
         let text = self.render(depth)?;
         let body: hcl::edit::structure::Body = text
             .parse()
@@ -273,461 +275,143 @@ impl HclBlock {
     }
 }
 
-/// Register the `hcl` module on `engine`.
-pub fn register(engine: &mut Engine) {
-    engine.register_type_with_name::<HclBody>("HclBody");
-    engine.register_type_with_name::<HclBlock>("HclBlock");
-    engine.register_type_with_name::<HclExpr>("HclExpr");
-    engine.register_type_with_name::<HclDoc>("HclDoc");
+impl UserData for HclBody {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut(
+            "with_attribute",
+            |lua, body, (key, value): (String, Value)| -> Result<HclBody> {
+                body.add_attribute(lua, &key, value)?;
+                Ok(body.clone())
+            },
+        );
+        methods.add_method_mut(
+            "with_block",
+            |_, body, block: UserDataRef<HclBlock>| -> Result<HclBody> {
+                body.add_block(&block);
+                Ok(body.clone())
+            },
+        );
+        methods.add_method_mut("with_comment", |_, body, text: String| -> Result<HclBody> {
+            body.add_comment(&text)?;
+            Ok(body.clone())
+        });
+        methods.add_method("to_string", |_, body, ()| body.render(0));
+        methods.add_meta_method(mlua::MetaMethod::ToString, |_, body, ()| body.render(0));
+    }
+}
 
-    let mut module = Module::new();
+impl UserData for HclBlock {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("with_label", |_, block, label: String| {
+            block.labels.borrow_mut().push(label);
+            Ok(block.clone())
+        });
+        methods.add_method_mut(
+            "with_attribute",
+            |lua, block, (key, value): (String, Value)| -> Result<HclBlock> {
+                block.body.add_attribute(lua, &key, value)?;
+                Ok(block.clone())
+            },
+        );
+        methods.add_method_mut(
+            "with_block",
+            |_, block, child: UserDataRef<HclBlock>| -> Result<HclBlock> {
+                block.body.add_block(&child);
+                Ok(block.clone())
+            },
+        );
+        methods.add_method_mut(
+            "with_comment",
+            |_, block, text: String| -> Result<HclBlock> {
+                block.add_comment(&text)?;
+                Ok(block.clone())
+            },
+        );
+    }
+}
 
-    // hcl::parse(text) -> Dynamic
-    module.set_native_fn(
+/// Register the `hcl` module on `lua`.
+pub fn register(lua: &Lua) -> Result<()> {
+    let module = lua.create_table()?;
+
+    // hcl.parse(text) -> value
+    module.set(
         "parse",
-        |text: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
+        lua.create_function(|lua, text: String| -> Result<Value> {
             let value: hcl::Value =
                 hcl::from_str(&text).map_err(|e| to_err(format!("hcl parse error: {e}")))?;
-            rhai::serde::to_dynamic(value)
-        },
-    );
+            lua.to_value(&value)
+        })?,
+    )?;
 
-    // hcl::to_string(value) -> String
-    // Serialize a Rhai value (e.g. a parsed/constructed map) to HCL
+    // hcl.to_string(value) -> String
+    // Serialize a Lua value (e.g. a parsed/constructed table) to HCL
     // text. Like toml, this does not necessarily round-trip.
-    module.set_native_fn(
+    module.set(
         "to_string",
-        |value: Dynamic| -> Result<String, Box<EvalAltResult>> {
-            let v: hcl::Value = rhai::serde::from_dynamic(&value)?;
+        lua.create_function(|lua, value: Value| -> Result<String> {
+            let v: hcl::Value = lua.from_value(value)?;
             hcl::to_string(&v).map_err(|e| to_err(format!("hcl serialize error: {e}")))
-        },
-    );
+        })?,
+    )?;
 
-    // hcl::builder() -> HclBody
-    module.set_native_fn("builder", || Ok(HclBody::default()));
+    // hcl.builder() -> HclBody
+    module.set(
+        "builder",
+        lua.create_function(|_, ()| Ok(HclBody::default()))?,
+    )?;
 
-    // hcl::block(ident) -> HclBlock
-    module.set_native_fn("block", |ident: ImmutableString| {
-        Ok(HclBlock {
-            ident: ident.to_string(),
-            labels: Rc::new(RefCell::new(Vec::new())),
-            body: HclBody::default(),
-            comment: Rc::new(RefCell::new(None)),
-        })
-    });
+    // hcl.block(ident) -> HclBlock
+    module.set(
+        "block",
+        lua.create_function(|_, ident: String| {
+            Ok(HclBlock {
+                ident,
+                labels: Rc::new(RefCell::new(Vec::new())),
+                body: HclBody::default(),
+                comment: Rc::new(RefCell::new(None)),
+            })
+        })?,
+    )?;
 
-    // hcl::expr(text) -> HclExpr
+    // hcl.expr(text) -> HclExpr
     // Parse a raw HCL expression (bare keyword, traversal `var.foo`,
     // function call, ...). Emitted verbatim, unquoted.
-    module.set_native_fn(
+    module.set(
         "expr",
-        |text: ImmutableString| -> Result<HclExpr, Box<EvalAltResult>> {
+        lua.create_function(|_, text: String| -> Result<HclExpr> {
             let expr: hcl::Expression = text
                 .parse()
                 .map_err(|e| to_err(format!("hcl expression error: {e}")))?;
             Ok(HclExpr(expr))
-        },
-    );
+        })?,
+    )?;
 
-    // hcl::ident(name) -> HclExpr
+    // hcl.ident(name) -> HclExpr
     // A bare identifier/variable reference (e.g. `string`), validated.
-    module.set_native_fn(
+    module.set(
         "ident",
-        |name: ImmutableString| -> Result<HclExpr, Box<EvalAltResult>> {
+        lua.create_function(|_, name: String| -> Result<HclExpr> {
             let var = hcl::Variable::new(name.as_str())
                 .map_err(|e| to_err(format!("hcl identifier error: {e}")))?;
             Ok(HclExpr(hcl::Expression::Variable(var)))
-        },
-    );
+        })?,
+    )?;
 
-    // hcl::edit(text) -> HclDoc
+    // hcl.edit(text) -> HclDoc
     // Parse HCL into a format-preserving editable handle. Unlike `parse`
-    // (which is lossy and yields plain Rhai values), this keeps the
+    // (which is lossy and yields plain Lua values), this keeps the
     // document's layout and comments; edits are surgical.
-    module.set_native_fn(
+    module.set(
         "edit",
-        |text: ImmutableString| -> Result<HclDoc, Box<EvalAltResult>> {
+        lua.create_function(|_, text: String| -> Result<HclDoc> {
             let body: hcl::edit::structure::Body = text
                 .parse()
                 .map_err(|e| to_err(format!("hcl parse error: {e}")))?;
             Ok(HclDoc::new(Rc::new(RefCell::new(body))))
-        },
-    );
+        })?,
+    )?;
 
-    engine.register_static_module("hcl", module.into());
-
-    register_edit_methods(engine);
-
-    // Body builder methods (chainable: mutate and return the same handle,
-    // so they take the `with_*` prefix).
-    engine.register_fn(
-        "with_attribute",
-        |body: &mut HclBody,
-         key: ImmutableString,
-         value: Dynamic|
-         -> Result<HclBody, Box<EvalAltResult>> {
-            body.add_attribute(&key, value)?;
-            Ok(body.clone())
-        },
-    );
-    engine.register_fn(
-        "with_block",
-        |body: &mut HclBody, block: HclBlock| -> Result<HclBody, Box<EvalAltResult>> {
-            body.add_block(&block)?;
-            Ok(body.clone())
-        },
-    );
-    engine.register_fn(
-        "with_comment",
-        |body: &mut HclBody, text: ImmutableString| -> Result<HclBody, Box<EvalAltResult>> {
-            body.add_comment(&text)?;
-            Ok(body.clone())
-        },
-    );
-    engine.register_fn(
-        "to_string",
-        |body: &mut HclBody| -> Result<String, Box<EvalAltResult>> { body.render(0) },
-    );
-
-    // Block builder methods (chainable: mutate and return the same handle,
-    // so they take the `with_*` prefix).
-    engine.register_fn(
-        "with_label",
-        |block: &mut HclBlock, label: ImmutableString| {
-            block.labels.borrow_mut().push(label.to_string());
-            block.clone()
-        },
-    );
-    engine.register_fn(
-        "with_attribute",
-        |block: &mut HclBlock,
-         key: ImmutableString,
-         value: Dynamic|
-         -> Result<HclBlock, Box<EvalAltResult>> {
-            block.body.add_attribute(&key, value)?;
-            Ok(block.clone())
-        },
-    );
-    engine.register_fn(
-        "with_block",
-        |block: &mut HclBlock, child: HclBlock| -> Result<HclBlock, Box<EvalAltResult>> {
-            block.body.add_block(&child)?;
-            Ok(block.clone())
-        },
-    );
-    engine.register_fn(
-        "with_comment",
-        |block: &mut HclBlock, text: ImmutableString| -> Result<HclBlock, Box<EvalAltResult>> {
-            block.add_comment(&text)?;
-            Ok(block.clone())
-        },
-    );
-}
-
-/// Register the cursor methods of the `hcl::edit` handle (`HclDoc`). These
-/// dispatch on an `HclDoc` receiver, so the names they share with the
-/// builder (`block`, `attribute`, `to_string`) do not collide. Mirrors the
-/// `hrs` crate's `script.rs`.
-fn register_edit_methods(engine: &mut Engine) {
-    // Traversal.
-    engine.register_indexer_get(HclDoc::rhai_traverse_str);
-    engine.register_indexer_get(HclDoc::rhai_traverse_index);
-
-    engine.register_fn("attr", HclDoc::rhai_attr);
-    engine.register_fn("attribute", HclDoc::rhai_attr);
-
-    engine.register_fn("block", |h: &mut HclDoc, ident: &str| {
-        h.traverse_block(ident.into(), HclDoc::any_labels(), None)
-    });
-    engine.register_fn("block", |h: &mut HclDoc, ident: &str, l1: &str| {
-        h.traverse_block(ident.into(), vec![l1.into()], None)
-    });
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str| {
-            h.traverse_block(ident.into(), vec![l1.into(), l2.into()], None)
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc, ident: &str, nth: i64| -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(
-                ident.into(),
-                HclDoc::any_labels(),
-                Some(HclDoc::check_nth(nth)?),
-            ))
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc, ident: &str, labels: rhai::Array| -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(ident.into(), HclDoc::parse_labels_array(labels)?, None))
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc,
-         ident: &str,
-         labels: rhai::Array,
-         nth: i64|
-         -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(
-                ident.into(),
-                HclDoc::parse_labels_array(labels)?,
-                Some(HclDoc::check_nth(nth)?),
-            ))
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc, ident: &str, l1: &str, nth: i64| -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(ident.into(), vec![l1.into()], Some(HclDoc::check_nth(nth)?)))
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc,
-         ident: &str,
-         l1: &str,
-         l2: &str,
-         nth: i64|
-         -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(
-                ident.into(),
-                vec![l1.into(), l2.into()],
-                Some(HclDoc::check_nth(nth)?),
-            ))
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str, l3: &str| {
-            h.traverse_block(ident.into(), vec![l1.into(), l2.into(), l3.into()], None)
-        },
-    );
-    engine.register_fn(
-        "block",
-        |h: &mut HclDoc,
-         ident: &str,
-         l1: &str,
-         l2: &str,
-         l3: &str,
-         nth: i64|
-         -> Result<HclDoc, Box<EvalAltResult>> {
-            Ok(h.traverse_block(
-                ident.into(),
-                vec![l1.into(), l2.into(), l3.into()],
-                Some(HclDoc::check_nth(nth)?),
-            ))
-        },
-    );
-
-    engine.register_fn("exists", HclDoc::rhai_exists);
-
-    engine.register_fn("attrs", HclDoc::rhai_attributes);
-    engine.register_fn("attributes", HclDoc::rhai_attributes);
-    engine.register_fn("try_attrs", HclDoc::rhai_try_attributes);
-    engine.register_fn("try_attributes", HclDoc::rhai_try_attributes);
-
-    engine.register_fn("attr_keys", HclDoc::rhai_attribute_keys);
-    engine.register_fn("attribute_keys", HclDoc::rhai_attribute_keys);
-    engine.register_fn("try_attr_keys", HclDoc::rhai_try_attribute_keys);
-    engine.register_fn("try_attribute_keys", HclDoc::rhai_try_attribute_keys);
-
-    engine.register_fn("blocks", HclDoc::rhai_blocks);
-    engine.register_fn("blocks", HclDoc::rhai_blocks_filtered);
-    engine.register_fn(
-        "blocks",
-        |h: &mut HclDoc, ident: &str| -> Result<rhai::Array, Box<EvalAltResult>> {
-            h.rhai_blocks_filtered(ident, HclDoc::any_labels_array())
-        },
-    );
-    engine.register_fn(
-        "blocks",
-        |h: &mut HclDoc, ident: &str, l1: &str| -> Result<rhai::Array, Box<EvalAltResult>> {
-            h.rhai_blocks_filtered(ident, vec![Dynamic::from(l1.to_string())])
-        },
-    );
-    engine.register_fn(
-        "blocks",
-        |h: &mut HclDoc,
-         ident: &str,
-         l1: &str,
-         l2: &str|
-         -> Result<rhai::Array, Box<EvalAltResult>> {
-            h.rhai_blocks_filtered(
-                ident,
-                vec![Dynamic::from(l1.to_string()), Dynamic::from(l2.to_string())],
-            )
-        },
-    );
-    engine.register_fn(
-        "blocks",
-        |h: &mut HclDoc,
-         ident: &str,
-         l1: &str,
-         l2: &str,
-         l3: &str|
-         -> Result<rhai::Array, Box<EvalAltResult>> {
-            h.rhai_blocks_filtered(
-                ident,
-                vec![
-                    Dynamic::from(l1.to_string()),
-                    Dynamic::from(l2.to_string()),
-                    Dynamic::from(l3.to_string()),
-                ],
-            )
-        },
-    );
-    engine.register_fn("try_blocks", HclDoc::rhai_try_blocks);
-    engine.register_fn("try_blocks", HclDoc::rhai_try_blocks_filtered);
-    engine.register_fn("try_blocks", |h: &mut HclDoc, ident: &str| -> Dynamic {
-        h.rhai_try_blocks_filtered(ident, HclDoc::any_labels_array())
-    });
-    engine.register_fn(
-        "try_blocks",
-        |h: &mut HclDoc, ident: &str, l1: &str| -> Dynamic {
-            h.rhai_try_blocks_filtered(ident, vec![Dynamic::from(l1.to_string())])
-        },
-    );
-    engine.register_fn(
-        "try_blocks",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str| -> Dynamic {
-            h.rhai_try_blocks_filtered(
-                ident,
-                vec![Dynamic::from(l1.to_string()), Dynamic::from(l2.to_string())],
-            )
-        },
-    );
-    engine.register_fn(
-        "try_blocks",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str, l3: &str| -> Dynamic {
-            h.rhai_try_blocks_filtered(
-                ident,
-                vec![
-                    Dynamic::from(l1.to_string()),
-                    Dynamic::from(l2.to_string()),
-                    Dynamic::from(l3.to_string()),
-                ],
-            )
-        },
-    );
-
-    engine.register_fn("block_types", HclDoc::rhai_block_types);
-    engine.register_fn("try_block_types", HclDoc::rhai_try_block_types);
-
-    engine.register_fn("block_labels", HclDoc::rhai_block_labels);
-    engine.register_fn("try_block_labels", HclDoc::rhai_try_block_labels);
-
-    engine.register_fn("block_count", HclDoc::rhai_block_count);
-    engine.register_fn(
-        "block_count",
-        |h: &mut HclDoc, ident: &str| -> Result<i64, Box<EvalAltResult>> {
-            h.rhai_block_count(ident, HclDoc::any_labels_array())
-        },
-    );
-    engine.register_fn(
-        "block_count",
-        |h: &mut HclDoc, ident: &str, l1: &str| -> Result<i64, Box<EvalAltResult>> {
-            h.rhai_block_count(ident, vec![Dynamic::from(l1.to_string())])
-        },
-    );
-    engine.register_fn(
-        "block_count",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str| -> Result<i64, Box<EvalAltResult>> {
-            h.rhai_block_count(
-                ident,
-                vec![Dynamic::from(l1.to_string()), Dynamic::from(l2.to_string())],
-            )
-        },
-    );
-    engine.register_fn(
-        "block_count",
-        |h: &mut HclDoc,
-         ident: &str,
-         l1: &str,
-         l2: &str,
-         l3: &str|
-         -> Result<i64, Box<EvalAltResult>> {
-            h.rhai_block_count(
-                ident,
-                vec![
-                    Dynamic::from(l1.to_string()),
-                    Dynamic::from(l2.to_string()),
-                    Dynamic::from(l3.to_string()),
-                ],
-            )
-        },
-    );
-    engine.register_fn("try_block_count", HclDoc::rhai_try_block_count);
-    engine.register_fn(
-        "try_block_count",
-        |h: &mut HclDoc, ident: &str| -> Dynamic {
-            h.rhai_try_block_count(ident, HclDoc::any_labels_array())
-        },
-    );
-    engine.register_fn(
-        "try_block_count",
-        |h: &mut HclDoc, ident: &str, l1: &str| -> Dynamic {
-            h.rhai_try_block_count(ident, vec![Dynamic::from(l1.to_string())])
-        },
-    );
-    engine.register_fn(
-        "try_block_count",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str| -> Dynamic {
-            h.rhai_try_block_count(
-                ident,
-                vec![Dynamic::from(l1.to_string()), Dynamic::from(l2.to_string())],
-            )
-        },
-    );
-    engine.register_fn(
-        "try_block_count",
-        |h: &mut HclDoc, ident: &str, l1: &str, l2: &str, l3: &str| -> Dynamic {
-            h.rhai_try_block_count(
-                ident,
-                vec![
-                    Dynamic::from(l1.to_string()),
-                    Dynamic::from(l2.to_string()),
-                    Dynamic::from(l3.to_string()),
-                ],
-            )
-        },
-    );
-
-    // Type checks.
-    engine.register_fn("is_array", HclDoc::rhai_is_array);
-    engine.register_fn("is_object", HclDoc::rhai_is_object);
-    engine.register_fn("is_expr", HclDoc::rhai_is_expr);
-    engine.register_fn("is_block", HclDoc::rhai_is_block);
-    engine.register_fn("is_body", HclDoc::rhai_is_body);
-
-    // Read / modify.
-    engine.register_fn("read", HclDoc::rhai_read);
-    engine.register_fn("try_read", HclDoc::rhai_try_read);
-    engine.register_fn("read_raw", HclDoc::rhai_read_raw);
-    engine.register_fn("try_read_raw", HclDoc::rhai_try_read_raw);
-
-    engine.register_fn("write", HclDoc::rhai_write);
-    engine.register_fn("try_write", HclDoc::rhai_try_write);
-
-    engine.register_fn("len", HclDoc::rhai_len);
-    engine.register_fn("try_len", HclDoc::rhai_try_len);
-
-    engine.register_fn("add", HclDoc::rhai_add_index);
-    engine.register_fn("add", HclDoc::rhai_add_kv);
-    engine.register_fn("add", HclDoc::rhai_add_value);
-    engine.register_fn("try_add", HclDoc::rhai_try_add_index);
-    engine.register_fn("try_add", HclDoc::rhai_try_add_kv);
-    engine.register_fn("try_add", HclDoc::rhai_try_add_value);
-
-    engine.register_fn("remove", HclDoc::rhai_remove);
-    engine.register_fn("remove", HclDoc::rhai_remove_index);
-    engine.register_fn("remove", HclDoc::rhai_remove_key);
-    engine.register_fn("try_remove", HclDoc::rhai_try_remove);
-    engine.register_fn("try_remove", HclDoc::rhai_try_remove_index);
-    engine.register_fn("try_remove", HclDoc::rhai_try_remove_key);
-
-    engine.register_fn("to_string", HclDoc::rhai_to_string);
-    engine.register_fn("try_to_string", HclDoc::rhai_try_to_string);
+    lua.globals().set("hcl", module)?;
+    Ok(())
 }

@@ -1,43 +1,50 @@
-//! `toml` module: convert between TOML text and native Rhai values.
+//! `toml` module: convert between TOML text and native Lua values.
 //!
-//! - `toml::parse(text)` deserializes via the `toml` crate into a
-//!   `toml::Value`, then converts to a Rhai `Dynamic` (maps, arrays,
-//!   strings, ints/floats, bools; datetimes become strings), so scripts
-//!   can inspect TOML content with ordinary Rhai indexing and iteration.
-//! - `toml::to_string(value)` / `toml::to_string_pretty(value)`
-//!   serialize a Rhai value back to TOML text. The top-level value must
-//!   be a map (TOML has no top-level array/scalar form).
+//! - `toml.parse(text)` deserializes via the `toml` crate into a
+//!   `toml::Value`, then converts to a Lua value (tables, strings,
+//!   numbers, bools; datetimes become strings), so scripts can inspect
+//!   TOML content with ordinary Lua indexing and iteration.
+//! - `toml.to_string(value)` / `toml.to_string_pretty(value)` serialize a
+//!   Lua value back to TOML text. The top-level value must be a table
+//!   with string keys (TOML has no top-level array/scalar form).
 
-use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Module};
+use mlua::{Lua, LuaSerdeExt, Value};
 
-/// Register the `toml` module on `engine`.
-pub fn register(engine: &mut Engine) {
-    let mut module = Module::new();
-    module.set_native_fn(
+/// Register the `toml` module on `lua`.
+pub fn register(lua: &Lua) -> mlua::Result<()> {
+    let module = lua.create_table()?;
+
+    module.set(
         "parse",
-        |text: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
+        lua.create_function(|lua, text: String| {
             let value: toml::Value = toml::from_str(&text)
-                .map_err(|e| -> Box<EvalAltResult> { format!("toml parse error: {e}").into() })?;
-            rhai::serde::to_dynamic(value)
-        },
-    );
-    module.set_native_fn(
+                .map_err(|e| mlua::Error::runtime(format!("toml parse error: {e}")))?;
+            lua.to_value(&value)
+        })?,
+    )?;
+
+    module.set(
         "to_string",
-        |value: Dynamic| -> Result<String, Box<EvalAltResult>> {
-            let v = to_toml_value(value)?;
-            toml::to_string(&v).map_err(|e| format!("toml serialize error: {e}").into())
-        },
-    );
-    module.set_native_fn(
+        lua.create_function(|lua, value: Value| {
+            let v = to_toml_value(lua, value)?;
+            toml::to_string(&v)
+                .map_err(|e| mlua::Error::runtime(format!("toml serialize error: {e}")))
+        })?,
+    )?;
+
+    module.set(
         "to_string_pretty",
-        |value: Dynamic| -> Result<String, Box<EvalAltResult>> {
-            let v = to_toml_value(value)?;
-            toml::to_string_pretty(&v).map_err(|e| format!("toml serialize error: {e}").into())
-        },
-    );
-    engine.register_static_module("toml", module.into());
+        lua.create_function(|lua, value: Value| {
+            let v = to_toml_value(lua, value)?;
+            toml::to_string_pretty(&v)
+                .map_err(|e| mlua::Error::runtime(format!("toml serialize error: {e}")))
+        })?,
+    )?;
+
+    lua.globals().set("toml", module)?;
+    Ok(())
 }
 
-fn to_toml_value(value: Dynamic) -> Result<toml::Value, Box<EvalAltResult>> {
-    rhai::serde::from_dynamic(&value)
+fn to_toml_value(lua: &Lua, value: Value) -> mlua::Result<toml::Value> {
+    lua.from_value(value)
 }

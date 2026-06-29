@@ -172,7 +172,7 @@ fn build_flow_entry_green(key: &str, value: Yaml) -> rowan::GreenNode {
         .find(|n| n.kind() == SyntaxKind::FLOW_MAPPING_ENTRY)
         .expect("fragment has a flow mapping entry")
         .green()
-        .into_owned()
+        .to_owned()
 }
 
 /// Render `key: value` as inline flow text suitable for placing inside

@@ -1,8 +1,26 @@
+//! The command-line surface of each binary.
+//!
+//! One [`Parser`] per binary — [`IqCli`], [`IedCli`], [`ItoCli`] — each
+//! flattening the shared [`Args`] groups it applies. A binary's flag set is
+//! therefore whatever its struct declares: there is no runtime filtering, and no
+//! way for a flag to exist but do nothing.
+//!
+//! The groups, smallest first:
+//!
+//! - [`CommonArgs`] — everything every binary has: the script source, `-C`,
+//!   `-v`, the `--doc`/`--completion` exits.
+//! - [`InputArgs`] — the optional `INPUT` positional, exposed as the `input`
+//!   global. Every flag-parsing binary flattens it: handing a script its data on
+//!   the command line is orthogonal to what else that script may reach.
+//! - [`ReportArgs`] — previewing buffered writes (`-d`, `-l`, `-e`) and
+//!   committing them (`-w`). Only meaningful where writes are buffered, so only
+//!   [`IedCli`] flattens it.
+
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, ValueEnum};
 
-/// The shells `ito util completions` can generate scripts for.
+/// The shells `--completion` can generate scripts for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Shell {
     Bash,
@@ -20,15 +38,12 @@ impl From<Shell> for clap_complete::Shell {
     }
 }
 
-#[derive(Parser)]
-#[command(
-    name = "ito",
-    version,
-    disable_help_subcommand = true,
-    about = "Rhai script runner",
-    long_about = "Run a Rhai script. The script gets a virtual `fs` module rooted at the working directory (see -C). Buffered writes are flushed to disk after the script returns, unless --dry-run is given."
-)]
-pub struct Cli {
+/// Flags every binary has.
+///
+/// The `--doc`/`--completion` pair are early exits rather than run options: they
+/// print and stop, so they coexist with a missing `SCRIPT`.
+#[derive(Args, Debug, Clone)]
+pub struct CommonArgs {
     #[arg(
         short = 'v',
         long = "verbose",
@@ -44,112 +59,124 @@ pub struct Cli {
         value_name = "DIR",
         action = clap::ArgAction::Append,
         global = true,
-        help = "Change to DIR before doing anything else (sets the `fs` module root). Repeatable; each is relative to the previous one.",
+        help = "Change to DIR before doing anything else (what `fs` paths resolve against; the `fs` root under iq/ied). Repeatable; each is relative to the previous one. SCRIPT is still resolved against the directory you invoked from.",
     )]
     pub directory: Vec<PathBuf>,
 
-    #[command(subcommand)]
-    pub command: Option<Command>,
-}
+    /// Print documentation and exit. With no TOPIC, prints this program's
+    /// overview followed by the list of topics ('all' dumps everything).
+    #[arg(long = "doc", value_name = "TOPIC", num_args = 0..=1, default_missing_value = "")]
+    pub doc: Option<String>,
 
-#[derive(Subcommand)]
-pub enum Command {
-    /// Run an inline Rhai expression or program.
-    Exec {
-        /// The Rhai expression or program to run.
-        #[arg(value_name = "STR")]
-        expression: String,
+    /// Emit raw markdown without ANSI styling when using --doc (also
+    /// implied when stdout is not a terminal, or when NO_COLOR is set).
+    #[arg(long = "doc-plain", requires = "doc")]
+    pub doc_plain: bool,
 
-        #[command(flatten)]
-        run: RunArgs,
-    },
-    /// Run a Rhai script file ('-' reads from stdin).
-    Run {
-        /// Script file to run, or '-' for stdin.
-        #[arg(value_name = "PATH")]
-        script_path: PathBuf,
+    /// Write --doc output directly to stdout instead of through a pager.
+    #[arg(long = "doc-no-pager", requires = "doc")]
+    pub doc_no_pager: bool,
 
-        #[command(flatten)]
-        run: RunArgs,
-    },
-    /// Run a named script discovered in the working directory.
-    ///
-    /// Looks for `<name>.ito.rhai`, `.<name>.ito.rhai`, `ito/<name>.rhai`,
-    /// or `.ito/<name>.rhai`. It is an error for more than one to exist.
-    #[command(external_subcommand)]
-    Script(Vec<String>),
-    /// Utility subcommands (shell completions, …).
-    Util {
-        #[command(subcommand)]
-        command: UtilCommand,
-    },
-    /// Print scripting help. With no TOPIC, lists the available topics.
-    Help {
-        /// Topic to print ('all' for everything). Omit to list topics.
-        #[arg(value_name = "TOPIC")]
-        topic: Option<String>,
-
-        /// Emit raw markdown without ANSI styling (also implied when
-        /// stdout is not a terminal, or when NO_COLOR is set).
-        #[arg(long = "plain")]
-        plain: bool,
-
-        /// Write directly to stdout instead of through a pager.
-        #[arg(long = "no-pager")]
-        no_pager: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum UtilCommand {
-    /// Generate a shell completion script (to stdout).
+    /// Generate a shell completion script (to stdout) and exit.
     ///
     /// Source it from your shell's startup file, e.g.
-    /// `eval "$(ito util completions zsh)"` or write it to the shell's
+    /// `eval "$(iq --completion zsh)"` or write it to the shell's
     /// completion directory.
-    Completions {
-        /// Shell to generate completions for.
-        #[arg(value_name = "SHELL", value_enum)]
-        shell: Shell,
-    },
+    #[arg(long = "completion", value_name = "SHELL", value_enum)]
+    pub completion: Option<Shell>,
+
+    /// Interpret SCRIPT as an inline Luau expression/program instead of a
+    /// name or path.
+    #[arg(short = 's', long = "script")]
+    pub inline: bool,
+
+    #[arg(
+        short = 'r',
+        long = "require",
+        value_name = "DIR",
+        help_heading = "Run control",
+        help = "Allow a stdin or -s script to `require` modules from DIR, confined to that tree. Without it such scripts cannot import at all. Not valid with a SCRIPT file, which imports relative to itself."
+    )]
+    pub require_root: Option<PathBuf>,
+
+    /// The script to run: a file path, '-' for stdin, or (with -s) an
+    /// inline Luau expression/program.
+    ///
+    /// Paths are resolved against the directory you invoked from, before
+    /// any -C takes effect. Run with no arguments to list the scripts in
+    /// the current directory.
+    ///
+    /// Arguments for the script itself go after a bare '::', which ends
+    /// this program's own arguments; they reach the script verbatim as
+    /// the global `argv`.
+    #[arg(value_name = "SCRIPT")]
+    pub script: Option<String>,
 }
 
-/// Flags shared by `exec` and `run`: injected args and output control.
-#[derive(Args, Debug, Clone)]
-pub struct RunArgs {
-    #[arg(
-        long = "unsafe-proc",
-        help_heading = "Run control",
-        help = "Register the `proc` module, allowing the script to execute arbitrary processes. Off by default (safe sandbox)."
-    )]
-    pub unsafe_proc: bool,
-
-    #[arg(
-        long = "unsafe-fs-flush",
-        help_heading = "Run control",
-        help = "Allow the script to call `fs::flush()`, writing buffered changes to disk mid-run. Off by default (safe sandbox)."
-    )]
-    pub unsafe_fs_flush: bool,
-
-    #[command(flatten, next_help_heading = "Script arguments")]
-    pub script_args: ScriptArgsFlags,
-
-    #[command(flatten, next_help_heading = "Output")]
-    pub output: OutputArgs,
+/// The data a script operates on, as the `input` global.
+///
+/// Flattened by every flag-parsing binary. What a script may *reach* is the
+/// capability boundary between them; what it is *handed* is not, so there is no
+/// reason for the spelling to differ — `ied fix.luau data.json` and
+/// `ito run.luau -` mean what `iq q.luau data.json` does.
+///
+/// Reading the positional is [`crate::run::Startup::input`], installing it
+/// [`crate::run::Engine::with_input`]; both were always binary-agnostic.
+#[derive(Args, Debug, Clone, Default)]
+pub struct InputArgs {
+    /// The data to operate on, as the `input` global: a file path, or '-' for
+    /// stdin.
+    ///
+    /// Omit it and `input` is nil — a script that only needs its own arguments,
+    /// or one reading files through `fs`, has no use for it.
+    ///
+    /// `input` is the raw text. Parse it for the format you expect
+    /// (`json.parse(input)`, `yaml.parse(input)`, …): stdin carries no
+    /// indication of its own format, so guessing would only be right sometimes.
+    #[arg(value_name = "INPUT")]
+    pub input: Option<String>,
 }
 
-/// Output control. The action axis (`--dry-run`) is independent of the
-/// report axis (`--diff`, `--list-changed`, `-q`). `--diff` and
-/// `--list-changed` are mutually exclusive, and either one implies `-q`.
-#[derive(Args, Debug, Clone)]
-pub struct OutputArgs {
+impl InputArgs {
+    /// Reject `SCRIPT` and `INPUT` both being `-`.
+    ///
+    /// They are separate sources, so either may be stdin — `iq - data.json`
+    /// reads the script from a pipe and the data from a file. Both at once is
+    /// the one impossible case: stdin cannot be read twice, and splitting it
+    /// would need a delimiter nobody asked for.
+    pub fn validate(&self, common: &CommonArgs) -> Result<(), String> {
+        if common.script.as_deref() == Some("-") && self.input.as_deref() == Some("-") {
+            return Err(
+                "SCRIPT and INPUT cannot both be '-': stdin can only be read once. \
+                 Use -s for an inline script, or name a file for one of them"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Previewing and committing buffered writes.
+///
+/// Every flag here reads or releases the pending write set, so the group only
+/// makes sense for a run that has one. A binary that writes directly (or not at
+/// all) does not flatten it, which is why `iq --diff` is an unknown flag rather
+/// than a no-op.
+///
+/// Writing is opt-in (`-w`): a bare `ied` run computes the whole change set and
+/// discards it. That makes the safe thing the default — the tool's usual job is
+/// to answer "would this change anything?" as a linter or config check — and it
+/// leaves committing as a single composable flag, so `-dw` previews *and*
+/// applies rather than needing a separate mode.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ReportArgs {
     #[arg(
-        short = 'n',
-        long = "dry-run",
+        short = 'w',
+        long = "write",
         display_order = 0,
-        help = "Compute buffered writes but do not flush them to disk."
+        help = "Apply the buffered writes to disk after the script returns. Without it nothing is written, so a run is a preview by default."
     )]
-    pub dry_run: bool,
+    pub write: bool,
 
     #[arg(
         short = 'd',
@@ -169,14 +196,6 @@ pub struct OutputArgs {
     pub changed: bool,
 
     #[arg(
-        short = 'q',
-        long = "quiet",
-        display_order = 3,
-        help = "Suppress script print() output."
-    )]
-    pub quiet: bool,
-
-    #[arg(
         short = 'e',
         long = "exit-code",
         display_order = 4,
@@ -185,45 +204,210 @@ pub struct OutputArgs {
     pub exit_code: bool,
 }
 
-#[derive(Args, Debug, Clone)]
-pub struct ScriptArgsFlags {
+/// `iq` — query structured files. The script's return value is the output.
+#[derive(Parser, Debug)]
+#[command(
+    name = "iq",
+    version,
+    about = "Query structured files with a sandboxed Luau script (read-only)",
+    long_about = "Query structured files with a sandboxed Luau script.\n\n\
+        The script's return value is the output: it must be a string, and it is \
+        written to stdout verbatim. There is no print().\n\n\
+        A read-only `fs` rooted at the working directory (see -C) provides \
+        reads, alongside the format modules (json, yaml, toml, hcl) and \
+        helpers. Nothing can be changed: fs.write and fs.remove are not \
+        defined, and there is no way to run commands or open network \
+        connections.\n\n\
+        Use `ied` to edit files, or `ito` for the full toolset."
+)]
+pub struct IqCli {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    #[command(flatten)]
+    pub input: InputArgs,
+
     #[arg(
-        short = 'S',
-        long = "string",
-        value_names = ["NAME", "VALUE"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        display_order = 0,
-        help = "Deprecated: inject a string global. Prefer key=value on the command line.",
+        short = 'f',
+        long = "fs",
+        help_heading = "Run control",
+        help = "Expose the working directory as the `fs` module (read-only). Without it `fs` is not defined."
     )]
-    pub arg_string: Vec<String>,
+    pub filesystem: bool,
+
     #[arg(
-        short = 'N',
-        long = "numeric",
-        value_names = ["NAME", "VALUE"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        display_order = 1,
-        help = "Deprecated: inject a numeric global (i64 or f64). Prefer key=value on the command line.",
+        short = 'q',
+        long = "quiet",
+        help_heading = "Output",
+        help = "Suppress script output."
     )]
-    pub arg_numeric: Vec<String>,
+    pub quiet: bool,
+}
+
+/// `ied` — edit files in the sandbox, with buffered, previewable writes.
+#[derive(Parser, Debug)]
+#[command(
+    name = "ied",
+    version,
+    about = "Edit structured files with a sandboxed Luau script",
+    long_about = "Edit structured files with a sandboxed Luau script.\n\n\
+        The script gets a virtual `fs` rooted at the working directory (see \
+        -C). Writes are buffered rather than applied, and nothing reaches disk \
+        unless you pass --write: by default a run is a preview, which is what \
+        makes it safe to use as a linter or config check. Use --diff, \
+        --list-changed and --exit-code to inspect the pending changes, in any \
+        combination with --write.\n\n\
+        Files are the only thing it can reach: there is no way to run \
+        commands, open network connections, or read the environment. Use `ito` \
+        for those, or `iq` for read-only queries.\n\n\
+        An optional INPUT (a path, or '-' for stdin) is handed to the script \
+        as the `input` global, raw and unparsed."
+)]
+pub struct IedCli {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    #[command(flatten, next_help_heading = "Output")]
+    pub report: ReportArgs,
+
     #[arg(
-        short = 'B',
-        long = "bool",
-        value_names = ["NAME", "VALUE"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        display_order = 2,
-        help = "Deprecated: inject a boolean global. Prefer +flag on the command line.",
+        short = 'q',
+        long = "quiet",
+        help_heading = "Output",
+        display_order = 3,
+        help = "Suppress script print() output."
     )]
-    pub arg_bool: Vec<String>,
+    pub quiet: bool,
+}
+
+/// `ito` — the full toolset: direct writes plus commands, SSH, EC2 and tasks.
+#[derive(Parser, Debug)]
+#[command(
+    name = "ito",
+    version,
+    about = "Run a Luau script with the full ito standard library",
+    long_about = "Run a Luau script with the full ito standard library.\n\n\
+        The script gets an `fs` over the real filesystem: relative paths \
+        resolve against the working directory (see -C), absolute paths and \
+        `..` reach outside it, and traversals report absolute paths. \
+        Writes go to disk as they happen, not at the end: this run can also \
+        spawn subprocesses, and buffering writes they cannot see would be a \
+        promise that a single `process` call breaks. Because nothing is held \
+        back there is nothing to preview, so the --write/--diff/--list-changed \
+        flags do not exist here.\n\n\
+        On top of what `ied` provides it can run local commands (proc), run \
+        them remotely (ssh), query AWS EC2 and read from S3 (aws.ec2, aws.s3), \
+        and overlap any of that concurrently (task).\n\n\
+        An optional INPUT (a path, or '-' for stdin) is handed to the script \
+        as the `input` global, raw and unparsed.\n\n\
+        Arguments for the script go after a bare `::`. For a script that owns \
+        its whole command line -- a `#!/usr/bin/env -S irun` script -- run it \
+        with `irun`, which is this program with no flags of its own.\n\n\
+        Use `ied` for buffered, previewable edits, or `iq` for read-only \
+        queries."
+)]
+pub struct ItoCli {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Print the AI skill bootstrap prompt for `ito` and exit.
+    ///
+    /// Outputs a prompt you can feed to an AI assistant to generate an
+    /// up-to-date `ito` skill.
+    ///
+    /// Declared before the flattened groups so it lands in the default
+    /// `Options` section rather than inheriting the next `help_heading`.
+    #[arg(long = "ai-skill-init")]
+    pub ai_skill_init: bool,
+
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    #[arg(
+        short = 'q',
+        long = "quiet",
+        help_heading = "Output",
+        help = "Suppress script print() output."
+    )]
+    pub quiet: bool,
+}
+
+impl CommonArgs {
+    /// The one invocation a binary with no flags can describe: a script path and
+    /// nothing else.
+    ///
+    /// `irun` parses no arguments, but still goes through [`crate::run::Startup`]
+    /// so script resolution (and its shebang handling) has one implementation
+    /// rather than two. Building the struct here rather than at the call site
+    /// keeps a new field from having to be spelled out in a binary that has no
+    /// way to set it.
+    pub fn script_only(script: String) -> Self {
+        Self {
+            verbose: 0,
+            directory: Vec::new(),
+            doc: None,
+            doc_plain: false,
+            doc_no_pager: false,
+            completion: None,
+            inline: false,
+            require_root: None,
+            script: Some(script),
+        }
+    }
 }
 
 pub(crate) struct LoadedScript {
     pub(crate) label: String,
     pub(crate) source: String,
-    /// The directory `import` paths resolve relative to. For a real file
-    /// this is the directory containing the script; for inline/stdin it is
-    /// `None` (the caller falls back to the VFS root).
-    pub(crate) base_dir: Option<PathBuf>,
 }
+
+impl IqCli {
+    /// Reject argument combinations that cannot mean anything.
+    pub fn validate(&self) -> Result<(), String> {
+        // `-C` sets the `fs` root, so without `-f` there is no root to set.
+        // Silently ignoring it would leave someone believing they had scoped a
+        // query that in fact has no filesystem at all.
+        if !self.common.directory.is_empty() && !self.filesystem {
+            return Err(
+                "-C sets the `fs` root, but `fs` is not exposed; pass -f/--fs to use it".into(),
+            );
+        }
+        self.input.validate(&self.common)
+    }
+}
+
+impl IedCli {
+    /// Reject argument combinations that cannot mean anything.
+    pub fn validate(&self) -> Result<(), String> {
+        self.input.validate(&self.common)
+    }
+}
+
+impl ItoCli {
+    /// Reject argument combinations that cannot mean anything.
+    pub fn validate(&self) -> Result<(), String> {
+        self.input.validate(&self.common)
+    }
+}
+
+/// Parsing that splits the script's own arguments off the command line first.
+///
+/// Everything after a bare `::` belongs to the script, so it is partitioned out
+/// before clap sees anything — clap would reject those tokens as unknown flags,
+/// and they are not ours to interpret in the first place.
+///
+/// Implemented once and blanket-applied, so no binary can forget the split or
+/// do it differently.
+pub trait ParseWithArgv: Parser + Sized {
+    fn parse_with_argv() -> (Self, crate::scripting::Argv) {
+        let raw: Vec<String> = std::env::args().collect();
+        let (argv, clean) = crate::scripting::Argv::split(&raw[1..]);
+        let cli = Self::parse_from(std::iter::once(raw[0].clone()).chain(clean));
+        (cli, argv)
+    }
+}
+
+impl<T: Parser> ParseWithArgv for T {}

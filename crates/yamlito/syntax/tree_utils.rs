@@ -171,7 +171,7 @@ fn observed_block_col_with_offset(node: &SyntaxNode, offset: usize) -> usize {
 ///
 /// `cols == 0` is a no-op (returns the green unchanged).
 pub(crate) fn indent_green_continuations(node: &SyntaxNode, cols: usize) -> GreenNode {
-    let green = node.green().into_owned();
+    let green = node.green().to_owned();
     if cols == 0 {
         return green;
     }

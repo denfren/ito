@@ -1,121 +1,171 @@
 //! The `ito` scripting module.
 //!
-//! Registered as `ito::` on the engine. Covers:
+//! Registered as the global `ito` table. Covers:
 //!
-//! - `ito::version_check(req)` — abort if the running ito is incompatible
+//! - `ito.version_check(req)` — abort if the running ito is incompatible
 //!   with the semver requirement `req` (caret semantics on a bare version).
-//! - `ito::flag(name)` → `bool` — true when `+name` was passed on the CLI.
-//! - `ito::opt(name)` → `String` — value of `name=value`; throws if absent.
-//! - `ito::try_opt(name)` → `String | ()` — value or unit when absent.
+//! - `ito.null` — the sentinel value `json`/`toml`/`yaml`/`hcl` use for an
+//!   explicit null (a Lua table cannot store `nil` as a value, so a parsed
+//!   `null` is not plain `nil` — see [`crate::scripting::json`]).
+//! - `ito.is_null(value)` → `bool` — true iff `value` is that sentinel.
 //!
-//! Script flags (`key=value` / `+flag`) are stripped from the raw argument
-//! list before clap sees it by [`ScriptFlags::split`].
-
-use std::collections::{HashMap, HashSet};
-
-use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Module};
-
-// ---------------------------------------------------------------------------
-// ScriptFlags — parsed before clap
-// ---------------------------------------------------------------------------
-
-fn is_script_key(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_lowercase() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c == '-' || c.is_ascii_lowercase() || c.is_ascii_digit())
-}
-
-/// Script flags extracted from the raw argument list.
-#[derive(Debug, Clone, Default)]
-pub struct ScriptFlags {
-    /// `key=value` pairs.
-    pub opts: HashMap<String, String>,
-    /// `+flag` boolean flags (stored without the `+` prefix).
-    pub flags: HashSet<String>,
-}
-
-impl ScriptFlags {
-    /// Partition `args` into script flags and the remainder for clap.
-    ///
-    /// - `+name` → boolean flag (stored without `+`); `name` must be non-empty.
-    /// - `key=value` where `key` matches `[a-z_][a-z0-9_-]*` → option pair.
-    ///   Tokens like `--flag=val`, `let x = y`, or `PATH=/bin` are left for clap.
-    pub fn split(args: &[String]) -> (Self, Vec<String>) {
-        let mut this = Self::default();
-        let mut rest = Vec::new();
-
-        for arg in args {
-            if let Some(name) = arg.strip_prefix('+') {
-                if !name.is_empty() {
-                    this.flags.insert(name.to_string());
-                    continue;
-                }
-            }
-            if let Some((k, v)) = arg.split_once('=') {
-                if is_script_key(k) {
-                    this.opts.insert(k.to_string(), v.to_string());
-                    continue;
-                }
-            }
-            rest.push(arg.clone());
-        }
-
-        (this, rest)
-    }
-}
+//! Two more exist **only under `ito`/`irun`** (see [`register_host_paths`]),
+//! because they name host locations:
+//!
+//! - `ito.require_root()` — the outer bound, absolute: the directory imports
+//!   are confined to.
+//! - `ito.require_dir()` — the directory the *calling* chunk's relative
+//!   imports resolve against, absolute, so a `require`d module gets its own
+//!   rather than the entry script's.
+//! - `ito.pid()` — the running process's own pid (see [`register_host_pid`]).
+//! - `ito.slug()` — a random `"adjective-noun"` name (see
+//!   [`register_host_slug`]).
+//!
+//! The two anchors `require` itself uses, which is why they share its name: one
+//! script wants "relative to the whole tree", another "relative to me".
+//!
+//! Script arguments are not here: everything after `::` on the command line
+//! reaches the script as the global `argv` (see [`crate::scripting::argv`]).
 
 // ---------------------------------------------------------------------------
 // Engine registration
 // ---------------------------------------------------------------------------
 
-/// Register the `ito` module on `engine`.
-pub fn register(engine: &mut Engine, current: &'static str, script_flags: ScriptFlags) {
-    let mut module = Module::new();
+/// Register the `ito` module on `lua`.
+pub fn register(lua: &mlua::Lua, current: &'static str) -> mlua::Result<()> {
+    let module = lua.create_table()?;
 
-    // ito::version_check(req)
-    module.set_native_fn(
+    // ito.version_check(req)
+    module.set(
         "version_check",
-        move |req: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            version_check(&req, current).map_err(Into::into)
-        },
-    );
+        lua.create_function(move |_, req: String| {
+            version_check(&req, current).map_err(mlua::Error::runtime)
+        })?,
+    )?;
 
-    // ito::flag(name) -> bool
-    let flags = script_flags.flags.clone();
-    module.set_native_fn(
-        "flag",
-        move |name: ImmutableString| -> Result<bool, Box<EvalAltResult>> {
-            Ok(flags.contains(name.as_str()))
-        },
-    );
+    // ito.null — the shared null sentinel (see json/toml/yaml/hcl).
+    module.set("null", mlua::LuaSerdeExt::null(lua))?;
 
-    // ito::opt(name) -> String   (throws when absent)
-    let opts = script_flags.opts.clone();
-    module.set_native_fn(
-        "opt",
-        move |name: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
-            opts.get(name.as_str())
-                .map(|v| ImmutableString::from(v.as_str()))
-                .ok_or_else(|| format!("ito::opt: no option {name:?} was passed").into())
-        },
-    );
+    // ito.is_null(value) -> bool
+    module.set(
+        "is_null",
+        lua.create_function(|lua, value: mlua::Value| Ok(value == mlua::LuaSerdeExt::null(lua)))?,
+    )?;
 
-    // ito::try_opt(name) -> String | ()
-    let opts = script_flags.opts.clone();
-    module.set_native_fn(
-        "try_opt",
-        move |name: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
-            Ok(opts
-                .get(name.as_str())
-                .map(|v| Dynamic::from(ImmutableString::from(v.as_str())))
-                .unwrap_or(Dynamic::UNIT))
-        },
-    );
+    lua.globals().set("ito", module)?;
+    Ok(())
+}
 
-    engine.register_static_module("ito", module.into());
+/// Add `ito.require_root()` and `ito.require_dir()` to the already-registered
+/// `ito` table.
+///
+/// The two anchors `require` resolves against, handed to the script so it can
+/// resolve its *own* paths the same way: the tree imports are confined to, and
+/// the directory the calling file's relative imports start from. Everything
+/// else is a `path.join` from one of them.
+///
+/// Host-only (`ito`/`irun`): both name a location on the host filesystem, which
+/// is the same line `fs.cwd()` draws. Under `iq`/`ied` the require root is a
+/// boundary the script is not meant to locate, and a path it could not act on
+/// through its own rooted `fs` would be a leak rather than a feature. Absent
+/// rather than stubbed, so `if ito.require_dir then` is a usable feature test.
+///
+/// Both are functions rather than constants because only one of them *could*
+/// have been a constant: `require_dir` is per-chunk, answering for whichever
+/// file called it, so a `require`d module gets its own. Spelling them the same
+/// way keeps the pair from reading as two unrelated things.
+///
+/// Like the other reach-into-the-stdlib steps in `Engine::build`, this must run
+/// before `sandbox(true)` freezes the `ito` table.
+pub fn register_host_paths(lua: &mlua::Lua, root: Option<std::path::PathBuf>) -> mlua::Result<()> {
+    let module: mlua::Table = lua.globals().get("ito")?;
+
+    // ito.require_root() -> String?
+    // `nil` for a stdin/-s script run without `-r`, which has no root and no
+    // imports either.
+    let root_string = root.map(|p| p.to_string_lossy().into_owned());
+    module.set(
+        "require_root",
+        lua.create_function(move |_, ()| Ok(root_string.clone()))?,
+    )?;
+
+    // ito.require_dir() -> String?
+    // Where the calling chunk's own relative imports resolve from. Luau names
+    // a filesystem-backed chunk `@<abs path minus extension>` (see
+    // `run::Script` and `scripting::require`), so this is its parent -- the
+    // stripped extension does not matter to a `pop`, which is why nothing has
+    // to put one back.
+    //
+    // `nil` where there is no directory to name: a stdin/-s chunk with no root
+    // (named `=<label>`, not a path), or a call from a host-spawned context
+    // with no Luau frame above it.
+    module.set(
+        "require_dir",
+        lua.create_function(|lua, ()| {
+            // Level 1 is the caller of this function, the chunk we answer for.
+            let Some(chunk) = lua.inspect_stack(1, |d| d.source().source.map(|s| s.to_string()))
+            else {
+                return Ok(None);
+            };
+            Ok(chunk.and_then(|c| chunk_dir(&c)))
+        })?,
+    )?;
+
+    Ok(())
+}
+
+/// Add `ito.pid()` to the already-registered `ito` table.
+///
+/// Host-only (`ito`/`irun`) for the reason `os.getenv` is: a pid is ambient
+/// state the caller never passed, and it differs between two runs of one
+/// script — exactly what an `ied --diff` preview must not read, since a report
+/// that embedded one could not match the `--write` after it.
+///
+/// A function rather than a constant, matching `require_root`/`require_dir`, so
+/// the whole host-only half of this table reads as one thing.
+///
+/// Must run before `sandbox(true)` freezes the `ito` table.
+pub fn register_host_pid(lua: &mlua::Lua) -> mlua::Result<()> {
+    let module: mlua::Table = lua.globals().get("ito")?;
+    // `std::process::id`, not `getpid(2)`: the same number, from the standard
+    // library, and it is `u32` so Luau sees a plain integer.
+    module.set("pid", lua.create_function(|_, ()| Ok(std::process::id()))?)?;
+    Ok(())
+}
+
+/// Add `ito.slug()` to the already-registered `ito` table.
+///
+/// Host-only (`ito`/`irun`), like `ito.pid`: it's random, and `math.random` is
+/// dropped from the sandbox for the same reason -- a script whose output must
+/// be reproducible (`iq`, or an `ied` preview) cannot see it.
+///
+/// Returns a `"adjective-noun"` pair (e.g. `"rusty-nail"`) from the `names`
+/// crate's default generator -- the same one `smic`'s `gen_random_tmp` uses --
+/// for scratch directory/resource names that read better than a random hex
+/// string. Not a general-purpose ID: no numbered variant, no custom word
+/// lists, no uniqueness guarantee.
+///
+/// Must run before `sandbox(true)` freezes the `ito` table.
+pub fn register_host_slug(lua: &mlua::Lua) -> mlua::Result<()> {
+    let module: mlua::Table = lua.globals().get("ito")?;
+    module.set(
+        "slug",
+        lua.create_function(|_, ()| {
+            Ok(names::Generator::default()
+                .next()
+                .expect("names::Generator never returns None"))
+        })?,
+    )?;
+    Ok(())
+}
+
+/// The directory holding the file a Luau chunk name refers to, if it names one.
+fn chunk_dir(chunk_name: &str) -> Option<String> {
+    // Only `@`-prefixed chunks are filesystem-backed; `=<stdin>` is not.
+    let path = std::path::Path::new(chunk_name.strip_prefix('@')?);
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -181,52 +231,30 @@ mod tests {
     }
 
     #[test]
+    fn chunk_dir_is_the_parent_of_the_named_path() {
+        // Luau strips the extension from the chunk name; the parent is the
+        // same either way, which is why nothing has to put one back.
+        assert_eq!(
+            chunk_dir("@/proj/sub/lib").as_deref(),
+            Some("/proj/sub"),
+            "extension-stripped chunk name"
+        );
+        assert_eq!(chunk_dir("@/proj/main.luau").as_deref(), Some("/proj"));
+    }
+
+    #[test]
+    fn chunk_dir_declines_chunks_that_name_no_file() {
+        // `=<expression>`/`=<stdin>`: not filesystem-backed, so no directory.
+        assert_eq!(chunk_dir("=<expression>"), None);
+        assert_eq!(chunk_dir("=<stdin>"), None);
+        // A bare name has no parent worth reporting (`""`, not a directory).
+        assert_eq!(chunk_dir("@main"), None);
+    }
+
+    #[test]
     fn error_message_mentions_both_versions() {
         let err = version_check("0.3.0", "0.2.1").unwrap_err();
         assert!(err.contains("0.3.0"), "{err}");
         assert!(err.contains("0.2.1"), "{err}");
-    }
-
-    #[test]
-    fn split_flags_and_opts() {
-        let args: Vec<String> = ["key=val", "+dry-run", "--quiet", "other"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let (sf, rest) = ScriptFlags::split(&args);
-        assert_eq!(sf.opts.get("key").map(|s| s.as_str()), Some("val"));
-        assert!(sf.flags.contains("dry-run"));
-        assert_eq!(rest, vec!["--quiet", "other"]);
-    }
-
-    #[test]
-    fn flags_consumed_past_double_dash() {
-        // -- is not special; +flag and key=val after it are still stripped.
-        let args: Vec<String> = ["key=val", "--", "+a-flag"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let (sf, rest) = ScriptFlags::split(&args);
-        assert!(sf.opts.contains_key("key"));
-        assert!(sf.flags.contains("a-flag"));
-        assert_eq!(rest, vec!["--"]);
-    }
-
-    #[test]
-    fn assignment_expression_not_treated_as_opt() {
-        // "let x = y" contains '=' but key "let x " fails is_script_key.
-        let args: Vec<String> = ["let x = y"].iter().map(|s| s.to_string()).collect();
-        let (sf, rest) = ScriptFlags::split(&args);
-        assert!(sf.opts.is_empty());
-        assert_eq!(rest, vec!["let x = y"]);
-    }
-
-    #[test]
-    fn clap_style_flags_are_left_alone() {
-        let args: Vec<String> = ["--flag=val", "-S"].iter().map(|s| s.to_string()).collect();
-        let (sf, rest) = ScriptFlags::split(&args);
-        assert!(sf.opts.is_empty());
-        assert!(sf.flags.is_empty());
-        assert_eq!(rest, args);
     }
 }

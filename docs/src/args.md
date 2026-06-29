@@ -1,59 +1,90 @@
 # args — passing values to scripts
 
-## Script flags (preferred)
-
-Pass named options and boolean flags directly on the command line. They
-are stripped before `ito`'s own flag parsing, so they can appear
-anywhere on the command line.
-
-| Form | Example | Access in script |
-| --- | --- | --- |
-| `key=value` | `env=prod` | `ito::opt("env")` → `"prod"` |
-| `+flag` | `+dry-run` | `ito::flag("dry-run")` → `true` |
+Everything after a bare `::` on the command line belongs to the script.
+The part before it is parsed as usual; the part after is handed through
+verbatim as the global `argv`.
 
 ```sh
-ito run deploy.rhai env=prod +dry-run
-ito deploy env=prod +dry-run
+ito deploy.luau -v :: --env prod --dry-run
 ```
 
-See [`ito` module](modules/ito.md) for `ito::flag`, `ito::opt`, and
-`ito::try_opt`.
+```lua
+-- argv == { "--env", "prod", "--dry-run" }
+print(#argv)        -- 3
+print(argv[1])      -- "--env"
+```
 
-## Injected globals (`-S`/`-N`/`-B`) *(deprecated)*
+| | |
+| --- | --- |
+| `argv` | An array of strings: the arguments given after `::`. |
 
-> **Deprecated.** Prefer `key=value` / `+flag` and the `ito::opt` /
-> `ito::flag` functions. The `-S`/`-N`/`-B` flags will be removed in a
-> future release.
+Three things to know:
 
-Values can also be injected as typed **globals** directly into the
-script's scope. Each flag may be repeated.
+- **`argv[1]` is not the program name.** Unlike a C `argv`, only the
+  strings you actually passed appear, so `argv[1]` is the first script
+  argument and `#argv` is how many there were.
+- **It is always a table.** A run with no `::` sees an empty one, never
+  `nil`, so `#argv` and `ipairs(argv)` work unconditionally.
+- **Nothing is interpreted.** No option map, no type coercion, no name
+  rules — `--env`, `-x`, `prod` and `::` are all just strings. Parsing
+  them is the script's job, which is what lets a script define whatever
+  grammar suits it.
 
-| Flag | Long | Type | Notes |
-| --- | --- | --- | --- |
-| `-S` | `--string <name> <value>` | string | |
-| `-N` | `--numeric <name> <value>` | int or float | Parsed as `i64`, else `f64`. |
-| `-B` | `--bool <name> <value>` | bool | `true` / `false`. |
-
-The injected `<name>`s become ordinary globals accessible directly, but
-only in the **entry** script (they are not seeded into imported modules).
+Only the *first* `::` separates; later ones are ordinary arguments.
 
 ```sh
-ito exec '
-  print(`hello ${name}`);   // "hello world"
-  if verbose { print(count + 1); }   // 4
-' -S name world -N count 3 -B verbose true
+ito run.luau :: a :: b     # argv == { "a", "::", "b" }
 ```
 
-## Host-provided constants
+## Without the separator: `irun`
 
-Two constants are pre-bound and visible everywhere — in the entry script
-and inside all imported modules:
+`::` exists because `ito` and the script share a command line. When the
+script should own that line outright — chiefly in a `#!` line —
+[`irun`](binaries/irun.md) drops every flag of its own, takes the script
+path as its single argument, and hands the rest straight to `argv`:
 
-- `MAIN` — `true` in the entry script, `false` inside an imported module.
-- `ITO_VERSION` — the running `ito` version as a string (e.g. `"0.4.0"`).
-
-```rhai
-if MAIN {
-    print("running as main");
-}
+```sh
+irun deploy.luau --env prod    # argv == { "--env", "prod" }
 ```
+
+`argv` behaves identically either way; only who claimed the arguments
+changes. Under `irun` there is nothing to separate, so `::` is not special
+and arrives as a plain string like anything else.
+
+## Parsing them: `cli`
+
+You rarely have to read `argv` by hand. The [`cli`](modules/cli.md) module
+takes a declaration of what the script accepts and does the rest,
+including a generated `--help`:
+
+```lua
+local dry   = cli.opt("n/dry-run", "report without writing")
+local files = cli.arg("files...",  "files to change")
+
+function main()
+    cli.parse()
+    if dry() then
+        print("dry run — no changes written")
+    end
+    for _, f in ipairs(files()) do print(f) end
+end
+```
+
+`cli` is opt-in and takes nothing away: `argv` is still the raw list
+beside it, so a script whose grammar `cli` does not cover can parse the
+list itself.
+
+## Entry-point-only code
+
+There is no injected "am I the entry script?" constant. Put such code in
+a global `main` function instead: it is called after the script body, and
+only for the script that was run — a file loaded with `require` has its
+body evaluated but its `main` left alone.
+
+```lua
+function main()
+    print("running as the entry script")
+end
+```
+
+See [Functions](luau/functions.md#the-main-function).

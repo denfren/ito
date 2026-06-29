@@ -1,9 +1,35 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+## [0.6.0] - 2026-09-09
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The `ito` binary has been split:
+
+- `iq` ito-query - used for read-only operations
+- `ied` ito-edit - used for read-write (this is roughly was `ito` v0.5.0 was)
+- `ito` ito - ito for automation (real filesystem access, spawn processes, network, time)
+- `irun` ito-run - a shebang helper that allows passing arguments to scripts easily
+
+The scripting language is now `luau`.
+
+New scripting modules/globals:
+
+- `cli` - declarative flag/option parsing with usage and help
+- `hash` - hashing of strings, bytes and files
+- `redirect` - stream redirect targets for `proc`/`ssh` commands
+- `ssh` - remote command execution over SSH
+- `tablefmt` - render ASCII/Unicode tables
+- `task` - concurrency: spawn, pool, timeout, wait
+- `time` - timestamps, durations, timezones, calendar math
+- `aws.ec2` - inspect and manage EC2 instances, images, snapshots
+- `aws.s3` - read, write, tag S3 objects and buckets
+- `aws.autoscaling` - inspect and manage Auto Scaling groups
+- `aws.config` - shared AWS credentials/region configuration
+- `ui.prompt` - interactive terminal prompts (confirm, select, input)
+- `ui.progress` - terminal progress bars, including multi-bar display
+
+Also substantially reworked: `fs` (host filesystem, finder, grep), `path`,
+`proc` (async child processes), `io`.
+
 
 ## [0.5.0] - 2026-06-29
 

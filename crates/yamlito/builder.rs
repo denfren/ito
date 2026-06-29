@@ -206,11 +206,11 @@ fn from_node(node: &Node) -> Result<Yaml, String> {
 
 // --- serde ---
 //
-// `Yaml` is the value model used to bridge to/from external data (e.g. a
-// Rhai `Dynamic`, via `rhai::serde`). Serialization is a direct mapping of
-// the variants; deserialization is a `Visitor` that accepts the data model
-// any serde source produces. Mapping keys must be strings — the only key
-// shape `Yaml` (and the builder) supports.
+// `Yaml` is the value model used to bridge to/from external data.
+// Serialization is a direct mapping of the variants; deserialization is a
+// `Visitor` that accepts the data model any serde source produces. Mapping
+// keys must be strings — the only key shape `Yaml` (and the builder)
+// supports.
 
 impl serde::Serialize for Yaml {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {

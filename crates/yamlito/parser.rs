@@ -42,10 +42,7 @@ pub fn parse_recover(source: &str) -> (SyntaxTree, Vec<ParseError>) {
         errors.push(e);
     }
     let green = p.builder.finish();
-    // Mutable root: enables in-place edits via splice_children. The
-    // edit layer asserts mutability, so making this universal keeps
-    // the contract simple.
-    let root = SyntaxNode::new_root_mut(green);
+    let root = SyntaxNode::new_root(green);
     let tree = SyntaxTree::new(root);
     // Lossless contract: every byte of the source lives in some token,
     // so re-emitting the tree must reproduce the input exactly. Cheap

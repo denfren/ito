@@ -3,17 +3,19 @@
 //!
 //! Two path vocabularies meet here:
 //!
-//! - **virtual** — what a script sees: always an absolute namespace
-//!   rooted at `/`, so the real file `root/subdir/x.txt` is addressed as
-//!   `/subdir/x.txt`. `fs::list`/`fs::glob`/`fs::finder` emit virtual
-//!   paths.
+//! - **virtual** — what a script sees: root-relative, with no leading
+//!   `/`, so the real file `root/subdir/x.txt` is addressed as
+//!   `subdir/x.txt` (the root itself is `""`). `fs.list`/`fs.glob`/
+//!   `fs.finder` emit virtual paths. A leading `/` is still accepted on
+//!   input (e.g. in glob patterns) and treated the same as no leading
+//!   `/`.
 //! - **real** — actual filesystem paths, in two output forms.
 //!   [`PathMapper::to_real_abs`] turns a virtual (or relative) path into
 //!   an **absolute** real path under the root (for disk I/O), and
 //!   [`PathMapper::to_real_relative`] turns it into a **root-relative**
 //!   string (what `--diff`/`--list-changed` print). The reverse,
 //!   [`PathMapper::to_virtual`], turns a real path back into the
-//!   `/`-rooted virtual namespace.
+//!   root-relative virtual namespace.
 //!
 //! Every mapping rejects escapes: `..` traversal that climbs above the
 //! root is an error, and the result is additionally checked against
@@ -25,7 +27,6 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use rhai::EvalAltResult;
 use thiserror::Error;
 
 /// An error mapping or anchoring a path.
@@ -46,10 +47,10 @@ pub enum PathError {
     Escape(String),
 }
 
-/// Mapping errors surface to scripts as Rhai runtime errors.
-impl From<PathError> for Box<EvalAltResult> {
+/// Mapping errors surface to scripts as Lua runtime errors.
+impl From<PathError> for mlua::Error {
     fn from(e: PathError) -> Self {
-        e.to_string().into()
+        mlua::Error::runtime(e.to_string())
     }
 }
 
@@ -138,19 +139,12 @@ impl PathMapper {
             .unwrap_or_else(|_| real.to_string_lossy().into_owned())
     }
 
-    /// Map a real path back into the script-visible absolute virtual
-    /// namespace (`/subdir/x.txt`; the root itself is `/`). Falls back to
+    /// Map a real path back into the script-visible root-relative virtual
+    /// namespace (`subdir/x.txt`; the root itself is `""`). Falls back to
     /// the absolute path if it is not under the root.
     pub fn to_virtual(&self, real: &Path) -> String {
         match real.strip_prefix(&self.root) {
-            Ok(rest) => {
-                let s = rest.to_string_lossy();
-                if s.is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("/{s}")
-                }
-            }
+            Ok(rest) => rest.to_string_lossy().into_owned(),
             Err(_) => real.to_string_lossy().into_owned(),
         }
     }
