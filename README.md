@@ -15,7 +15,7 @@ line. Here it reads this project's `Cargo.toml` and prints the version:
 
 ```sh
 # The code can only access files in $PWD, for the script our $PWD is the root folder
-ito exec 'print(toml::parse(fs::read("/Cargo.toml")).package.version)'
+ito exec 'print(toml::parse(fs::read("ito/Cargo.toml"))["package"].version)'
 ```
 
 ## How it works
