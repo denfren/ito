@@ -49,7 +49,10 @@ pub(crate) fn replace_node_live(
             new,
         },
     );
-    crate::edit::node_at_path(tree.root(), &path)
+    // `ReplaceNode` is 1-for-1, so the path still names a node unless
+    // `target` was already stale — in which case `apply_edit` dropped the
+    // edit, and returning the caller's own handle keeps this total.
+    crate::edit::node_at_path(tree.root(), &path).unwrap_or_else(|| target.clone())
 }
 
 /// Child indices (within `node`) of the entries of kind `entry_kind`.

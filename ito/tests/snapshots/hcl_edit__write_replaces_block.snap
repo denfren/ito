@@ -1,8 +1,9 @@
 ---
 source: ito/tests/hcl_edit.rs
-expression: "eval_str(&format!(\"{DOC}\\\n         let r = hcl::block(\\\"resource\\\").with_label(\\\"aws_instance\\\").with_label(\\\"web\\\").with_attribute(\\\"ami\\\", \\\"new\\\");\\n\\\n         h.block(\\\"resource\\\",\\\"aws_instance\\\",\\\"web\\\").write(r);\\n\\\n         h.to_string()\"))"
+expression: "eval_str(DOC,\nr#\"local h = hcl.edit(subject)\n           local r = hcl.block(\"resource\"):with_label(\"aws_instance\"):with_label(\"web\"):with_attribute(\"ami\", \"new\")\n           h:block(\"resource\",\"aws_instance\",\"web\"):write(r)\n           return h:to_string()\"#)"
 ---
 region = "us-east-1"
+
 resource "aws_instance" "web" {
   ami = "new"
 }

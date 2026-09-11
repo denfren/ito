@@ -1,0 +1,16 @@
+---
+source: ito/tests/hcl_edit.rs
+assertion_line: 509
+expression: "eval_str(DOC,\nr#\"local h = hcl.edit(subject)\n           h:block(\"resource\",\"aws_instance\",\"web\"):upsert_at(1, \"region\", function(v)\n             if v == nil then return \"eu-west-1\" end\n             return v\n           end)\n           return h:to_string()\"#)"
+---
+region = "us-east-1"
+
+resource "aws_instance" "web" {
+  region = "eu-west-1"
+  ami = "old" # keep
+  count = 2
+}
+
+resource "aws_instance" "db" {
+  ami = "old2"
+}

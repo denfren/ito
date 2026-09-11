@@ -1,0 +1,9 @@
+---
+source: ito/tests/hcl_edit.rs
+assertion_line: 409
+expression: "eval_str(VAR_X_TYPE_STRING,\nr#\"local h = hcl.edit(subject)\n           h:block(\"variable\",\"x\"):add_at(1, \"default\", \"dev\")\n           return h:to_string()\"#)"
+---
+variable "x" {
+  default = "dev"
+  type = string
+}

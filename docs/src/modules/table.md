@@ -3,8 +3,9 @@
 Luau has one built-in `table` type for both arrays and objects: a table
 used with sequential integer keys starting at `1` is an array; a table
 used with string (or other) keys is a map. This chapter documents Luau's
-built-in `table` type and library as used in ito scripts — ito adds no
-functions of its own here. Full built-in reference:
+built-in `table` type and library as used in ito scripts, plus ito's one
+addition — `table.array`, the array marker the codecs share — and the global
+`null` sentinel. Full built-in reference:
 [luau-lang.org — Tables](https://luau.org/syntax#table-constructors) and
 [Luau's `table` library](https://luau.org/library#table-library).
 
@@ -19,6 +20,9 @@ functions of its own here. Full built-in reference:
 | `table.sort(xs[, cmp])` | Sort the array part in place. |
 | `table.concat(xs[, sep])` | Join stringable elements into one string. |
 | `table.clone(t)` | Shallow copy. |
+| `table.array([t])` | Mark a table as an array, so an empty one serializes as `[]`; returns it. |
+
+## Example
 
 ```lua
 -- Parsed config comes back as tables; walk it with pairs/ipairs.
@@ -35,7 +39,7 @@ table.sort(scripts)
 -- scripts is now an alphabetically sorted array of script names
 ```
 
-## General rules
+## Conventions
 
 - A table can mix both parts: `{1, 2, extra = "x"}` has a 2-element
   array part and an `extra` key. `#t` only counts the array part, and
@@ -62,11 +66,11 @@ Element count of a table's array part.
 **Parameters:**
 - `xs` — table to measure.
 
-**Return value:** the number of elements in the array part (indices `1`
+**Returns:** the number of elements in the array part (indices `1`
 through the first `nil`). Behavior is undefined if the array part has
 holes.
 
-**Error conditions:** none for a table; raises if applied to a value
+**Errors:** none for a table; raises if applied to a value
 that has no length (e.g. `nil`, a number).
 
 ```lua
@@ -89,9 +93,9 @@ later elements up.
   satisfy `1 <= i <= #xs + 1`.
 - `val` — the value to insert.
 
-**Return value:** none; mutates `xs` in place.
+**Returns:** none; mutates `xs` in place.
 
-**Error conditions:** raises if `i` is out of the valid range in the
+**Errors:** raises if `i` is out of the valid range in the
 three-argument form.
 
 ```lua
@@ -111,10 +115,10 @@ down.
 - `xs` — the array to mutate.
 - `i` — 1-based index to remove. Defaults to `#xs` (the last element).
 
-**Return value:** the removed value, or `nil` if `xs` is empty (default
+**Returns:** the removed value, or `nil` if `xs` is empty (default
 `i`) or `i` is out of range.
 
-**Error conditions:** none — an out-of-range `i` returns `nil` rather
+**Errors:** none — an out-of-range `i` returns `nil` rather
 than raising.
 
 ```lua
@@ -133,10 +137,10 @@ Finds the index of the first occurrence of a value in an array.
 - `xs` — the array to search.
 - `val` — the value to look for, compared with `==`.
 
-**Return value:** the 1-based index of the first match, or `nil` if not
+**Returns:** the 1-based index of the first match, or `nil` if not
 found.
 
-**Error conditions:** none.
+**Errors:** none.
 
 ```lua
 local xs = {"a", "b", "c"}
@@ -155,9 +159,9 @@ Sorts an array's array part in place.
 - `cmp` — optional comparator; `cmp(a, b)` returns `true` if `a` should
   sort before `b`. Defaults to `<` (numeric/lexicographic ascending).
 
-**Return value:** none.
+**Returns:** none.
 
-**Error conditions:** raises if elements are not mutually comparable
+**Errors:** raises if elements are not mutually comparable
 under the comparator (e.g. mixing numbers and strings with the default
 comparator).
 
@@ -177,9 +181,9 @@ Joins an array's elements into a single string.
 - `xs` — array of strings or numbers (anything directly stringable).
 - `sep` — separator inserted between elements. Defaults to `""`.
 
-**Return value:** the joined string. An empty array yields `""`.
+**Returns:** the joined string. An empty array yields `""`.
 
-**Error conditions:** raises if an element is not a string or number.
+**Errors:** raises if an element is not a string or number.
 
 ```lua
 local xs = {"a", "b", "c"}
@@ -195,11 +199,11 @@ Shallow-copies a table.
 **Parameters:**
 - `t` — the table to copy.
 
-**Return value:** a new table with the same keys and values as `t`.
+**Returns:** a new table with the same keys and values as `t`.
 Nested tables are shared (not deep-copied) between the original and the
 clone.
 
-**Error conditions:** none.
+**Errors:** none.
 
 ```lua
 local a = {1, 2, {3}}
@@ -207,6 +211,53 @@ local b = table.clone(a)
 b[1] = 99
 -- a[1] is still 1; a[3] and b[3] are the same nested table
 ```
+
+## `table.array`
+
+Marks a table as an array, including an empty one. The codecs need the mark
+because an empty table is otherwise indistinguishable from an empty object:
+`json.to_string({items = {}})` writes `{"items":{}}`, while
+`json.to_string({items = table.array()})` writes `{"items":[]}`.
+
+**Signature:** `table.array([t]) -> table`
+
+**Parameters:**
+- `t` — the table to mark. Omitted or `nil` creates a fresh empty table.
+
+**Returns:** the same table (or the new one), now carrying the shared
+array metatable. Marking is idempotent.
+
+**Errors:** raises if `t` is not a table.
+
+```lua
+local xs = table.array({1, 2, 3})
+json.to_string(xs)                 -- "[1,2,3]"
+json.to_string(table.array())      -- "[]"
+```
+
+Parsers attach the same marker to every array they produce, so a parsed
+`[]` round-trips without a second call. A marked table must still be a
+proper sequence (`1..n`, no holes): the marker says "array", not "ignore
+my keys".
+
+## The global `null`
+
+`null` is the shared sentinel for an explicit null value. A Luau table
+cannot store `nil` as a value — assigning `t.k = nil` removes the key — so
+the parsers use this light-userdata value instead. It is the same value
+`json.parse`, `yaml.parse`, `hcl.parse` and `yaml.edit` produce, and the
+same one `json.to_string`/`yaml.to_string`/`hcl.to_string` accept.
+
+```lua
+local v = json.parse('{"a":null}')
+v.a == nil     -- false
+v.a == null    -- true
+json.to_string(v)   -- '{"a":null}'
+```
+
+`null` is a single global value, so `==` is the test (there is no
+`is_null` function). [`toml`](toml.md) has no null: writing it there
+raises.
 
 ## Map-style access
 

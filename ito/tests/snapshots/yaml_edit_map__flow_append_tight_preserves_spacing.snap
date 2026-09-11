@@ -1,5 +1,0 @@
----
-source: ito/tests/yaml_edit_map.rs
-expression: "eval(r#\"\n        let s = yaml::edit(\"{a: 1,b: 2}\\n\");\n        s.doc.append(\"c\", 3);\n        s.to_string()\n        \"#)"
----
-{a: 1,b: 2,c: 3}

@@ -3,29 +3,17 @@
 //! Registered as the global `ito` table. Covers:
 //!
 //! - `ito.version_check(req)` — abort if the running ito is incompatible
-//!   with the semver requirement `req` (caret semantics on a bare version).
-//! - `ito.null` — the sentinel value `json`/`toml`/`yaml`/`hcl` use for an
-//!   explicit null (a Lua table cannot store `nil` as a value, so a parsed
-//!   `null` is not plain `nil` — see [`crate::scripting::json`]).
-//! - `ito.is_null(value)` → `bool` — true iff `value` is that sentinel.
-//!
-//! Two more exist **only under `ito`/`irun`** (see [`register_host_paths`]),
-//! because they name host locations:
-//!
-//! - `ito.require_root()` — the outer bound, absolute: the directory imports
-//!   are confined to.
-//! - `ito.require_dir()` — the directory the *calling* chunk's relative
-//!   imports resolve against, absolute, so a `require`d module gets its own
-//!   rather than the entry script's.
-//! - `ito.pid()` — the running process's own pid (see [`register_host_pid`]).
-//! - `ito.slug()` — a random `"adjective-noun"` name (see
+//!   with the semver requirement `req` (caret semantics on a bare version; a
+//!   `0.x` minor bump is incompatible, as in Cargo). `req` must be a string.
+//! - `ito.slug()` — a random `"adjective-noun"` name, host-only (see
 //!   [`register_host_slug`]).
 //!
-//! The two anchors `require` itself uses, which is why they share its name: one
-//! script wants "relative to the whole tree", another "relative to me".
+//! The host locations live elsewhere: `fs.require_root()`, `fs.require_dir()`
+//! and `fs.script()` sit next to `fs.cwd()` (see [`register_host_paths`]), and
+//! `proc.pid()` next to the other process functions (see [`register_host_pid`]).
 //!
-//! Script arguments are not here: everything after `::` on the command line
-//! reaches the script as the global `argv` (see [`crate::scripting::argv`]).
+//! Script arguments are not here: everything after `SCRIPT` on the command
+//! line reaches the script as the global `argv` (see [`crate::scripting::argv`]).
 
 // ---------------------------------------------------------------------------
 // Engine registration
@@ -38,67 +26,73 @@ pub fn register(lua: &mlua::Lua, current: &'static str) -> mlua::Result<()> {
     // ito.version_check(req)
     module.set(
         "version_check",
-        lua.create_function(move |_, req: String| {
-            version_check(&req, current).map_err(mlua::Error::runtime)
+        lua.create_function(move |_, req: mlua::Value| {
+            // Lua would stringify a number (`0.10` -> "0.1"), silently asking
+            // for a different version: require a string.
+            let mlua::Value::String(req) = req else {
+                return Err(mlua::Error::runtime(format!(
+                    "ito.version_check: expected a string, got {}",
+                    req.type_name()
+                )));
+            };
+            version_check(&req.to_str()?, current).map_err(mlua::Error::runtime)
         })?,
-    )?;
-
-    // ito.null — the shared null sentinel (see json/toml/yaml/hcl).
-    module.set("null", mlua::LuaSerdeExt::null(lua))?;
-
-    // ito.is_null(value) -> bool
-    module.set(
-        "is_null",
-        lua.create_function(|lua, value: mlua::Value| Ok(value == mlua::LuaSerdeExt::null(lua)))?,
     )?;
 
     lua.globals().set("ito", module)?;
     Ok(())
 }
 
-/// Add `ito.require_root()` and `ito.require_dir()` to the already-registered
-/// `ito` table.
+/// Add `fs.require_root()`, `fs.require_dir()` and `fs.script()` to the
+/// already-registered `fs` table.
 ///
-/// The two anchors `require` resolves against, handed to the script so it can
-/// resolve its *own* paths the same way: the tree imports are confined to, and
-/// the directory the calling file's relative imports start from. Everything
-/// else is a `path.join` from one of them.
+/// The anchors `require` resolves against (the tree imports are confined to,
+/// and the directory the calling file's relative imports start from), plus the
+/// entry script's own path, handed to the script so it can resolve its *own*
+/// paths the same way. Everything else is a `path.join` from one of them.
 ///
-/// Host-only (`ito`/`irun`): both name a location on the host filesystem, which
-/// is the same line `fs.cwd()` draws. Under `iq`/`ied` the require root is a
-/// boundary the script is not meant to locate, and a path it could not act on
-/// through its own rooted `fs` would be a leak rather than a feature. Absent
-/// rather than stubbed, so `if ito.require_dir then` is a usable feature test.
+/// All three are symlink-resolved: the entry script is canonicalized first (see
+/// `run::Script::file`), and when that fails the anchors silently fall back to
+/// the `-C` directory.
 ///
-/// Both are functions rather than constants because only one of them *could*
-/// have been a constant: `require_dir` is per-chunk, answering for whichever
-/// file called it, so a `require`d module gets its own. Spelling them the same
-/// way keeps the pair from reading as two unrelated things.
+/// Host-only (`ito`), the line `fs.cwd()` draws: they name locations on the
+/// host filesystem, which a rooted `fs` could not act on. Absent rather than
+/// stubbed, so `if fs.require_dir then` is a usable feature test.
 ///
-/// Like the other reach-into-the-stdlib steps in `Engine::build`, this must run
-/// before `sandbox(true)` freezes the `ito` table.
-pub fn register_host_paths(lua: &mlua::Lua, root: Option<std::path::PathBuf>) -> mlua::Result<()> {
-    let module: mlua::Table = lua.globals().get("ito")?;
+/// `require_dir` is a function because it is per-chunk: it answers for
+/// whichever file called it, so a `require`d module gets its own directory.
+///
+/// Must run after `fs` is registered and before `sandbox(true)` freezes it.
+pub fn register_host_paths(
+    lua: &mlua::Lua,
+    root: std::path::PathBuf,
+    script: std::path::PathBuf,
+) -> mlua::Result<()> {
+    let module: mlua::Table = lua.globals().get("fs")?;
 
-    // ito.require_root() -> String?
-    // `nil` for a stdin/-s script run without `-r`, which has no root and no
-    // imports either.
-    let root_string = root.map(|p| p.to_string_lossy().into_owned());
+    // fs.require_root() -> String
+    let root_string = root.to_string_lossy().into_owned();
     module.set(
         "require_root",
         lua.create_function(move |_, ()| Ok(root_string.clone()))?,
     )?;
 
-    // ito.require_dir() -> String?
-    // Where the calling chunk's own relative imports resolve from. Luau names
-    // a filesystem-backed chunk `@<abs path minus extension>` (see
-    // `run::Script` and `scripting::require`), so this is its parent -- the
-    // stripped extension does not matter to a `pop`, which is why nothing has
-    // to put one back.
+    // fs.script() -> String
+    let script_string = script.to_string_lossy().into_owned();
+    module.set(
+        "script",
+        lua.create_function(move |_, ()| Ok(script_string.clone()))?,
+    )?;
+
+    // fs.require_dir() -> String?
+    // Where the calling chunk's own relative imports resolve from. A
+    // filesystem-backed chunk is named `@<abs path>` (see `run::Script` and
+    // `scripting::require`), so this is its parent; for a required `init`
+    // module that is the package directory itself.
     //
-    // `nil` where there is no directory to name: a stdin/-s chunk with no root
-    // (named `=<label>`, not a path), or a call from a host-spawned context
-    // with no Luau frame above it.
+    // `nil` where there is no directory to name: a chunk not named after a
+    // file (`=<label>`), or a call from a host-spawned context (or through a
+    // `pcall`) with no Luau frame of its own above it.
     module.set(
         "require_dir",
         lua.create_function(|lua, ()| {
@@ -114,36 +108,30 @@ pub fn register_host_paths(lua: &mlua::Lua, root: Option<std::path::PathBuf>) ->
     Ok(())
 }
 
-/// Add `ito.pid()` to the already-registered `ito` table.
+/// Add `proc.pid()` to the already-registered `proc` table.
 ///
-/// Host-only (`ito`/`irun`) for the reason `os.getenv` is: a pid is ambient
+/// Host-only (`ito`) for the reason `os.getenv` is: a pid is ambient
 /// state the caller never passed, and it differs between two runs of one
-/// script — exactly what an `ied --diff` preview must not read, since a report
-/// that embedded one could not match the `--write` after it.
+/// script — exactly what an `ied --diff` preview must not read.
 ///
-/// A function rather than a constant, matching `require_root`/`require_dir`, so
-/// the whole host-only half of this table reads as one thing.
-///
-/// Must run before `sandbox(true)` freezes the `ito` table.
+/// Must run after `proc::register` and before `sandbox(true)`.
 pub fn register_host_pid(lua: &mlua::Lua) -> mlua::Result<()> {
-    let module: mlua::Table = lua.globals().get("ito")?;
-    // `std::process::id`, not `getpid(2)`: the same number, from the standard
-    // library, and it is `u32` so Luau sees a plain integer.
+    let module: mlua::Table = lua.globals().get("proc")?;
+    // `std::process::id`: `u32`, so Luau sees a plain integer.
     module.set("pid", lua.create_function(|_, ()| Ok(std::process::id()))?)?;
     Ok(())
 }
 
 /// Add `ito.slug()` to the already-registered `ito` table.
 ///
-/// Host-only (`ito`/`irun`), like `ito.pid`: it's random, and `math.random` is
+/// Host-only (`ito`), like `proc.pid`: it's random, and `math.random` is
 /// dropped from the sandbox for the same reason -- a script whose output must
-/// be reproducible (`iq`, or an `ied` preview) cannot see it.
+/// be reproducible (an `ied` preview) cannot see it.
 ///
 /// Returns a `"adjective-noun"` pair (e.g. `"rusty-nail"`) from the `names`
-/// crate's default generator -- the same one `smic`'s `gen_random_tmp` uses --
-/// for scratch directory/resource names that read better than a random hex
-/// string. Not a general-purpose ID: no numbered variant, no custom word
-/// lists, no uniqueness guarantee.
+/// crate's default generator, for scratch directory/resource names that read
+/// better than a random hex string. Not a general-purpose ID: no numbered
+/// variant, no custom word lists, no uniqueness guarantee.
 ///
 /// Must run before `sandbox(true)` freezes the `ito` table.
 pub fn register_host_slug(lua: &mlua::Lua) -> mlua::Result<()> {
@@ -161,7 +149,7 @@ pub fn register_host_slug(lua: &mlua::Lua) -> mlua::Result<()> {
 
 /// The directory holding the file a Luau chunk name refers to, if it names one.
 fn chunk_dir(chunk_name: &str) -> Option<String> {
-    // Only `@`-prefixed chunks are filesystem-backed; `=<stdin>` is not.
+    // Only `@`-prefixed chunks are filesystem-backed; `=<label>` is not.
     let path = std::path::Path::new(chunk_name.strip_prefix('@')?);
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -176,16 +164,16 @@ fn chunk_dir(chunk_name: &str) -> Option<String> {
 /// anything containing an operator is taken verbatim.
 fn version_check(req: &str, current: &str) -> Result<(), String> {
     let version = semver::Version::parse(current).map_err(|e| {
-        format!("ito::version_check: internal: bad running version {current:?}: {e}")
+        format!("ito.version_check: internal: bad running version {current:?}: {e}")
     })?;
     let requirement = semver::VersionReq::parse(req).map_err(|e| {
-        format!("ito::version_check: {req:?} is not a valid version requirement: {e}")
+        format!("ito.version_check: {req:?} is not a valid version requirement: {e}")
     })?;
     if requirement.matches(&version) {
         Ok(())
     } else {
         Err(format!(
-            "ito::version_check: this script requires ito {req} (compatible with \
+            "ito.version_check: this script requires ito {req} (compatible with \
              {requirement}), but the running ito is {current}; \
              upgrade ito or relax the requirement",
         ))
@@ -244,11 +232,37 @@ mod tests {
 
     #[test]
     fn chunk_dir_declines_chunks_that_name_no_file() {
-        // `=<expression>`/`=<stdin>`: not filesystem-backed, so no directory.
-        assert_eq!(chunk_dir("=<expression>"), None);
-        assert_eq!(chunk_dir("=<stdin>"), None);
+        // `=<label>`: not filesystem-backed, so no directory.
+        assert_eq!(chunk_dir("=<label>"), None);
         // A bare name has no parent worth reporting (`""`, not a directory).
         assert_eq!(chunk_dir("@main"), None);
+    }
+
+    #[test]
+    fn version_check_requires_a_string() {
+        let lua = mlua::Lua::new();
+        register(&lua, "0.10.0").unwrap();
+        let err = lua.load("ito.version_check(0.10)").exec().unwrap_err();
+        assert!(err.to_string().contains("expected a string"), "{err}");
+        lua.load(r#"ito.version_check("0.10")"#).exec().unwrap();
+    }
+
+    #[test]
+    fn host_paths_land_on_fs_and_pid_on_proc() {
+        let lua = mlua::Lua::new();
+        lua.globals().set("fs", lua.create_table().unwrap()).unwrap();
+        lua.globals().set("proc", lua.create_table().unwrap()).unwrap();
+        register_host_paths(&lua, "/r".into(), "/r/main.luau".into()).unwrap();
+        register_host_pid(&lua).unwrap();
+        lua.load(
+            r#"
+            assert(fs.require_root() == "/r")
+            assert(fs.script() == "/r/main.luau")
+            assert(proc.pid() > 0)
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]

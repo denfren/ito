@@ -5,28 +5,33 @@ same values, [`ssh`](ssh.md)'s remote command builder. There is no
 `redirect` global — these live on the `proc` table because a redirect
 target is only ever an argument to those two methods:
 
-| Value | Signature | Meaning |
-| --- | --- | --- |
-| `proc.NULL` | — | discard the output (the default for both streams) |
-| `proc.INHERIT` | — | pass through to this program's stream matching the slot |
-| `proc.OUT` | — | pass through to *this* program's stdout, whichever slot |
-| `proc.ERR` | — | pass through to *this* program's stderr, whichever slot |
-| `proc.STDOUT` | — | bind to whatever `:stdout()` currently points at (shell's `2>&1`) |
-| `proc.STDERR` | — | bind to whatever `:stderr()` currently points at (shell's `1>&2`) |
-| `proc.file` | `(<path>)` | write to a local file (truncated on first open) |
-| `proc.buffer` | `()` | capture, returned as a `buffer` |
-| `proc.string` | `()` | capture, returned as a string |
+| Value | Meaning |
+| --- | --- |
+| `proc.NULL` | discard the output (the default for both streams) |
+| `proc.INHERIT` | pass through to this program's stream matching the slot |
+| `proc.OUT` | pass through to *this* program's stdout, whichever slot |
+| `proc.ERR` | pass through to *this* program's stderr, whichever slot |
+| `proc.STDOUT` | on `:stderr()`: bind to whatever `:stdout()` currently points at (shell's `2>&1`) |
+| `proc.STDERR` | on `:stdout()`: bind to whatever `:stderr()` currently points at (shell's `1>&2`) |
+| `proc.file(<path>, [<options>])` | a local file: written (truncated on first open, or appended with `{append = true}`); read as a `:stdin()` source |
+| `proc.buffer()` | capture, returned as a `buffer` |
+| `proc.string()` | capture, returned as a string |
 
 Any other value raises `"expected a redirect target (proc.INHERIT,
 proc.OUT, proc.ERR, proc.NULL, proc.STDOUT, proc.STDERR, proc.file(path),
-proc.buffer() or proc.string()), got <type>"`.
+proc.buffer() or proc.string()), got <type>"` — including a userdata of
+some other kind.
+
+`:stdin()` accepts its own set: `proc.NULL`, `proc.INHERIT`,
+`proc.file(path)` (read), or a Luau string or buffer fed to the command and
+then closed. It raises `"expected a stdin source"` for any other redirect.
 
 ```lua
 proc.command({ "ls" }):stdout(proc.string()):run()
 ssh.connect("host"):command({ "ls" }):stdout(proc.string()):run()
 ```
 
-## Rules
+## Conventions
 
 **One spelling, local or remote.** `ssh` accepts the exact same values as
 `proc`, through the same conversion — a command built with `:stdout(proc.string())`
@@ -65,18 +70,35 @@ local r = proc.command({ "sh", "-c", "echo out; echo err >&2" })
 -- r.stdout and r.stderr are the same merged value
 ```
 
-Two *separate* `proc.file()` handles pointed at the same path is an error
+Two *separate* `proc.file()` handles pointed at the same file is an error
 at run time, not silent corruption — each would carry its own write offset
-and clobber the file. Reuse one handle instead.
+and clobber the file. "The same file" means the same path or, once both
+exist, the same device and inode (a symlink, `a/../f`). Reuse one handle
+instead.
 
 **Aliases bind on assignment, not at run time.** `proc.STDOUT`/`proc.STDERR`
 substitute the *other* stream's current target when assigned — matching
 the shell, where `cmd >f 2>&1 >/dev/null` still sends stderr to the file:
 `:stderr(proc.STDOUT)` captures whatever stdout pointed at *then*, and a
-later `:stdout(...)` does not drag stderr along.
+later `:stdout(...)` does not drag stderr along. Hence the order: stdout
+first, then `:stderr(proc.STDOUT)`; the reverse aliases a not-yet-configured
+stream (`proc.NULL`). An alias onto a capture makes it a shared handle,
+so the result carries *both* `r.stdout` and `r.stderr`, holding the same
+merged text. An alias onto a plain `proc.INHERIT` binds to
+the concrete stream it means (`:stdout(proc.INHERIT):stderr(proc.STDOUT)`
+sends stderr to *our stdout*).
+
+**What the result contains.** A result has a `stdout`/`stderr` field only
+for a stream whose target was `proc.buffer()`/`proc.string()`; both fields
+hold the same value for a shared handle. Files, NULL, inherit targets and
+aliases onto them leave the field absent.
+
+**Merged captures interleave.** A shared capture handle funnels both
+streams into one pipe for `proc` and for `ssh` alike, so the text arrives in
+the order the command wrote it.
 
 **Files bypass `fs`.** Files opened via `proc.file()` are opened directly
-against the filesystem, not through the [`fs`](fs.md) VFS — they are never
+against the filesystem, not through [`fs`](fs.md) — they are never
 buffered, previewed or reported as changes.
 
 ## `proc.NULL`
@@ -84,8 +106,7 @@ buffered, previewed or reported as changes.
 Discards the stream. The default for both `:stdout()` and `:stderr()` when
 neither is called.
 
-- **Shape:** a constant value, not a function call.
-- **Example:**
+A constant value, not a function call.
 
 ```lua
 -- explicit, though this is already the default
@@ -97,10 +118,11 @@ proc.command({ "make" }):stderr(proc.NULL):run()
 Passes the stream straight through to this program's own *corresponding*
 stream — the slot's counterpart, so a child's stdout reaches our stdout
 and its stderr our stderr. To cross them, name the stream with
-`proc.OUT`/`proc.ERR` below.
+`proc.OUT`/`proc.ERR` below. As a `:stdin()` source it hands the child this
+program's stdin. Anything this program has printed is flushed before the
+child starts, so the two outputs do not reorder.
 
-- **Shape:** a constant value, not a function call.
-- **Example:**
+A constant value, not a function call.
 
 ```lua
 proc.command({ "make", "install" })
@@ -114,16 +136,17 @@ proc.command({ "make", "install" })
 Passes the stream through to *this* program's stdout (`proc.OUT`) or
 stderr (`proc.ERR`), named outright rather than matched to the slot.
 
-- **Shape:** constant values, not function calls.
-- **Why both these and `proc.INHERIT`:** inheriting hands the child
-  whichever of our descriptors matches the slot it is assigned to, so a
-  child's stdout going to *our stderr* had no spelling at all. These name
-  the descriptor instead, which is what makes the shell's `1>&2` (and the
-  reverse) expressible here. `proc.INHERIT` is unchanged and still means
-  "the slot's own counterpart".
-- **Error conditions:** raises at spawn time if the named descriptor
-  cannot be duplicated.
-- **Example:**
+Constant values, not function calls.
+
+**Why both these and `proc.INHERIT`:** inheriting hands the child
+whichever of our descriptors matches the slot it is assigned to, so a
+child's stdout going to *our stderr* had no spelling at all. These name
+the descriptor instead, which is what makes the shell's `1>&2` (and the
+reverse) expressible here. `proc.INHERIT` is unchanged and still means
+"the slot's own counterpart".
+
+**Errors:** raises at spawn time if the named descriptor cannot be
+duplicated.
 
 ```lua
 -- the child's stdout onto ito's stderr (the shell's `1>&2`)
@@ -139,13 +162,15 @@ Aliases the *other* stream's current target — `proc.STDOUT` assigned to
 `:stderr()` is the shell's `2>&1`; `proc.STDERR` assigned to `:stdout()` is
 `1>&2`. Resolved once, at the point of assignment. These link the
 *child's* two streams to each other; to point one at a stream of *ours*,
-use `proc.OUT`/`proc.ERR` above.
+use `proc.OUT`/`proc.ERR` above. They are two distinct values so a mistake
+can be caught.
 
-- **Shape:** constant values, not function calls.
-- **Error conditions:** none — assigning either always succeeds; it simply
-  captures whatever the aliased stream currently holds (`proc.NULL` if that
-  stream hasn't been set yet).
-- **Example:**
+Constant values, not function calls.
+
+**Errors:** raises when a stream is aliased onto itself
+  (`:stdout(proc.STDOUT)`, `:stderr(proc.STDERR)`). Otherwise assigning
+  either succeeds; it captures whatever the other stream currently holds
+  (`proc.NULL` if that stream hasn't been set yet).
 
 ```lua
 -- merge stderr into wherever stdout is currently headed
@@ -156,25 +181,37 @@ local r = proc.command({ "sh", "-c", "echo out; echo err >&2" })
 print(r.stdout) -- "out\nerr\n"
 ```
 
-## `proc.file(path)`
+## `proc.file`
 
-Writes the stream to a file on the machine running the script.
+Writes the stream to a file on the machine running the script, or (for
+`:stdin()`) reads one.
 
-- **Signature:** `proc.file(path: string) -> Redirect`
-- **Parameters:** `path` — a local filesystem path. Always resolved on the
-  machine running the script, even for a remote command over `ssh`: the
-  target is a file descriptor here, so a remote command's output travels
-  back over the connection to be written locally. To write on the far side
-  instead, redirect inside the remote command itself.
-- **Returns:** a new handle. The underlying file is created (truncating any
-  existing content) on first use, not when `proc.file()` is called; reusing
-  one handle across `:stdout()` and `:stderr()` shares the same file
-  descriptor, so interleaved writes land through one offset instead of two
-  independent ones.
-- **Error conditions:** raises at run time if the file cannot be created
-  (permissions, missing directory, etc.), or if two *different* `proc.file()`
-  handles target the same path on one command.
-- **Example:**
+**Signature:** `proc.file(path: string, options: { append: boolean? }?) -> Redirect`
+
+**Parameters:**
+- `path` — a local filesystem path. Always resolved on the machine running
+  the script, even for a remote command over `ssh`: the target is a file
+  descriptor here, so a remote command's output travels back over the
+  connection to be written locally. To write on the far side instead,
+  redirect inside the remote command itself. A relative path is relative to
+  this process's working directory, **not** a command's `:current_dir()`.
+- `options.append` — open with `O_APPEND` instead of truncating.
+
+**Returns:** a new handle. The underlying file is created (truncating any
+existing content, unless appending) on first use, not when `proc.file()` is
+called, and the descriptor is then kept until the handle is collected. So
+reusing one handle across `:stdout()` and `:stderr()` shares the same
+descriptor and interleaved writes land through one offset instead of two
+independent ones — and reusing it across several *commands* continues at
+that offset (an append in effect, not a fresh truncate); make a new handle
+to truncate again. As a `:stdin()` source the file is opened read-only at
+spawn and never created.
+
+**Errors:** raises at run time if the file cannot be opened (permissions,
+missing directory, etc.), or if two *different* `proc.file()` handles target
+the same file on one command. All of a command's targets are opened before
+it is spawned, but a program that then fails to launch has already truncated
+a file target.
 
 ```lua
 proc.command({ "ls", "-la" })
@@ -187,17 +224,19 @@ proc.command({ "ls", "-la" })
 ssh.connect("host"):command({ "sh", "-c", "cmd > /remote/path" }):run()
 ```
 
-## `proc.buffer()`
+## `proc.buffer`
 
 Captures the stream, returned from `:run()` as a Luau `buffer`.
 
-- **Signature:** `proc.buffer() -> Redirect`
-- **Parameters:** none.
-- **Returns:** a new capture handle. The result field is a `buffer`
-  containing the raw bytes, with no UTF-8 validation — the honest choice
-  when output may be binary.
-- **Error conditions:** none.
-- **Example:**
+**Signature:** `proc.buffer() -> Redirect`
+
+**Parameters:** none.
+
+**Returns:** a new capture handle. The result field is a `buffer` containing
+the raw bytes, with no UTF-8 validation — the honest choice when output may
+be binary.
+
+**Errors:** none.
 
 ```lua
 local r = proc.command({ "curl", "-s", "https://example.com/logo.png" })
@@ -206,17 +245,19 @@ local r = proc.command({ "curl", "-s", "https://example.com/logo.png" })
 -- r.stdout is a `buffer`
 ```
 
-## `proc.string()`
+## `proc.string`
 
 Captures the stream, returned from `:run()` as a Luau string.
 
-- **Signature:** `proc.string() -> Redirect`
-- **Parameters:** none.
-- **Returns:** a new capture handle. The result field is a string; still
-  8-bit clean, so binary output survives intact even though it prints as a
-  string.
-- **Error conditions:** none.
-- **Example:**
+**Signature:** `proc.string() -> Redirect`
+
+**Parameters:** none.
+
+**Returns:** a new capture handle. The result field is a string; still
+8-bit clean, so binary output survives intact even though it prints as a
+string.
+
+**Errors:** none.
 
 ```lua
 local r = proc.command({ "git", "rev-parse", "HEAD" })

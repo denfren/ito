@@ -21,6 +21,14 @@
 //! `fixers` does by collecting in document order and removing tokens
 //! whose siblings are not themselves targets).
 //!
+//! Index paths are therefore a best-effort rescue, not an identity: a
+//! path that survived a removal can name a *different* node, and one
+//! that no longer names a node at all makes `apply_edit` drop the edit
+//! (see `node_at_path`) rather than rewrite an unrelated one. A caller
+//! that needs a handle to stay meaningful across arbitrary edits should
+//! re-descend from `tree.root()` by key/index instead — which is what
+//! `ito`'s `yaml.edit` cursor does.
+//!
 //! # Edit kinds
 //!
 //! - `ReplaceToken { target, new }` — swap one token for a fresh one.
@@ -143,16 +151,23 @@ pub(crate) fn index_path(node: &SyntaxNode) -> Vec<usize> {
     path
 }
 
-/// Re-resolve `path` (from `index_path`) against `root`.
-pub(crate) fn node_at_path(root: &SyntaxNode, path: &[usize]) -> SyntaxNode {
+/// Re-resolve `path` (from `index_path`) against `root`, or `None` when
+/// it no longer names a node.
+///
+/// A path taken before a *structural* edit can outlive the shape it
+/// described: `Remove*` shifts its later siblings down, so an index that
+/// once named a node may now name a token, or be past the end. Reporting
+/// that as `None` rather than panicking is what keeps a stale handle from
+/// aborting the process — the caller decides what a vanished target means.
+pub(crate) fn node_at_path(root: &SyntaxNode, path: &[usize]) -> Option<SyntaxNode> {
     let mut cur = root.clone();
     for &i in path {
         cur = match cur.children_with_tokens().nth(i) {
             Some(NodeOrToken::Node(n)) => n,
-            _ => panic!("stale edit target: no node at child index {i}"),
+            _ => return None,
         };
     }
-    cur
+    Some(cur)
 }
 
 /// Replace `parent.children_with_tokens()[range]` with `new`, rebuilding
@@ -167,7 +182,12 @@ fn splice_into(
     new: Vec<GreenElement>,
 ) {
     let path = index_path(parent);
-    let live = node_at_path(tree.root(), &path);
+    // A parent from a superseded revision may no longer exist at its old
+    // index path. Dropping the edit is the only safe answer: applying it
+    // where the stale path now points would rewrite an unrelated node.
+    let Some(live) = node_at_path(tree.root(), &path) else {
+        return;
+    };
     let mut green = splice_children_green(&live, range, new);
 
     // Walk back up, rebuilding each ancestor around the new child green.
@@ -404,6 +424,38 @@ mod tests {
         let emitted = tree.emit();
         crate::parse(&emitted).expect("reparse");
         assert_eq!(emitted, "a: world\n");
+    }
+
+    /// A handle taken before a removal can outlive the shape it named.
+    /// Editing through it must not abort the process — `node_at_path`
+    /// reports the miss and the edit is dropped.
+    #[test]
+    fn edit_through_stale_target_does_not_panic() {
+        let mut tree = crate::parse("a: 1\nb: 2\nc: 3\n").expect("parse");
+        let stale = all_scalars_in(tree.root())
+            .into_iter()
+            .find(|s| s.decoded().ok().as_deref() == Some("3"))
+            .expect("c scalar");
+        let token = stale.value_token().expect("value token");
+
+        // Remove the first entry, shifting every later sibling's index.
+        let map = tree
+            .root()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BLOCK_MAPPING)
+            .expect("block mapping");
+        remove_map_entry(&mut tree, &map, 0);
+
+        // The stale token's index path no longer names its old node.
+        apply_edit(
+            &mut tree,
+            TreeEdit::ReplaceToken {
+                new: mk_token(token.kind(), "99"),
+                target: token,
+            },
+        );
+        // No panic; the tree is still well-formed and re-parses.
+        crate::parse(&tree.emit()).expect("reparse");
     }
 
     #[test]

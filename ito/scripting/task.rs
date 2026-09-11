@@ -18,6 +18,7 @@
 //! task.spawn(f, ...)       -- start f(...); returns a handle
 //! task.await(h, ...)       -- wait for handles, return their results
 //! task.poll(h)             -- -> ready, results... ; never blocks
+//! task.status(h)           -- "pending" | "done" | "failed" | "cancelled"
 //! task.cancel(h)           -- abort a pending task
 //! task.wait(duration)      -- non-blocking sleep
 //! task.timeout(d, f, ...)  -- run f(...) under a deadline
@@ -72,7 +73,7 @@
 //! `await`/`poll` raise when called from within *any* pool's task, rather than
 //! hanging.
 //!
-//! A duration is either a number of seconds or a humantime string
+//! A duration is read by `time.parse_delta`: a number of seconds or a string
 //! (`"30s"`, `"5min"`, `"1h 30min"`), so a deadline reads as what it is.
 //!
 //! `task.timeout` returns what `f` returned, unchanged, or the `task.TIMEOUT`
@@ -138,6 +139,8 @@ enum State {
 struct Task {
     /// Stable identity, for the handle's `tostring` and for log messages.
     id: u64,
+    /// Belongs to a pool, so log lines can say more than an opaque `task#N`.
+    pooled: bool,
     state: State,
     /// Handle on the `spawn_local` task driving this one, used by `cancel`.
     ///
@@ -238,24 +241,21 @@ impl Tasks {
     /// being awaited, having logged each of them.
     pub async fn drain(&self) -> LuaResult<()> {
         let mut first_error = None;
-        // A finishing task may spawn more, so rescan until a pass finds nothing
-        // pending rather than awaiting a single snapshot.
+        // A finishing task may spawn more, so keep popping until the registry
+        // is empty rather than awaiting a single snapshot. Popping (not
+        // scanning) also releases each task, and covers one that failed and
+        // settled before the drain ever looked.
         loop {
-            let next = self
-                .registry
-                .borrow()
-                .tasks
-                .values()
-                .find(|t| matches!(t.borrow().state, State::Pending))
-                .cloned();
-            let Some(task) = next else { break };
+            let next = self.registry.borrow_mut().tasks.pop_first();
+            let Some((_, task)) = next else { break };
             Settled(Rc::clone(&task)).await;
             let mut task = task.borrow_mut();
             let id = task.id;
+            let what = if task.pooled { "pooled task" } else { "task" };
             if let State::Failed { error, reported } = &mut task.state {
                 if !*reported {
                     *reported = true;
-                    tracing::error!("task#{id} failed: {error}");
+                    tracing::error!("{what}#{id} failed: {error}");
                     first_error.get_or_insert_with(|| error.clone());
                 }
             }
@@ -293,7 +293,12 @@ fn handle_from(value: &Value, what: &str) -> LuaResult<Rc<RefCell<Task>>> {
             value.type_name()
         ))
     })?;
-    Ok(ud.borrow::<Handle>()?.0.clone())
+    let handle = ud.borrow::<Handle>().map_err(|_| {
+        mlua::Error::runtime(format!(
+            "{what} expects a task handle from task.spawn(), got another userdata"
+        ))
+    })?;
+    Ok(handle.0.clone())
 }
 
 /// Collect the handles named by an `await` argument list.
@@ -302,14 +307,23 @@ fn handle_from(value: &Value, what: &str) -> LuaResult<Rc<RefCell<Task>>> {
 /// handles, which is what a loop accumulating handles into a table wants.
 /// Otherwise every argument is itself a handle.
 fn handles_from(args: &Variadic<Value>, what: &str) -> LuaResult<Vec<Rc<RefCell<Task>>>> {
-    if let [Value::Table(list)] = &args[..] {
-        return list
-            .clone()
-            .sequence_values::<Value>()
-            .map(|v| handle_from(&v?, what))
-            .collect();
+    let handles: Vec<_> = if let [Value::Table(list)] = &args[..] {
+        // Walk by length, not `sequence_values`, which stops quietly at the
+        // first nil and would drop every handle behind it.
+        (1..=list.raw_len())
+            .map(|i| handle_from(&list.raw_get::<Value>(i)?, what))
+            .collect::<LuaResult<_>>()?
+    } else {
+        args.iter()
+            .map(|v| handle_from(v, what))
+            .collect::<LuaResult<_>>()?
+    };
+    if handles.is_empty() {
+        return Err(mlua::Error::runtime(format!(
+            "{what} expects at least one task handle"
+        )));
     }
-    args.iter().map(|v| handle_from(v, what)).collect()
+    Ok(handles)
 }
 
 /// The value `task.timeout` returns when the deadline passed first.
@@ -328,47 +342,19 @@ impl UserData for Timeout {
     }
 }
 
-/// Read a duration from either a number of seconds or a humantime string.
+/// Read a duration through `time.parse_delta`, the one delta grammar.
 ///
-/// Strings are what a deadline usually wants to be written as -- `"20min"`
-/// says what `1200` only means -- but the numeric form predates them and stays
-/// valid, so `task.wait(0.5)` keeps working.
+/// A number is seconds, a string is `"20min"`-style. Negative and out-of-range
+/// values are rejected here rather than panicking in `Duration`.
 fn duration_from(value: &Value, what: &str) -> LuaResult<Duration> {
-    match value {
-        Value::Integer(n) => {
-            let seconds = *n as f64;
-            if seconds < 0.0 {
-                return Err(mlua::Error::runtime(format!(
-                    "{what} expects a non-negative number of seconds, got {seconds}"
-                )));
-            }
-            Ok(Duration::from_secs_f64(seconds))
-        }
-        Value::Number(seconds) => {
-            let seconds = *seconds;
-            if !(seconds.is_finite() && seconds >= 0.0) {
-                return Err(mlua::Error::runtime(format!(
-                    "{what} expects a non-negative number of seconds, got {seconds}"
-                )));
-            }
-            Ok(Duration::from_secs_f64(seconds))
-        }
-        Value::String(s) => {
-            let text = s.to_str()?;
-            humantime::parse_duration(text.trim()).map_err(|e| {
-                mlua::Error::runtime(format!(
-                    "{what} could not read '{}' as a duration ({e}); \
-                     expected something like \"30s\", \"5min\" or \"1h 30min\"",
-                    text.trim()
-                ))
-            })
-        }
-        other => Err(mlua::Error::runtime(format!(
-            "{what} expects a duration -- seconds as a number, or a string like \
-             \"30s\" or \"5min\" -- got {}",
-            other.type_name()
-        ))),
+    let seconds = super::time::parse_delta_value(value, what)?;
+    if seconds < 0.0 {
+        return Err(mlua::Error::runtime(format!(
+            "{what} expects a non-negative duration, got {seconds}s"
+        )));
     }
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| mlua::Error::runtime(format!("{what}: {seconds}s is too long a duration")))
 }
 
 /// Start `f(args)` on its own driven thread and register it.
@@ -394,12 +380,19 @@ fn spawn_task(
         reg.next_id += 1;
         reg.next_id
     };
+    let pooled = pool.is_some();
     let task = Rc::new(RefCell::new(Task {
         id,
+        pooled,
         state: State::Pending,
         driver: None,
         waiters: Vec::new(),
     }));
+    // Pooled work, or work spawned from inside it, counts as "inside a pool"
+    // for the reentrancy check: awaiting a pool from a task that a pooled task
+    // spawned and is waiting on deadlocks just the same.
+    let tainted = pooled || IN_POOL.get() > 0;
+    let reg = Rc::clone(registry);
 
     // `spawn_local`, so the future need not be `Send` -- an `AsyncThread` never
     // is. It is `'static` though, which is what lets the runtime own it
@@ -429,7 +422,7 @@ fn spawn_task(
         // would raise it while the task sits parked on a `task.wait`, and the
         // main script's own `pool:await` -- on the same thread -- would then
         // look like reentrant pooled work.
-        let outcome = if gate.is_some() {
+        let outcome = if tainted {
             InPool(thread).await
         } else {
             thread.await
@@ -442,6 +435,7 @@ fn spawn_task(
         if !matches!(task.state, State::Pending) {
             return;
         }
+        let done = outcome.is_ok();
         task.settle(match outcome {
             Ok(values) => State::Done(values),
             Err(error) => State::Failed {
@@ -450,6 +444,11 @@ fn spawn_task(
             },
         });
         drop(task);
+        // Only a failure the drain may still owe a report stays registered; the
+        // handle keeps the result of everything else alive on its own.
+        if done {
+            reg.borrow_mut().tasks.remove(&id);
+        }
 
         // Queue the result for collection. After `settle`, so a `poll` woken by
         // this cannot see the task still pending.
@@ -550,6 +549,8 @@ struct Pool {
     /// Every task this pool has spawned that has not been collected, so
     /// `cancel` can reach the queued and running ones too.
     live: Vec<Rc<RefCell<Task>>>,
+    /// The concurrency the pool was created with.
+    concurrency: usize,
     /// Wakers of `await`s parked on this pool, woken when a task settles.
     waiters: Vec<std::task::Waker>,
 }
@@ -583,7 +584,9 @@ impl std::future::Future for Ready {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let mut pool = self.0.borrow_mut();
-        if pool.ready.is_empty() {
+        // Also done when nothing is outstanding (a cancel emptied the pool), so
+        // the caller raises "drained" instead of parking forever.
+        if pool.ready.is_empty() && pool.outstanding > 0 {
             let waker = cx.waker();
             if !pool.waiters.iter().any(|w| w.will_wake(waker)) {
                 pool.waiters.push(waker.clone());
@@ -701,21 +704,48 @@ fn pool_methods<M: UserDataMethods<PoolHandle>>(methods: &mut M, registry: &Rc<R
     methods.add_method("count", |_, this, ()| Ok(this.0.borrow().outstanding));
     methods.add_method("done", |_, this, ()| Ok(this.0.borrow().outstanding == 0));
 
+    methods.add_method("concurrency", |_, this, ()| Ok(this.0.borrow().concurrency));
+
+    methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, ()| {
+        let pool = this.0.borrow();
+        Ok(format!(
+            "task.pool({}) ({} outstanding)",
+            pool.concurrency, pool.outstanding
+        ))
+    });
+
+    // Returns how many tasks were still pending and got cancelled; ones that
+    // had already settled (collected or not) are not counted.
     methods.add_method("cancel", |_, this, ()| {
-        // Take the list out before cancelling: `cancel_task` wakes waiters, and
+        // Take the lists out before cancelling: `cancel_task` wakes waiters, and
         // holding the pool's borrow across that risks a borrow panic if a woken
         // task reaches back into the pool.
-        let live = {
+        let (live, ready, waiters) = {
             let mut pool = this.0.borrow_mut();
             pool.outstanding = 0;
-            pool.ready.clear();
-            std::mem::take(&mut pool.live)
+            (
+                std::mem::take(&mut pool.live),
+                std::mem::take(&mut pool.ready),
+                std::mem::take(&mut pool.waiters),
+            )
         };
         let mut cancelled = 0usize;
         for task in &live {
             if cancel_task(task) {
                 cancelled += 1;
             }
+        }
+        // A failure nobody can collect now is part of the abandoned sweep, so
+        // it must not fail the run from the drain either.
+        for task in live.iter().chain(ready.iter()) {
+            if let State::Failed { reported, .. } = &mut task.borrow_mut().state {
+                *reported = true;
+            }
+        }
+        // Wake parked `pool:await`s: nothing is outstanding, so they raise
+        // "drained" instead of hanging.
+        for waker in waiters {
+            waker.wake();
         }
         // Cancellation is exempt from drain reporting, so this is the only way
         // to abandon a sweep without failing the run.
@@ -776,10 +806,20 @@ pub fn module(lua: &Lua) -> LuaResult<(Table, Tasks)> {
             // script's to see, and the drain must not repeat them.
             let mut out = MultiValue::new();
             let mut first_error = None;
-            for task in &handles {
+            for (i, task) in handles.iter().enumerate() {
                 let values = match take_settled(task) {
                     Ok(values) => values,
                     Err(e) => {
+                        // With several handles, say which one failed.
+                        let e = if handles.len() > 1 {
+                            mlua::Error::runtime(format!(
+                                "task.await: handle {} (task#{}) failed: {e}",
+                                i + 1,
+                                task.borrow().id
+                            ))
+                        } else {
+                            e
+                        };
                         first_error.get_or_insert(e);
                         MultiValue::new()
                     }
@@ -813,6 +853,21 @@ pub fn module(lua: &Lua) -> LuaResult<(Table, Tasks)> {
                 out.push_back(v);
             }
             Ok(out)
+        })?,
+    )?;
+
+    // --- status -----------------------------------------------------------
+    exports.raw_set(
+        "status",
+        lua.create_function(|_, handle: Value| {
+            let task = handle_from(&handle, "task.status")?;
+            let state = match task.borrow().state {
+                State::Pending => "pending",
+                State::Done(..) => "done",
+                State::Failed { .. } => "failed",
+                State::Cancelled => "cancelled",
+            };
+            Ok(state)
         })?,
     )?;
 
@@ -892,20 +947,29 @@ pub fn module(lua: &Lua) -> LuaResult<(Table, Tasks)> {
 
     exports.raw_set(
         "pool",
-        lua.create_function(move |lua, concurrency: i64| {
-            let permits = usize::try_from(concurrency)
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| {
-                    mlua::Error::runtime(format!(
-                        "task.pool expects a concurrency of at least 1, got {concurrency}"
-                    ))
-                })?;
+        lua.create_function(move |lua, concurrency: Value| {
+            let max = tokio::sync::Semaphore::MAX_PERMITS;
+            let bad = |shown: String| {
+                mlua::Error::runtime(format!(
+                    "task.pool expects a whole concurrency between 1 and {max}, got {shown}"
+                ))
+            };
+            let n = match &concurrency {
+                Value::Integer(n) => *n as f64,
+                Value::Number(n) if n.fract() == 0.0 => *n,
+                Value::Number(n) => return Err(bad(n.to_string())),
+                other => return Err(bad(other.type_name().to_string())),
+            };
+            if !(n >= 1.0 && n <= max as f64) {
+                return Err(bad(n.to_string()));
+            }
+            let permits = n as usize;
             let pool = Rc::new(RefCell::new(Pool {
                 permits: Rc::new(tokio::sync::Semaphore::new(permits)),
                 ready: std::collections::VecDeque::new(),
                 outstanding: 0,
                 live: Vec::new(),
+                concurrency: permits,
                 waiters: Vec::new(),
             }));
             lua.create_any_userdata(PoolHandle(pool))
@@ -1703,5 +1767,140 @@ mod tests {
         assert!(eval("task.await(42)").is_err());
         assert!(eval("task.poll('nope')").is_err());
         assert!(eval("task.cancel({})").is_err());
+    }
+
+    #[test]
+    fn an_unawaited_failure_that_settled_early_still_fails_the_run() {
+        // The failure settles while the script is still running (it yields on
+        // `task.wait`), so the drain finds nothing pending.
+        let err = eval(
+            r#"
+            task.spawn(function() error("boom") end)
+            task.wait(0.05)
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn pool_cancel_wakes_a_parked_await() {
+        // A concurrent await on a cancelled pool raises "drained" instead of
+        // hanging forever.
+        eval(
+            r#"
+            local pool = task.pool(1)
+            pool:spawn(function() task.wait(10) return 1 end)
+            local waiter = task.spawn(function()
+                local ok, err = pcall(function() return pool:await() end)
+                return ok, tostring(err)
+            end)
+            task.wait(0.05)
+            assert(pool:cancel() == 1)
+            local ok, err = task.await(waiter)
+            assert(ok == false and err:find("drained"), err)
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pool_cancel_claims_an_already_failed_task() {
+        eval(
+            r#"
+            local pool = task.pool(2)
+            pool:spawn(function() error("late") end)
+            task.wait(0.05)
+            pool:cancel()
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn durations_use_the_one_delta_grammar_and_never_panic() {
+        for bad in ["1e20", "math.huge", "-1", "'-5s'", "'1month'", "'P1D'"] {
+            assert!(
+                eval(&format!("task.wait({bad})")).is_err(),
+                "task.wait({bad})"
+            );
+        }
+        eval("task.wait('10ms') task.wait(0)").unwrap();
+    }
+
+    #[test]
+    fn pool_rejects_huge_and_fractional_concurrency() {
+        for bad in ["1e19", "2.5", "'2'"] {
+            assert!(eval(&format!("task.pool({bad})")).is_err(), "{bad}");
+        }
+        eval("task.pool(2.0)").unwrap();
+    }
+
+    #[test]
+    fn status_reports_the_task_state() {
+        eval(
+            r#"
+            local ok = task.spawn(function() return 1 end)
+            local bad = task.spawn(function() error("x") end)
+            local slow = task.spawn(function() task.wait(10) end)
+            assert(task.status(slow) == "pending")
+            pcall(task.await, bad)
+            task.await(ok)
+            assert(task.status(ok) == "done" and task.status(bad) == "failed")
+            task.cancel(slow)
+            assert(task.status(slow) == "cancelled")
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn await_rejects_an_empty_list_and_a_hole() {
+        assert!(eval("task.await({})").is_err());
+        assert!(eval("task.await()").is_err());
+        // A hole is a wrong-typed element, not the end of the list.
+        assert!(eval("local h = task.spawn(function() end) task.await({h, nil, h})").is_err());
+    }
+
+    #[test]
+    fn a_batch_error_names_the_failing_handle() {
+        let err = eval(
+            r#"
+            local a = task.spawn(function() return 1 end)
+            local b = task.spawn(function() error("nope") end)
+            task.await(a, b)
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("handle 2") && err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn nested_spawn_inside_a_pooled_task_cannot_await_a_pool() {
+        eval(
+            r#"
+            local pool = task.pool(1)
+            pool:spawn(function()
+                local inner = task.spawn(function() return pcall(function() return pool:poll() end) end)
+                return (task.await(inner))
+            end)
+            assert(pool:await() == false)
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_pool_has_a_readable_concurrency_and_tostring() {
+        eval(
+            r#"
+            local p = task.pool(3)
+            assert(p:concurrency() == 3)
+            assert(tostring(p):find("task.pool%(3%)"))
+        "#,
+        )
+        .unwrap();
     }
 }

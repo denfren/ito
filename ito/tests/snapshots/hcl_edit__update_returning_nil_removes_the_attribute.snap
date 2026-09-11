@@ -1,0 +1,14 @@
+---
+source: ito/tests/hcl_edit.rs
+assertion_line: 451
+expression: "eval_str(DOC,\nr#\"local h = hcl.edit(subject)\n           h:block(\"resource\",\"aws_instance\",\"web\"):update(\"ami\", function() return nil end)\n           return h:to_string()\"#)"
+---
+region = "us-east-1"
+
+resource "aws_instance" "web" {
+  count = 2
+}
+
+resource "aws_instance" "db" {
+  ami = "old2"
+}

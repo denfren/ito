@@ -49,12 +49,59 @@ fn non_shebang_first_line_starting_with_hash_bang_is_untouched_when_absent() {
 }
 
 #[test]
-fn shebang_stripped_for_inline_script() {
-    ito()
-        .args(["-s", "#!/usr/bin/env ito\nprint(\"inline\")"])
+fn shebang_stripped_for_ied_too() {
+    let dir = TempDir::new().unwrap();
+    let edit = dir.path().join("e.luau");
+    fs::write(&edit, "#!/usr/bin/env ied\nprint(\"edited\")\n").unwrap();
+    Command::cargo_bin("ied")
+        .unwrap()
+        .arg(&edit)
         .assert()
         .success()
-        .stdout(predicate::str::contains("inline"));
+        .stdout(predicate::str::contains("edited"));
+}
+
+/// Writes an executable `s.ito` into `dir` whose shebang runs the built `ito`
+/// with `flags`, followed by `body`.
+#[cfg(unix)]
+fn shebang_script(dir: &std::path::Path, flags: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = assert_cmd::cargo::cargo_bin("ito");
+    let script = dir.join("s.ito");
+    fs::write(
+        &script,
+        format!("#!/usr/bin/env -S {} {flags}\n{body}", bin.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn executed_shebang_script_reports_the_right_line() {
+    // The shebang line counts as line 1, so the error is on line 3.
+    let dir = TempDir::new().unwrap();
+    shebang_script(dir.path(), "", "print(\"ok\")\nerror(\"boom\")\n");
+    Command::new("./s.ito")
+        .current_dir(dir.path())
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(":3: boom"));
+}
+
+#[test]
+#[cfg(unix)]
+fn executed_shebang_script_owns_its_arguments() {
+    // What the user types after the script lands in `argv`, flag-looking or not.
+    let dir = TempDir::new().unwrap();
+    shebang_script(dir.path(), "", "print(table.concat(argv, \"|\"))\n");
+    Command::new("./s.ito")
+        .current_dir(dir.path())
+        .args(["-v", "--doc", "x"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-v|--doc|x"));
 }
 
 #[test]
@@ -63,24 +110,15 @@ fn shebang_script_with_dash_c_is_found_and_reroots_fs() {
     // The end-to-end shebang case: the kernel hands us `./s.ito` (relative to
     // the invocation cwd) while the shebang's own `-C sub` moves the fs root.
     // Resolving the script after the chdir used to make this "no script found".
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("marker.txt"), "outer").unwrap();
     fs::create_dir(dir.path().join("sub")).unwrap();
     fs::write(dir.path().join("sub/marker.txt"), "inner").unwrap();
-
-    let bin = assert_cmd::cargo::cargo_bin("ito");
-    let script = dir.path().join("s.ito");
-    fs::write(
-        &script,
-        format!(
-            "#!/usr/bin/env -S {} -C sub\nprint(\"marker=\" .. tostring(fs.read(\"marker.txt\")))\n",
-            bin.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    shebang_script(
+        dir.path(),
+        "-C sub",
+        "print(\"marker=\" .. tostring(fs.read(\"marker.txt\")))\n",
+    );
 
     Command::new("./s.ito")
         .current_dir(dir.path())

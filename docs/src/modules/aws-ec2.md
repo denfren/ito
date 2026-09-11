@@ -1,10 +1,11 @@
 # `aws.ec2` — AWS EC2
 
-| Function/method | Effect |
+| Function | Effect |
 | --- | --- |
 | `aws.ec2.describe_instances()` | new `DescribeInstances` builder |
 | `aws.ec2.describe_images()` | new `DescribeImages` builder |
 | `aws.ec2.describe_snapshots()` | new `DescribeSnapshots` builder |
+| `aws.ec2.describe_instance_status()` | new `DescribeInstanceStatus` builder |
 | `aws.ec2.start_instances(ids)` | new `start_instances` action builder |
 | `aws.ec2.stop_instances(ids)` | new `stop_instances` action builder |
 | `aws.ec2.reboot_instances(ids)` | new `reboot_instances` action builder |
@@ -12,7 +13,7 @@
 | `aws.ec2.create_tags(resources)` | new `create_tags` action builder |
 | `aws.ec2.delete_tags(resources)` | new `delete_tags` action builder |
 | `:id`/`:ids` | filter/select by instance, AMI or snapshot id |
-| `:name` | filter by `tag:Name` (instances/images: `name` for images) |
+| `:name` | filter by the `Name` tag (instances, instance status) — but the AMI `name` on `describe_images` |
 | `:tag`/`:tag_key` | filter by tag value / tag presence |
 | `:instance_state`/`:instance_type`/`:vpc_id`/`:subnet_id` | typed instance filters |
 | `:owner` | filter images/snapshots by owner |
@@ -20,6 +21,7 @@
 | `:architecture` | filter images by architecture |
 | `:volume_id` | filter snapshots by source volume |
 | `:include_deprecated` | include deprecated AMIs (images) |
+| `:include_all_instances` | include stopped instances (instance status) |
 | `:filter` | escape hatch: any EC2 filter by name |
 | `:dry_run` | validate an action's permissions, run nothing |
 | `:force`/`:hibernate` | `stop_instances`-only refinements |
@@ -42,9 +44,15 @@ end
 ## Conventions
 
 **Builder + `:send()`.** Every entry point (`describe_instances`,
-`describe_images`, `describe_snapshots`, the four lifecycle actions and
-the two tag actions) returns a mutable builder. Filter/option methods return the same builder
-so calls chain; `:send()` finalizes it and performs the request.
+`describe_images`, `describe_snapshots`, `describe_instance_status`, the
+four lifecycle actions and the two tag actions) returns a mutable
+builder. Filter/option methods mutate it in place and return the same
+handle, so calls chain; `:send()` finalizes it and performs the request.
+An entry call validates its required ids/resources immediately, a filter
+value is checked when its setter is called, and a bad combination that
+only shows up at send time (an empty tag set, a missing `:tags()`) raises
+from `:send()` before the request goes out. `:send()` is async and either
+raises or returns `(envelope, data)` — see below.
 
 **Two return values.** As documented for the whole `aws` surface,
 `:send()` either raises or returns exactly two values: an envelope table
@@ -57,7 +65,7 @@ local r, states    = aws.ec2.stop_instances({ "i-abc" }):send()
 
 For a describe, `ok` is always `true` — a query that matched nothing is
 an empty table, not a failure — so the envelope earns its keep on the
-actions instead, where [`:dry_run()`](#dry_run) makes "allowed,
+actions instead, where [`:dry_run()`](#dry-run) makes "allowed,
 and nothing happened" a real answer rather than an error.
 `create_tags`/`delete_tags` carry no response data at all, so their second
 value is always `nil`; the pair is kept anyway, so one `:send()` convention
@@ -74,13 +82,27 @@ aws.ec2.stop_instances({ "i-abc", "i-def" })
 ```
 
 Passing anything else (a number, a table with non-string entries) raises
-`"expected string or array of strings, got <type>"`.
+`"aws.ec2:<method>: expected string or array of strings, got <type>"`. An
+**empty list or an empty string raises too** (`ids({})`, `:tag("k", {})`,
+`:id("")`): EC2 reads an empty id/filter list as "no restriction", so it would
+silently widen the query to the whole region. The same holds for every `:ids()`,
+`:id()` and lifecycle/tag id argument.
+
+**Repeated filters AND together.** Two `:tag("Env", …)` calls are two separate
+filters that must both match (and a same-name pair usually matches nothing).
+Pass one list to mean *any of*.
+
+**Unknown ids are "no match".** A describe given an id EC2 does not know
+(`InvalidInstanceID.NotFound` and kin) returns an empty table instead of
+raising. EC2 fails the whole request on one unknown id, so a list containing a
+single stale id yields an empty result — describe without ids and filter if
+partial answers matter.
 
 **Wildcards.** Filter values support the `*` and `?` wildcards EC2 itself
 supports (`:name("web-*")`); there is no separate ends-with helper
 because EC2 has no such filter.
 
-**Pagination is followed to exhaustion.** All three describes drain their
+**Pagination is followed to exhaustion.** All four describes drain their
 paginator fully before returning; there is no page token to manage and no
 result cap to trip over.
 
@@ -123,38 +145,35 @@ local running, stopped = task.await(handles)
 Concurrent first calls into the ambient client share one lazily-built
 client rather than each building their own.
 
-## `describe_instances`
+## `aws.ec2.describe_instances`
 
 Builds a `DescribeInstances` request over instance ids and/or filters.
 
-### Signature
+**Signature:** `aws.ec2.describe_instances() -> DescribeInstances`
 
-```
-aws.ec2.describe_instances() -> DescribeInstances
-```
-
-### Parameters
+**Parameters:**
 
 None. Configure the request through the builder's methods, below.
 
-### Return value
+**Returns:**
 
 A `DescribeInstances` builder.
 
-### Builder methods
+**Methods:**
 
-| Method | Signature | EC2 filter |
-| --- | --- | --- |
-| `:id` | `(id)` | one instance id |
-| `:ids` | `(list)` | several instance ids |
-| `:name` | `(value)` | `tag:Name` |
-| `:tag` | `(key, value)` | `tag:<key>` |
-| `:tag_key` | `(key)` | `tag-key` |
-| `:instance_state` | `(value)` | `instance-state-name` |
-| `:instance_type` | `(value)` | `instance-type` |
-| `:vpc_id` | `(value)` | `vpc-id` |
-| `:subnet_id` | `(value)` | `subnet-id` |
-| `:filter` | `(name, value)` | any filter, by name |
+| Method | Effect |
+| --- | --- |
+| `:id(id)` | one instance id |
+| `:ids(list)` | several instance ids |
+| `:name(value)` | `tag:Name` |
+| `:tag(key, value)` | `tag:<key>` |
+| `:tag_key(key)` | `tag-key` |
+| `:instance_state(value)` | `instance-state-name` |
+| `:instance_type(value)` | `instance-type` |
+| `:vpc_id(value)` | `vpc-id` |
+| `:subnet_id(value)` | `subnet-id` |
+| `:filter(name, value)` | any filter, by name |
+| `:send(...)` | finalize the builder and run the request (async) |
 
 `value`/`list` parameters accept a single string or list of strings
 (see [Conventions](#conventions)). `:name` is sugar for
@@ -162,9 +181,9 @@ A `DescribeInstances` builder.
 attribute. `:filter` is the escape hatch for any EC2 filter without a
 typed helper above.
 
-### `:send()`
+### `DescribeInstances:send`
 
-#### Return value
+**Returns:**
 
 `(envelope, instances)` — `envelope.ok` is always `true`; `instances` is
 an array of instance tables, possibly empty.
@@ -194,13 +213,11 @@ date type. Absent scalars are omitted rather than set to `nil`. `tags` is
 always present — a `{[key] = value}` map, possibly empty — so
 `i.tags.Name` is safe to index without a guard.
 
-#### Error conditions
+**Errors:**
 
 Raises on any SDK/transport error (bad credentials, denied access,
 connectivity, a malformed filter). Never raises on "no matches" — that is
 an empty `instances` table.
-
-#### Example
 
 ```lua
 local r, instances = aws.ec2.describe_instances()
@@ -213,47 +230,44 @@ for _, i in ipairs(instances) do
 end
 ```
 
-## `describe_images`
+## `aws.ec2.describe_images`
 
 Builds a `DescribeImages` (AMI) request over image ids, owners and/or
 filters.
 
-### Signature
+**Signature:** `aws.ec2.describe_images() -> DescribeImages`
 
-```
-aws.ec2.describe_images() -> DescribeImages
-```
-
-### Parameters
+**Parameters:**
 
 None. Configure the request through the builder's methods, below.
 
-### Return value
+**Returns:**
 
 A `DescribeImages` builder.
 
-### Builder methods
+**Methods:**
 
-| Method | Signature | Meaning |
-| --- | --- | --- |
-| `:id` | `(id)` | one AMI id |
-| `:ids` | `(list)` | several AMI ids |
-| `:owner` | `(value)` | account id, or `self`/`amazon`/`aws-marketplace` |
-| `:name` | `(value)` | the `name` filter |
-| `:tag` | `(key, value)` | `tag:<key>` |
-| `:tag_key` | `(key)` | `tag-key` |
-| `:state` | `(value)` | `available`, `pending`, `failed`, … |
-| `:architecture` | `(value)` | `x86_64`, `arm64`, … |
-| `:include_deprecated` | `()` | include deprecated AMIs |
-| `:filter` | `(name, value)` | any filter, by name |
+| Method | Effect |
+| --- | --- |
+| `:id(id)` | one AMI id |
+| `:ids(list)` | several AMI ids |
+| `:owner(value)` | account id, or `self`/`amazon`/`aws-marketplace` |
+| `:name(value)` | the `name` filter |
+| `:tag(key, value)` | `tag:<key>` |
+| `:tag_key(key)` | `tag-key` |
+| `:state(value)` | `available`, `pending`, `failed`, … |
+| `:architecture(value)` | `x86_64`, `arm64`, … |
+| `:include_deprecated()` | include deprecated AMIs |
+| `:filter(name, value)` | any filter, by name |
+| `:send(...)` | finalize the builder and run the request (async) |
 
 Pass an owner. Without one the result is every public AMI in the region,
 which is never what a script wants. Deprecated AMIs are hidden unless
 `:include_deprecated()` is called, matching the API's own default.
 
-### `:send()`
+### `DescribeImages:send`
 
-#### Return value
+**Returns:**
 
 `(envelope, images)` — `envelope.ok` is always `true`; `images` is an
 array of image tables, possibly empty.
@@ -278,11 +292,9 @@ array of image tables, possibly empty.
 (unlike every other EC2 timestamp, which is converted from a typed
 `DateTime`). `tags` is always present, possibly empty.
 
-#### Error conditions
+**Errors:**
 
 Raises on any SDK/transport error. Never raises on "no matches".
-
-#### Example
 
 ```lua
 local r, images = aws.ec2.describe_images()
@@ -295,44 +307,41 @@ for _, img in ipairs(images) do
 end
 ```
 
-## `describe_snapshots`
+## `aws.ec2.describe_snapshots`
 
 Builds a `DescribeSnapshots` (EBS snapshot) request over snapshot ids,
 owners and/or filters.
 
-### Signature
+**Signature:** `aws.ec2.describe_snapshots() -> DescribeSnapshots`
 
-```
-aws.ec2.describe_snapshots() -> DescribeSnapshots
-```
-
-### Parameters
+**Parameters:**
 
 None. Configure the request through the builder's methods, below.
 
-### Return value
+**Returns:**
 
 A `DescribeSnapshots` builder.
 
-### Builder methods
+**Methods:**
 
-| Method | Signature | Meaning |
-| --- | --- | --- |
-| `:id` | `(id)` | one snapshot id |
-| `:ids` | `(list)` | several snapshot ids |
-| `:owner` | `(value)` | account id, or `self`/`amazon` |
-| `:volume_id` | `(value)` | `volume-id` |
-| `:status` | `(value)` | `pending`, `completed`, `error` |
-| `:tag` | `(key, value)` | `tag:<key>` |
-| `:tag_key` | `(key)` | `tag-key` |
-| `:filter` | `(name, value)` | any filter, by name |
+| Method | Effect |
+| --- | --- |
+| `:id(id)` | one snapshot id |
+| `:ids(list)` | several snapshot ids |
+| `:owner(value)` | account id, or `self`/`amazon` |
+| `:volume_id(value)` | `volume-id` |
+| `:status(value)` | `pending`, `completed`, `error` |
+| `:tag(key, value)` | `tag:<key>` |
+| `:tag_key(key)` | `tag-key` |
+| `:filter(name, value)` | any filter, by name |
+| `:send(...)` | finalize the builder and run the request (async) |
 
 As for images, pass an owner — otherwise the result is every public
 snapshot in the region.
 
-### `:send()`
+### `DescribeSnapshots:send`
 
-#### Return value
+**Returns:**
 
 `(envelope, snapshots)` — `envelope.ok` is always `true`; `snapshots` is
 an array of snapshot tables, possibly empty.
@@ -352,11 +361,9 @@ an array of snapshot tables, possibly empty.
 | `start_time` | string (RFC 3339) |
 | `tags` | table |
 
-#### Error conditions
+**Errors:**
 
 Raises on any SDK/transport error. Never raises on "no matches".
-
-#### Example
 
 ```lua
 local r, snaps = aws.ec2.describe_snapshots()
@@ -369,12 +376,95 @@ for _, s in ipairs(snaps) do
 end
 ```
 
-## Lifecycle actions: `start_instances`/`stop_instances`/`reboot_instances`/`terminate_instances`
+## `aws.ec2.describe_instance_status`
+
+Builds a `DescribeInstanceStatus` request — AWS's own verdict on an
+instance, as opposed to `describe_instances`' `state`, which is only
+EC2's *intended* lifecycle state. A `running` instance can still be
+failing its system status check; that distinction is why this is a
+separate call rather than a field folded into `describe_instances`.
+
+**Signature:** `aws.ec2.describe_instance_status() -> DescribeInstanceStatus`
+
+**Parameters:**
+
+None. Configure the request through the builder's methods, below.
+
+**Returns:**
+
+A `DescribeInstanceStatus` builder.
+
+**Methods:**
+
+| Method | Effect |
+| --- | --- |
+| `:id(id)` | one instance id |
+| `:ids(list)` | several instance ids |
+| `:tag(key, value)` | instances whose tag `key` matches |
+| `:tag_key(key)` | instances carrying the key, any value |
+| `:name(value)` | sugar for `:tag("Name", value)` |
+| `:include_all_instances()` | include stopped instances too |
+| `:filter(name, value)` | any filter, by name |
+| `:send(...)` | finalize the builder and run the request (async) |
+
+Stopped instances have no status checks to report and are excluded by
+default, matching the API's own `IncludeAllInstances` default of
+`false`; `:include_all_instances()` asks for them anyway (their status
+fields come back absent).
+
+The tag filters are the same ones `describe_instances` takes, so the
+health of a tagged set is one call rather than a lookup followed by a
+status check.
+
+### `DescribeInstanceStatus:send`
+
+**Returns:**
+
+`(envelope, statuses)` — `envelope.ok` is always `true`; `statuses` is an
+array of status tables, possibly empty.
+
+| Field | Type |
+| --- | --- |
+| `instance_id` | string |
+| `availability_zone` | string |
+| `instance_state` | string |
+| `instance_state_code` | number |
+| `instance_status` | table (`status`, `details`) |
+| `system_status` | table (`status`, `details`) |
+| `events` | table (array) |
+
+`instance_state`/`instance_state_code` are EC2's intended lifecycle
+state, flattened the same way `describe_instances` flattens `state`.
+`instance_status` and `system_status` are each `{status, details}`:
+`status` is the summary (`ok`, `impaired`, `insufficient-data`,
+`not-applicable`), and `details` is an array of `{name, status,
+impaired_since}` — one entry per underlying check (e.g.
+`reachability`), `impaired_since` present only once a check has actually
+failed. `events` is an array of scheduled maintenance events —
+`{id, code, description, not_before, not_after, not_before_deadline}` —
+that explain a status change with no health-check failure behind it
+(a scheduled reboot or instance retirement, say).
+
+**Errors:**
+
+Raises on any SDK/transport error. Never raises on "no matches".
+
+```lua
+local r, statuses = aws.ec2.describe_instance_status():send()
+
+for _, s in ipairs(statuses) do
+    if s.system_status and s.system_status.status ~= "ok" then
+        print(s.instance_id, s.system_status.status)
+    end
+end
+```
+
+## `aws.ec2.start_instances` / `aws.ec2.stop_instances` / `aws.ec2.reboot_instances` / `aws.ec2.terminate_instances`
 
 Each starts an action builder over a required set of instance ids, and is
 the only part of this module that changes anything.
 
-### Signature
+**Signature:**
 
 ```
 aws.ec2.start_instances(ids) -> LifecycleAction
@@ -383,35 +473,37 @@ aws.ec2.reboot_instances(ids) -> LifecycleAction
 aws.ec2.terminate_instances(ids) -> LifecycleAction
 ```
 
-### Parameters
+**Parameters:**
 
 - `ids` (string or list of strings, required) — the instance id(s) to
   act on. Required at the entry function rather than a builder method:
   there is no useful call without them.
 
-### Return value
+**Returns:**
 
 A `LifecycleAction` builder, one type shared by all four calls.
 
-### Builder methods
+**Methods:**
 
-| Method | Applies to | Meaning |
-| --- | --- | --- |
-| `:dry_run()` | all four | validate permissions, change nothing |
-| `:force()` | `stop_instances` only | stop without a graceful shutdown |
-| `:hibernate()` | `stop_instances` only | hibernate rather than stop |
+| Method | Effect |
+| --- | --- |
+| `:dry_run()` | validate permissions, change nothing (all four) |
+| `:force()` | stop without a graceful shutdown (`stop_instances` only) |
+| `:hibernate()` | hibernate rather than stop (`stop_instances` only) |
+| `:send(...)` | finalize the builder and run the request (async) |
 
 Calling `:force()` or `:hibernate()` on any action other than
 `stop_instances` raises immediately (not deferred to `:send()`): a script
 bug is caught here rather than being silently dropped on the way to EC2.
 
-### `:send()`
+### `LifecycleAction:send`
 
-#### Return value
+**Returns:**
 
 `(envelope, changes)`. `envelope.ok` is `true` unless the call raises.
 `changes` is an array of state-change tables — **except** under
-`:dry_run()` success, where it is `nil` (see [Dry run](#dry-run)), and
+`:dry_run()` success, where it is an empty table and `envelope.dry_run` is
+`true` (see [Dry run](#dry-run)), and
 **except** for `reboot_instances`, where it is always an empty table:
 EC2 reports no state transition for a reboot, only that the request was
 accepted.
@@ -429,7 +521,7 @@ State-change table fields:
 Both states are flattened to their names, with the numeric codes kept
 alongside — the same treatment `describe_instances` gives `state`.
 
-#### Error conditions
+**Errors:**
 
 - Raises `"<action>: expected at least one instance id"` if `ids` is
   empty (checked before the request is sent — EC2's own rejection message
@@ -441,8 +533,6 @@ alongside — the same treatment `describe_instances` gives `state`.
   `UnauthorizedOperation` (the caller lacks the permission being tested).
 - Does **not** raise on `DryRunOperation` under `:dry_run()` — that is
   the success case.
-
-#### Example
 
 ```lua
 local r, states = aws.ec2.stop_instances({ "i-abc", "i-def" }):send()
@@ -466,22 +556,20 @@ end
 ```
 
 EC2 reports that refusal as the `DryRunOperation` error, which this
-module treats as success: `ok` is `true` and the second return value is
-`nil`. `UnauthorizedOperation` — the same exchange for a caller who lacks
+module treats as success: `ok` is `true`, the envelope carries
+`dry_run = true`, and the second return value is an empty table (also for
+`create_tags`/`delete_tags`). Test `r.dry_run` to tell a dry run from a real
+one. `UnauthorizedOperation` — the same exchange for a caller who lacks
 the permission — still raises, since that one is a real answer rather
 than a validation artifact.
 
-## `create_tags`
+## `aws.ec2.create_tags`
 
 Sets tags on any EC2 resources, by id.
 
-### Signature
+**Signature:** `aws.ec2.create_tags(resources) -> TagRequest`
 
-```
-aws.ec2.create_tags(resources) -> TagRequest
-```
-
-### Parameters
+**Parameters:**
 
 - `resources` (string or list of strings, required) — the resource id(s)
   to tag. Required at the entry function rather than a builder method:
@@ -490,16 +578,17 @@ aws.ec2.create_tags(resources) -> TagRequest
   is keyed by resource *id*, not by resource type — a per-resource-type
   function would invent a distinction the service does not make.
 
-### Return value
+**Returns:**
 
 A `TagRequest` builder, one type shared with `delete_tags`.
 
-### Builder methods
+**Methods:**
 
-| Method | Signature | Meaning |
-| --- | --- | --- |
-| `:tags` | `(table)` | the tags to set, as a `{[<key>] = <value>}` map |
-| `:dry_run` | `()` | validate permissions, change nothing |
+| Method | Effect |
+| --- | --- |
+| `:tags(table)` | the tags to set, as a `{[<key>] = <value>}` map |
+| `:dry_run()` | validate permissions, change nothing |
+| `:send(...)` | finalize the builder and run the request (async) |
 
 `:tags()` takes the same `{[<key>] = <value>}` map that
 `.tags` reads back on every describe result, so a read/modify/write
@@ -511,16 +600,16 @@ A key without a value has no meaning on create — there is nothing to set
 — so an array entry (`{ "Env" }`) is refused at the declaring call rather
 than by EC2.
 
-### `:send()`
+### `TagRequest:send`
 
-#### Return value
+**Returns:**
 
 `(envelope, nil)`. `envelope.ok` is `true` unless the call raises;
 `CreateTags` returns no data, so the envelope is the whole answer. The
 second value is present, and `nil`, to keep the module's two-value
 convention.
 
-#### Error conditions
+**Errors:**
 
 - Raises `"create_tags: expected a table of tags, got <type>"` from
   `:tags()` if the argument is not a table.
@@ -543,8 +632,6 @@ convention.
 
 Nothing here returns `nil` to signal a failure; every failure raises.
 
-#### Example
-
 ```lua
 local r, instances = aws.ec2.describe_instances():instance_state("running"):send()
 
@@ -557,32 +644,29 @@ for _, i in ipairs(instances) do
 end
 ```
 
-## `delete_tags`
+## `aws.ec2.delete_tags`
 
 Removes tags from any EC2 resources, by id.
 
-### Signature
+**Signature:** `aws.ec2.delete_tags(resources) -> TagRequest`
 
-```
-aws.ec2.delete_tags(resources) -> TagRequest
-```
-
-### Parameters
+**Parameters:**
 
 - `resources` (string or list of strings, required) — the resource id(s)
   to untag. As for `create_tags`, one generic call covers every resource
   kind, EC2's tag API being keyed by id rather than type.
 
-### Return value
+**Returns:**
 
 A `TagRequest` builder, one type shared with `create_tags`.
 
-### Builder methods
+**Methods:**
 
-| Method | Signature | Meaning |
-| --- | --- | --- |
-| `:tags` | `(table)` | the tags to delete — a map, an array of keys, or both |
-| `:dry_run` | `()` | validate permissions, change nothing |
+| Method | Effect |
+| --- | --- |
+| `:tags(table)` | the tags to delete — a map, an array of keys, or both |
+| `:dry_run()` | validate permissions, change nothing |
+| `:send(...)` | finalize the builder and run the request (async) |
 
 `:tags()` accepts **either** shape, mirroring upstream, where omitting a
 tag's value deletes whatever value it has:
@@ -601,19 +685,19 @@ aws.ec2.delete_tags("i-abc"):tags({ "Scratch", Env = "staging" }):send()
 `:tags()` is **required**. Upstream reads an absent tag set as "delete
 every tag on these resources" — a silent fleet-wide tag loss one
 forgotten call away — so it has to be asked for by naming the keys, and
-there is deliberately no shorthand for it. An *explicitly* empty table is
-accepted, unlike on create: a caller who passed `{}` has said what they
-meant, and the call deletes nothing.
+there is deliberately no shorthand for it. An *empty* table raises as well:
+the SDK omits an empty tag list from the request and EC2 then deletes **every**
+tag, so `:tags({})` would be the same silent loss.
 
-### `:send()`
+### `TagRequest:send`
 
-#### Return value
+**Returns:**
 
 `(envelope, nil)`. `envelope.ok` is `true` unless the call raises;
 `DeleteTags` returns no data, so the envelope is the whole answer, with
 the `nil` keeping the module's two-value convention.
 
-#### Error conditions
+**Errors:**
 
 - Raises `"delete_tags: expected a table of tags, got <type>"` from
   `:tags()` if the argument is not a table.
@@ -626,7 +710,10 @@ the `nil` keeping the module's two-value convention.
   `:send()` if `resources` is empty.
 - Raises `"delete_tags: expected ':tags()' — pass the keys to delete;
   there is no shorthand for deleting every tag"` from `:send()` if
-  `:tags()` was never called.
+  `:tags()` was never called, and `"delete_tags: expected at least one tag"`
+  if it was called with an empty table.
+- Raises `"delete_tags: tag keys must be non-empty strings, got <type>"` for a
+  numeric or empty key in the array form (`{ 123 }`).
 - Raises on any other SDK/transport error, including
   `UnauthorizedOperation`.
 - Does **not** raise on `DryRunOperation` under `:dry_run()` — that is the
@@ -634,8 +721,6 @@ the `nil` keeping the module's two-value convention.
   `true` and nothing happened.
 
 Nothing here returns `nil` to signal a failure; every failure raises.
-
-#### Example
 
 ```lua
 local r = aws.ec2.delete_tags({ "i-abc", "vol-def" })

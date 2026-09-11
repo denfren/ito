@@ -16,6 +16,18 @@
 //! group — asking for 20 instances in a group whose `max_size` is 10 should
 //! say so rather than silently raise the ceiling.
 //!
+//! # Scaling activities and policies
+//!
+//! `describe_scaling_activities` is the group's own event log — launch and
+//! terminate attempts, health-check replacements, capacity changes — each
+//! carrying a `cause` string naming what triggered it. The group name is
+//! optional: omitting it is an account-wide read, for a script correlating an
+//! incident across a fleet rather than one known-bad group.
+//! `describe_policies` reads the scaling policies themselves (their
+//! adjustment and cooldown, plus the CloudWatch alarms that drive them);
+//! diagnosing why a policy fired is a job for `aws.autoscaling` plus
+//! CloudWatch, not this call alone.
+//!
 //! # Instance refresh
 //!
 //! A refresh replaces a group's instances in batches. It is asynchronous: the
@@ -66,26 +78,108 @@ use std::time::Duration;
 
 use aws_sdk_autoscaling::Client;
 use aws_sdk_autoscaling::types::{
-    AutoScalingGroup, AutoScalingInstanceDetails, Instance, InstanceRefresh, InstanceRefreshStatus,
-    RefreshPreferences, RefreshStrategy,
+    AutoScalingGroup, AutoScalingInstanceDetails, DesiredConfiguration, Instance, InstanceRefresh,
+    InstanceRefreshStatus, LaunchTemplateSpecification, RefreshPreferences, RefreshStrategy,
 };
 use mlua::{
     AnyUserData, Lua, MultiValue, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 use std::sync::{Arc, Mutex};
 
-use super::{BoxError, ClientSource, lua_err, value_to_string_list};
+use super::{BoxError, ClientSource, date_to_string, respond, value_to_string_list};
 
-/// Format a timestamp as RFC 3339, matching every other date in this crate.
-fn date_to_string(dt: &aws_smithy_types::DateTime) -> Option<String> {
-    dt.fmt(aws_smithy_types::date_time::Format::DateTime).ok()
+// --- shared argument helpers -------------------------------------------------
+// Local to this module (prefixed errors, empty-list guard, strict booleans).
+
+/// An SDK error as a Luau error, prefixed with the call that failed.
+fn sdk_err(call: &str, e: impl Into<BoxError>) -> mlua::Error {
+    mlua::Error::runtime(format!(
+        "{call}: {}",
+        super::format_error_chain(&e.into())
+    ))
 }
 
-/// Return `(envelope, data)`, the pair every `:send()` resolves to.
-fn respond(lua: &Lua, ok: bool, data: Value) -> LuaResult<MultiValue> {
-    let env = lua.create_table()?;
-    env.raw_set("ok", ok)?;
-    Ok(MultiValue::from_vec(vec![Value::Table(env), data]))
+/// A non-empty string list: an empty one would widen the query to the whole
+/// account, so it raises instead.
+fn list_arg(call: &str, what: &str, value: Value) -> LuaResult<Vec<String>> {
+    let list = value_to_string_list(value)
+        .map_err(|e| mlua::Error::runtime(format!("{call}: {what}: {e}")))?;
+    if list.is_empty() {
+        return Err(mlua::Error::runtime(format!(
+            "{call}: {what} was given an empty list, which would match everything"
+        )));
+    }
+    Ok(list)
+}
+
+/// A strict boolean flag argument: nil means `true`, truthiness is refused.
+fn bool_arg(call: &str, method: &str, value: Option<Value>) -> LuaResult<bool> {
+    match value {
+        None | Some(Value::Nil) => Ok(true),
+        Some(Value::Boolean(b)) => Ok(b),
+        Some(other) => Err(mlua::Error::runtime(format!(
+            "{call}: '{method}' expects a boolean, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// A group name must not be empty.
+fn group_arg(call: &str, group: String) -> LuaResult<String> {
+    if group.is_empty() {
+        return Err(mlua::Error::runtime(format!(
+            "{call}: expected an Auto Scaling group name, got an empty string"
+        )));
+    }
+    Ok(group)
+}
+
+/// Read `{id = ..} | {name = ..}` plus an optional `version` into a launch
+/// template specification.
+fn launch_template_arg(call: &str, value: Value) -> LuaResult<LaunchTemplateSpecification> {
+    let Value::Table(t) = value else {
+        return Err(mlua::Error::runtime(format!(
+            "{call}: ':launch_template()' expects {{name = .., version = ..}}, got {}",
+            value.type_name()
+        )));
+    };
+    let field = |k: &str| -> LuaResult<Option<String>> {
+        match t.get::<Value>(k)? {
+            Value::Nil => Ok(None),
+            Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+            Value::Integer(i) => Ok(Some(i.to_string())),
+            other => Err(mlua::Error::runtime(format!(
+                "{call}: launch_template '{k}' must be a string, got {}",
+                other.type_name()
+            ))),
+        }
+    };
+    let (id, name, version) = (field("id")?, field("name")?, field("version")?);
+    if id.is_some() == name.is_some() {
+        return Err(mlua::Error::runtime(format!(
+            "{call}: ':launch_template()' needs exactly one of 'id' or 'name'"
+        )));
+    }
+    Ok(LaunchTemplateSpecification::builder()
+        .set_launch_template_id(id)
+        .set_launch_template_name(name)
+        .set_version(version)
+        .build())
+}
+
+/// Flatten a launch template specification to `{id, name, version}`.
+fn launch_template_to_table(lua: &Lua, lt: LaunchTemplateSpecification) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+    if let Some(v) = lt.launch_template_id {
+        t.raw_set("id", v)?;
+    }
+    if let Some(v) = lt.launch_template_name {
+        t.raw_set("name", v)?;
+    }
+    if let Some(v) = lt.version {
+        t.raw_set("version", v)?;
+    }
+    Ok(t)
 }
 
 /// Whether a refresh status is one the refresh will not move on from.
@@ -123,7 +217,7 @@ struct DescribeGroups {
 impl UserData for DescribeGroups {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_function("name", |_, (ud, names): (AnyUserData, Value)| {
-            let names = value_to_string_list(names)?;
+            let names = list_arg("describe_groups", "':name()'", names)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -137,14 +231,14 @@ impl UserData for DescribeGroups {
         methods.add_function(
             "tag",
             |_, (ud, key, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = list_arg("describe_groups", "':tag()' values", values)?;
                 push_filter(&ud, format!("tag:{key}"), values)?;
                 Ok(ud)
             },
         );
 
         methods.add_function("tag_key", |_, (ud, keys): (AnyUserData, Value)| {
-            let keys = value_to_string_list(keys)?;
+            let keys = list_arg("describe_groups", "':tag_key()'", keys)?;
             push_filter(&ud, "tag-key".to_string(), keys)?;
             Ok(ud)
         });
@@ -152,7 +246,7 @@ impl UserData for DescribeGroups {
         methods.add_function(
             "filter",
             |_, (ud, name, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = list_arg("describe_groups", "':filter()' values", values)?;
                 push_filter(&ud, name, values)?;
                 Ok(ud)
             },
@@ -182,7 +276,7 @@ impl UserData for DescribeGroups {
             let mut idx = 0;
             let mut stream = req.into_paginator().items().send();
             while let Some(group) = stream.next().await {
-                let group = group.map_err(|e| lua_err(BoxError::from(e)))?;
+                let group = group.map_err(|e| sdk_err("describe_groups", e))?;
                 idx += 1;
                 out.raw_set(idx, group_to_table(&lua, group)?)?;
             }
@@ -246,17 +340,53 @@ fn group_to_table(lua: &Lua, group: AutoScalingGroup) -> LuaResult<Table> {
         t.raw_set("created_time", v)?;
     }
 
-    // The launch template, flattened to the two fields that identify it.
-    if let Some(lt) = group.launch_template {
-        let t2 = lua.create_table()?;
-        if let Some(v) = lt.launch_template_name {
-            t2.raw_set("name", v)?;
-        }
-        if let Some(v) = lt.version {
-            t2.raw_set("version", v)?;
-        }
-        t.raw_set("launch_template", t2)?;
+    // The launch template, flattened to what identifies it; a mixed-instances
+    // group carries it inside its policy.
+    let lt = group.launch_template.or_else(|| {
+        group
+            .mixed_instances_policy
+            .and_then(|p| p.launch_template)
+            .and_then(|l| l.launch_template_specification)
+    });
+    if let Some(lt) = lt {
+        t.raw_set("launch_template", launch_template_to_table(lua, lt)?)?;
     }
+    if let Some(v) = group.capacity_rebalance {
+        t.raw_set("capacity_rebalance", v)?;
+    }
+    if let Some(v) = group.placement_group {
+        t.raw_set("placement_group", v)?;
+    }
+    if let Some(v) = group.max_instance_lifetime {
+        t.raw_set("max_instance_lifetime", v)?;
+    }
+    if let Some(v) = group.default_instance_warmup {
+        t.raw_set("default_instance_warmup", v)?;
+    }
+    if let Some(v) = group.service_linked_role_arn {
+        t.raw_set("service_linked_role_arn", v)?;
+    }
+    for (field, list) in [
+        ("load_balancer_names", group.load_balancer_names),
+        ("termination_policies", group.termination_policies),
+    ] {
+        let l = lua.create_table()?;
+        for (i, v) in list.unwrap_or_default().into_iter().enumerate() {
+            l.raw_set(i + 1, v)?;
+        }
+        t.raw_set(field, l)?;
+    }
+    let suspended = lua.create_table()?;
+    for (i, p) in group
+        .suspended_processes
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| p.process_name)
+        .enumerate()
+    {
+        suspended.raw_set(i + 1, p)?;
+    }
+    t.raw_set("suspended_processes", suspended)?;
 
     let azs = lua.create_table()?;
     for (idx, az) in group
@@ -344,6 +474,12 @@ fn member_to_table(lua: &Lua, instance: Instance) -> LuaResult<Table> {
     if let Some(v) = instance.protected_from_scale_in {
         t.raw_set("protected_from_scale_in", v)?;
     }
+    if let Some(v) = instance.launch_configuration_name {
+        t.raw_set("launch_configuration_name", v)?;
+    }
+    if let Some(lt) = instance.launch_template {
+        t.raw_set("launch_template", launch_template_to_table(lua, lt)?)?;
+    }
     Ok(t)
 }
 
@@ -367,18 +503,26 @@ impl UserData for DescribeInstances {
                 (this.client.clone(), this.ids.lock().unwrap().clone())
             };
 
-            let mut req = client.describe_auto_scaling_instances();
-            if !ids.is_empty() {
-                req = req.set_instance_ids(Some(ids));
-            }
+            // The API takes at most 50 ids per call: chunk longer lists.
+            let chunks: Vec<Vec<String>> = if ids.is_empty() {
+                vec![Vec::new()]
+            } else {
+                ids.chunks(50).map(<[String]>::to_vec).collect()
+            };
 
             let out = lua.create_table()?;
             let mut idx = 0;
-            let mut stream = req.into_paginator().items().send();
-            while let Some(details) = stream.next().await {
-                let details = details.map_err(|e| lua_err(BoxError::from(e)))?;
-                idx += 1;
-                out.raw_set(idx, instance_details_to_table(&lua, details)?)?;
+            for chunk in chunks {
+                let mut req = client.describe_auto_scaling_instances();
+                if !chunk.is_empty() {
+                    req = req.set_instance_ids(Some(chunk));
+                }
+                let mut stream = req.into_paginator().items().send();
+                while let Some(details) = stream.next().await {
+                    let details = details.map_err(|e| sdk_err("describe_instances", e))?;
+                    idx += 1;
+                    out.raw_set(idx, instance_details_to_table(&lua, details)?)?;
+                }
             }
 
             respond(&lua, true, Value::Table(out))
@@ -413,6 +557,12 @@ fn instance_details_to_table(lua: &Lua, d: AutoScalingInstanceDetails) -> LuaRes
     if let Some(v) = d.protected_from_scale_in {
         t.raw_set("protected_from_scale_in", v)?;
     }
+    if let Some(v) = d.launch_configuration_name {
+        t.raw_set("launch_configuration_name", v)?;
+    }
+    if let Some(lt) = d.launch_template {
+        t.raw_set("launch_template", launch_template_to_table(lua, lt)?)?;
+    }
     Ok(t)
 }
 
@@ -430,8 +580,9 @@ impl UserData for SetDesiredCapacity {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // Off by default, matching the API: a script asking for a capacity
         // usually means now, not "once the cooldown allows it".
-        methods.add_function("honor_cooldown", |_, ud: AnyUserData| {
-            *ud.borrow::<Self>()?.honor_cooldown.lock().unwrap() = true;
+        methods.add_function("honor_cooldown", |_, (ud, on): (AnyUserData, Option<Value>)| {
+            let on = bool_arg("set_desired_capacity", ":honor_cooldown()", on)?;
+            *ud.borrow::<Self>()?.honor_cooldown.lock().unwrap() = on;
             Ok(ud)
         });
 
@@ -453,7 +604,7 @@ impl UserData for SetDesiredCapacity {
                 .honor_cooldown(honor_cooldown)
                 .send()
                 .await
-                .map_err(|e| lua_err(BoxError::from(e)))?;
+                .map_err(|e| sdk_err("set_desired_capacity", e))?;
 
             // The API returns nothing; the envelope alone is the answer.
             respond(&lua, true, Value::Nil)
@@ -464,8 +615,9 @@ impl UserData for SetDesiredCapacity {
 // --- update_group ----------------------------------------------------------
 
 /// Shared request state, mutated in place by the builder methods.
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq)]
 struct UpdateGroupState {
+    launch_template: Option<LaunchTemplateSpecification>,
     min_size: Option<i32>,
     max_size: Option<i32>,
     desired_capacity: Option<i32>,
@@ -517,6 +669,14 @@ impl UserData for UpdateGroup {
             Ok(ud)
         });
 
+        // Point the group at a (new version of a) launch template; new
+        // instances use it. Pair with an instance refresh to roll it out.
+        methods.add_function("launch_template", |_, (ud, v): (AnyUserData, Value)| {
+            let lt = launch_template_arg("update_group", v)?;
+            ud.borrow::<Self>()?.state.lock().unwrap().launch_template = Some(lt);
+            Ok(ud)
+        });
+
         methods.add_async_function("send", |lua, ud: AnyUserData| async move {
             let (client, group, state) = {
                 let this = ud.borrow::<Self>()?;
@@ -533,13 +693,16 @@ impl UserData for UpdateGroup {
                 return Err(mlua::Error::runtime(
                     "update_group: set at least one of ':min_size()', ':max_size()', \
                      ':desired_capacity()', ':health_check_grace_period()' or \
-                     ':default_cooldown()'",
+                     ':default_cooldown()' or ':launch_template()'",
                 ));
             }
 
             let mut req = client
                 .update_auto_scaling_group()
                 .auto_scaling_group_name(group);
+            if let Some(lt) = state.launch_template {
+                req = req.launch_template(lt);
+            }
             if let Some(v) = state.min_size {
                 req = req.min_size(v);
             }
@@ -556,7 +719,7 @@ impl UserData for UpdateGroup {
                 req = req.default_cooldown(v);
             }
 
-            req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
+            req.send().await.map_err(|e| sdk_err("update_group", e))?;
 
             respond(&lua, true, Value::Nil)
         });
@@ -580,7 +743,73 @@ struct StartRefreshState {
     skip_matching: Option<bool>,
     auto_rollback: Option<bool>,
     strategy: Option<String>,
+    launch_template: Option<LaunchTemplateSpecification>,
     wait: bool,
+}
+
+/// A validated integer knob, raising at the call rather than at AWS.
+fn ranged(method: &str, v: i32, lo: i32, hi: i32) -> LuaResult<i32> {
+    if !(lo..=hi).contains(&v) {
+        return Err(mlua::Error::runtime(format!(
+            "start_instance_refresh: '{method}' must be between {lo} and {hi}, got {v}"
+        )));
+    }
+    Ok(v)
+}
+
+/// Consecutive polling errors `:wait()` tolerates before raising.
+const POLL_RETRIES: u32 = 3;
+
+/// Poll a refresh until it reaches a terminal state. The first poll is
+/// immediate, and a transient error is retried a few times before it aborts
+/// the wait. `ok` reflects the outcome, per `is_ok`; a failed or cancelled
+/// refresh is an answer, not an error.
+async fn wait_refresh(
+    lua: &Lua,
+    call: &str,
+    client: &Client,
+    group: &str,
+    refresh_id: &str,
+    is_ok: impl Fn(&InstanceRefreshStatus) -> bool,
+) -> LuaResult<MultiValue> {
+    let mut failures = 0;
+    loop {
+        let polled = client
+            .describe_instance_refreshes()
+            .auto_scaling_group_name(group)
+            .instance_refresh_ids(refresh_id)
+            .send()
+            .await;
+        let page = match polled {
+            Ok(p) => {
+                failures = 0;
+                Some(p)
+            }
+            Err(e) => {
+                failures += 1;
+                if failures >= POLL_RETRIES {
+                    return Err(sdk_err(call, e));
+                }
+                None
+            }
+        };
+
+        if let Some(page) = page {
+            let Some(refresh) = page.instance_refreshes.unwrap_or_default().into_iter().next()
+            else {
+                // The refresh is not being reported; nothing left to wait for.
+                return Err(mlua::Error::runtime(format!(
+                    "{call}: refresh '{refresh_id}' on '{group}' disappeared while waiting"
+                )));
+            };
+            if let Some(status) = refresh.status.as_ref().filter(|s| is_terminal(s)) {
+                let ok = is_ok(status);
+                let t = refresh_to_table(lua, refresh)?;
+                return respond(lua, ok, Value::Table(t));
+            }
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Builder for `StartInstanceRefresh`, finalized with `:send()`.
@@ -595,6 +824,7 @@ impl UserData for StartRefresh {
         methods.add_function(
             "min_healthy_percentage",
             |_, (ud, v): (AnyUserData, i32)| {
+                let v = ranged(":min_healthy_percentage()", v, 0, 100)?;
                 ud.borrow::<Self>()?
                     .state
                     .lock()
@@ -607,6 +837,7 @@ impl UserData for StartRefresh {
         methods.add_function(
             "max_healthy_percentage",
             |_, (ud, v): (AnyUserData, i32)| {
+                let v = ranged(":max_healthy_percentage()", v, 100, 200)?;
                 ud.borrow::<Self>()?
                     .state
                     .lock()
@@ -617,32 +848,51 @@ impl UserData for StartRefresh {
         );
 
         // Seconds to wait after an instance reaches InService before counting
-        // it healthy; falls through to the group's own warmup when unset.
+        // it healthy; falls through to the group's own default instance warmup
+        // (or, failing that, its health-check grace period) when unset.
         methods.add_function("instance_warmup", |_, (ud, v): (AnyUserData, i32)| {
+            let v = ranged(":instance_warmup()", v, 0, i32::MAX)?;
             ud.borrow::<Self>()?.state.lock().unwrap().instance_warmup = Some(v);
             Ok(ud)
         });
 
         // Leave instances that already match the desired configuration alone.
-        methods.add_function("skip_matching", |_, ud: AnyUserData| {
-            ud.borrow::<Self>()?.state.lock().unwrap().skip_matching = Some(true);
+        methods.add_function("skip_matching", |_, (ud, on): (AnyUserData, Option<Value>)| {
+            let on = bool_arg("start_instance_refresh", ":skip_matching()", on)?;
+            ud.borrow::<Self>()?.state.lock().unwrap().skip_matching = Some(on);
             Ok(ud)
         });
 
-        methods.add_function("auto_rollback", |_, ud: AnyUserData| {
-            ud.borrow::<Self>()?.state.lock().unwrap().auto_rollback = Some(true);
+        methods.add_function("auto_rollback", |_, (ud, on): (AnyUserData, Option<Value>)| {
+            let on = bool_arg("start_instance_refresh", ":auto_rollback()", on)?;
+            ud.borrow::<Self>()?.state.lock().unwrap().auto_rollback = Some(on);
             Ok(ud)
         });
 
         methods.add_function("strategy", |_, (ud, v): (AnyUserData, String)| {
+            if !RefreshStrategy::values().contains(&v.as_str()) {
+                return Err(mlua::Error::runtime(format!(
+                    "start_instance_refresh: unknown strategy '{v}', expected one of {}",
+                    RefreshStrategy::values().join(", ")
+                )));
+            }
             ud.borrow::<Self>()?.state.lock().unwrap().strategy = Some(v);
+            Ok(ud)
+        });
+
+        // The configuration the refresh rolls the group towards (the launch
+        // template version to converge on), e.g. `{name = "web", version = "$Latest"}`.
+        methods.add_function("launch_template", |_, (ud, v): (AnyUserData, Value)| {
+            let lt = launch_template_arg("start_instance_refresh", v)?;
+            ud.borrow::<Self>()?.state.lock().unwrap().launch_template = Some(lt);
             Ok(ud)
         });
 
         // Poll until the refresh settles, rather than returning the id and
         // leaving the loop to the script.
-        methods.add_function("wait", |_, ud: AnyUserData| {
-            ud.borrow::<Self>()?.state.lock().unwrap().wait = true;
+        methods.add_function("wait", |_, (ud, on): (AnyUserData, Option<Value>)| {
+            let on = bool_arg("start_instance_refresh", ":wait()", on)?;
+            ud.borrow::<Self>()?.state.lock().unwrap().wait = on;
             Ok(ud)
         });
 
@@ -660,20 +910,37 @@ impl UserData for StartRefresh {
                 .start_instance_refresh()
                 .auto_scaling_group_name(&group);
 
-            let prefs = RefreshPreferences::builder()
-                .set_min_healthy_percentage(state.min_healthy_percentage)
-                .set_max_healthy_percentage(state.max_healthy_percentage)
-                .set_instance_warmup(state.instance_warmup)
-                .set_skip_matching(state.skip_matching)
-                .set_auto_rollback(state.auto_rollback)
-                .build();
-            req = req.preferences(prefs);
+            // Empty preferences are not sent at all.
+            if state.min_healthy_percentage.is_some()
+                || state.max_healthy_percentage.is_some()
+                || state.instance_warmup.is_some()
+                || state.skip_matching.is_some()
+                || state.auto_rollback.is_some()
+            {
+                req = req.preferences(
+                    RefreshPreferences::builder()
+                        .set_min_healthy_percentage(state.min_healthy_percentage)
+                        .set_max_healthy_percentage(state.max_healthy_percentage)
+                        .set_instance_warmup(state.instance_warmup)
+                        .set_skip_matching(state.skip_matching)
+                        .set_auto_rollback(state.auto_rollback)
+                        .build(),
+                );
+            }
 
             if let Some(s) = &state.strategy {
                 req = req.strategy(RefreshStrategy::from(s.as_str()));
             }
+            if let Some(lt) = state.launch_template {
+                req = req.desired_configuration(
+                    DesiredConfiguration::builder().launch_template(lt).build(),
+                );
+            }
 
-            let out = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
+            let out = req
+                .send()
+                .await
+                .map_err(|e| sdk_err("start_instance_refresh", e))?;
             let refresh_id = out.instance_refresh_id.unwrap_or_default();
 
             if !state.wait {
@@ -684,44 +951,21 @@ impl UserData for StartRefresh {
 
             // Poll to a terminal state. `sleep` yields, so other tasks — a
             // refresh on another group, say — run while this one waits.
-            loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
-
-                let page = client
-                    .describe_instance_refreshes()
-                    .auto_scaling_group_name(&group)
-                    .instance_refresh_ids(&refresh_id)
-                    .send()
-                    .await
-                    .map_err(|e| lua_err(BoxError::from(e)))?;
-
-                let Some(refresh) = page
-                    .instance_refreshes
-                    .unwrap_or_default()
-                    .into_iter()
-                    .next()
-                else {
-                    // The refresh we just started is not being reported; there
-                    // is nothing left to wait for.
-                    return Err(mlua::Error::runtime(format!(
-                        "start_instance_refresh: refresh '{refresh_id}' on '{group}' \
-                         disappeared while waiting"
-                    )));
-                };
-
-                let terminal = refresh.status.as_ref().is_some_and(is_terminal);
-                if terminal {
-                    // `ok` reflects the outcome: a failed or cancelled refresh
-                    // is a real answer to "how did it go", not an error.
-                    let ok = matches!(
-                        refresh.status,
-                        Some(InstanceRefreshStatus::Successful)
-                            | Some(InstanceRefreshStatus::RollbackSuccessful)
-                    );
-                    let t = refresh_to_table(&lua, refresh)?;
-                    return respond(&lua, ok, Value::Table(t));
-                }
-            }
+            wait_refresh(
+                &lua,
+                "start_instance_refresh",
+                &client,
+                &group,
+                &refresh_id,
+                |s| {
+                    matches!(
+                        s,
+                        InstanceRefreshStatus::Successful
+                            | InstanceRefreshStatus::RollbackSuccessful
+                    )
+                },
+            )
+            .await
         });
     }
 }
@@ -750,14 +994,30 @@ struct RefreshControl {
     client: Client,
     action: RefreshAction,
     group: String,
+    wait: Arc<Mutex<bool>>,
 }
 
 impl UserData for RefreshControl {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // Poll until the refresh reaches a terminal state (see
+        // `start_instance_refresh`'s `:wait()`).
+        methods.add_function("wait", |_, (ud, on): (AnyUserData, Option<Value>)| {
+            let this = ud.borrow::<Self>()?;
+            let on = bool_arg(this.action.name(), ":wait()", on)?;
+            *this.wait.lock().unwrap() = on;
+            drop(this);
+            Ok(ud)
+        });
+
         methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, action, group) = {
+            let (client, action, group, wait) = {
                 let this = ud.borrow::<Self>()?;
-                (this.client.clone(), this.action, this.group.clone())
+                (
+                    this.client.clone(),
+                    this.action,
+                    this.group.clone(),
+                    *this.wait.lock().unwrap(),
+                )
             };
 
             // Both raise when there is no refresh in progress on the group;
@@ -774,7 +1034,7 @@ impl UserData for RefreshControl {
                 RefreshAction::Cancel => {
                     client
                         .cancel_instance_refresh()
-                        .auto_scaling_group_name(group)
+                        .auto_scaling_group_name(&group)
                         .send()
                         .await
                         .map_err(|e| named(BoxError::from(e)))?
@@ -783,13 +1043,24 @@ impl UserData for RefreshControl {
                 RefreshAction::Rollback => {
                     client
                         .rollback_instance_refresh()
-                        .auto_scaling_group_name(group)
+                        .auto_scaling_group_name(&group)
                         .send()
                         .await
                         .map_err(|e| named(BoxError::from(e)))?
                         .instance_refresh_id
                 }
             };
+
+            if wait && let Some(id) = &refresh_id {
+                // The expected terminal state is the one the action asked for.
+                return wait_refresh(&lua, action.name(), &client, &group, id, |s| match action {
+                    RefreshAction::Cancel => matches!(s, InstanceRefreshStatus::Cancelled),
+                    RefreshAction::Rollback => {
+                        matches!(s, InstanceRefreshStatus::RollbackSuccessful)
+                    }
+                })
+                .await;
+            }
 
             let t = lua.create_table()?;
             if let Some(v) = refresh_id {
@@ -837,7 +1108,7 @@ impl UserData for DescribeRefreshes {
             let mut idx = 0;
             let mut stream = req.into_paginator().send();
             while let Some(page) = stream.next().await {
-                let page = page.map_err(|e| lua_err(BoxError::from(e)))?;
+                let page = page.map_err(|e| sdk_err("describe_instance_refreshes", e))?;
                 for refresh in page.instance_refreshes.unwrap_or_default() {
                     idx += 1;
                     out.raw_set(idx, refresh_to_table(&lua, refresh)?)?;
@@ -877,6 +1148,327 @@ fn refresh_to_table(lua: &Lua, refresh: InstanceRefresh) -> LuaResult<Table> {
     if let Some(v) = refresh.end_time.as_ref().and_then(date_to_string) {
         t.raw_set("end_time", v)?;
     }
+    // The configuration the refresh is converging on.
+    if let Some(lt) = refresh.desired_configuration.and_then(|d| d.launch_template) {
+        t.raw_set("launch_template", launch_template_to_table(lua, lt)?)?;
+    }
+
+    Ok(t)
+}
+
+// --- describe_scaling_activities --------------------------------------------
+
+/// Builder for `DescribeScalingActivities`, finalized with `:send()`.
+///
+/// Named by group like every other describe here, but the group is optional:
+/// omitting it is an account-wide read, which is what root-causing a launch
+/// failure across a fleet needs.
+struct DescribeActivities {
+    client: Client,
+    state: Arc<Mutex<DescribeActivitiesState>>,
+}
+
+#[derive(Default, Clone)]
+struct DescribeActivitiesState {
+    group: Option<String>,
+    activity_ids: Vec<String>,
+    include_deleted_groups: bool,
+}
+
+impl UserData for DescribeActivities {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_function("group", |_, (ud, group): (AnyUserData, String)| {
+            ud.borrow::<Self>()?.state.lock().unwrap().group = Some(group);
+            Ok(ud)
+        });
+
+        methods.add_function("id", |_, (ud, id): (AnyUserData, String)| {
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .activity_ids
+                .push(id);
+            Ok(ud)
+        });
+
+        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Value)| {
+            let ids = list_arg("describe_scaling_activities", "':ids()'", ids)?;
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .activity_ids
+                .extend(ids);
+            Ok(ud)
+        });
+
+        // Off by default, matching the API: a deleted group's history is not
+        // what "what happened to my fleet" usually means.
+        methods.add_function(
+            "include_deleted_groups",
+            |_, (ud, on): (AnyUserData, Option<Value>)| {
+                let on = bool_arg(
+                    "describe_scaling_activities",
+                    ":include_deleted_groups()",
+                    on,
+                )?;
+                ud.borrow::<Self>()?
+                    .state
+                    .lock()
+                    .unwrap()
+                    .include_deleted_groups = on;
+                Ok(ud)
+            },
+        );
+
+        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
+            let (client, state) = {
+                let this = ud.borrow::<Self>()?;
+                (this.client.clone(), this.state.lock().unwrap().clone())
+            };
+
+            let mut req = client.describe_scaling_activities();
+            if let Some(group) = state.group {
+                req = req.auto_scaling_group_name(group);
+            }
+            if !state.activity_ids.is_empty() {
+                req = req.set_activity_ids(Some(state.activity_ids));
+            }
+            if state.include_deleted_groups {
+                req = req.include_deleted_groups(true);
+            }
+
+            let out = lua.create_table()?;
+            let mut idx = 0;
+            let mut stream = req.into_paginator().items().send();
+            while let Some(activity) = stream.next().await {
+                let activity = activity.map_err(|e| sdk_err("describe_scaling_activities", e))?;
+                idx += 1;
+                out.raw_set(idx, activity_to_table(&lua, activity)?)?;
+            }
+
+            // Newest first, as the API returns them.
+            respond(&lua, true, Value::Table(out))
+        });
+    }
+}
+
+fn activity_to_table(
+    lua: &Lua,
+    activity: aws_sdk_autoscaling::types::Activity,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+
+    if let Some(v) = activity.activity_id {
+        t.raw_set("activity_id", v)?;
+    }
+    if let Some(v) = activity.auto_scaling_group_name {
+        t.raw_set("group_name", v)?;
+    }
+    if let Some(v) = activity.description {
+        t.raw_set("description", v)?;
+    }
+    if let Some(v) = activity.cause {
+        t.raw_set("cause", v)?;
+    }
+    if let Some(v) = activity.status_code {
+        t.raw_set("status_code", v.as_str().to_string())?;
+    }
+    if let Some(v) = activity.status_message {
+        t.raw_set("status_message", v)?;
+    }
+    if let Some(v) = activity.progress {
+        t.raw_set("progress", v)?;
+    }
+    if let Some(v) = activity.details {
+        t.raw_set("details", v)?;
+    }
+    if let Some(v) = activity.auto_scaling_group_state {
+        t.raw_set("group_state", v)?;
+    }
+    if let Some(v) = activity.start_time.as_ref().and_then(date_to_string) {
+        t.raw_set("start_time", v)?;
+    }
+    if let Some(v) = activity.end_time.as_ref().and_then(date_to_string) {
+        t.raw_set("end_time", v)?;
+    }
+
+    Ok(t)
+}
+
+// --- describe_policies -------------------------------------------------------
+
+/// Builder for `DescribePolicies`, finalized with `:send()`.
+struct DescribePolicies {
+    client: Client,
+    state: Arc<Mutex<DescribePoliciesState>>,
+}
+
+#[derive(Default, Clone)]
+struct DescribePoliciesState {
+    group: Option<String>,
+    policy_names: Vec<String>,
+    policy_types: Vec<String>,
+}
+
+impl UserData for DescribePolicies {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_function("group", |_, (ud, group): (AnyUserData, String)| {
+            ud.borrow::<Self>()?.state.lock().unwrap().group = Some(group);
+            Ok(ud)
+        });
+
+        methods.add_function("name", |_, (ud, names): (AnyUserData, Value)| {
+            let names = list_arg("describe_policies", "':name()'", names)?;
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .policy_names
+                .extend(names);
+            Ok(ud)
+        });
+
+        methods.add_function("policy_type", |_, (ud, types): (AnyUserData, Value)| {
+            let types = list_arg("describe_policies", "':policy_type()'", types)?;
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .policy_types
+                .extend(types);
+            Ok(ud)
+        });
+
+        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
+            let (client, state) = {
+                let this = ud.borrow::<Self>()?;
+                (this.client.clone(), this.state.lock().unwrap().clone())
+            };
+
+            let mut req = client.describe_policies();
+            if let Some(group) = state.group {
+                req = req.auto_scaling_group_name(group);
+            }
+            if !state.policy_names.is_empty() {
+                req = req.set_policy_names(Some(state.policy_names));
+            }
+            if !state.policy_types.is_empty() {
+                req = req.set_policy_types(Some(state.policy_types));
+            }
+
+            let out = lua.create_table()?;
+            let mut idx = 0;
+            let mut stream = req.into_paginator().items().send();
+            while let Some(policy) = stream.next().await {
+                let policy = policy.map_err(|e| sdk_err("describe_policies", e))?;
+                idx += 1;
+                out.raw_set(idx, policy_to_table(&lua, policy)?)?;
+            }
+
+            respond(&lua, true, Value::Table(out))
+        });
+    }
+}
+
+fn policy_to_table(
+    lua: &Lua,
+    policy: aws_sdk_autoscaling::types::ScalingPolicy,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+
+    if let Some(v) = policy.auto_scaling_group_name {
+        t.raw_set("group_name", v)?;
+    }
+    if let Some(v) = policy.policy_name {
+        t.raw_set("name", v)?;
+    }
+    if let Some(v) = policy.policy_arn {
+        t.raw_set("arn", v)?;
+    }
+    if let Some(v) = policy.policy_type {
+        t.raw_set("policy_type", v)?;
+    }
+    if let Some(v) = policy.adjustment_type {
+        t.raw_set("adjustment_type", v)?;
+    }
+    if let Some(v) = policy.scaling_adjustment {
+        t.raw_set("scaling_adjustment", v)?;
+    }
+    if let Some(v) = policy.min_adjustment_magnitude {
+        t.raw_set("min_adjustment_magnitude", v)?;
+    }
+    if let Some(v) = policy.cooldown {
+        t.raw_set("cooldown", v)?;
+    }
+    if let Some(v) = policy.estimated_instance_warmup {
+        t.raw_set("estimated_instance_warmup", v)?;
+    }
+    if let Some(v) = policy.enabled {
+        t.raw_set("enabled", v)?;
+    }
+    if let Some(v) = policy.metric_aggregation_type {
+        t.raw_set("metric_aggregation_type", v)?;
+    }
+
+    // Step policies: one row per step; absent bounds are open-ended.
+    let steps = lua.create_table()?;
+    for (idx, s) in policy
+        .step_adjustments
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        let st = lua.create_table()?;
+        if let Some(v) = s.metric_interval_lower_bound {
+            st.raw_set("metric_interval_lower_bound", v)?;
+        }
+        if let Some(v) = s.metric_interval_upper_bound {
+            st.raw_set("metric_interval_upper_bound", v)?;
+        }
+        if let Some(v) = s.scaling_adjustment {
+            st.raw_set("scaling_adjustment", v)?;
+        }
+        steps.raw_set(idx + 1, st)?;
+    }
+    t.raw_set("step_adjustments", steps)?;
+
+    // Target tracking: the target and the metric it tracks.
+    if let Some(tt) = policy.target_tracking_configuration {
+        let c = lua.create_table()?;
+        if let Some(v) = tt.target_value {
+            c.raw_set("target_value", v)?;
+        }
+        if let Some(v) = tt.disable_scale_in {
+            c.raw_set("disable_scale_in", v)?;
+        }
+        if let Some(p) = tt.predefined_metric_specification {
+            if let Some(m) = p.predefined_metric_type {
+                c.raw_set("predefined_metric_type", m.as_str())?;
+            }
+            if let Some(v) = p.resource_label {
+                c.raw_set("resource_label", v)?;
+            }
+        }
+        t.raw_set("target_tracking", c)?;
+    }
+
+    // The alarms that drive the policy, flattened to what a script actually
+    // wants to correlate against: name and ARN, nothing about their state
+    // (that lives in CloudWatch, not here).
+    let alarms = lua.create_table()?;
+    for (idx, alarm) in policy.alarms.unwrap_or_default().into_iter().enumerate() {
+        let a = lua.create_table()?;
+        if let Some(v) = alarm.alarm_name {
+            a.raw_set("name", v)?;
+        }
+        if let Some(v) = alarm.alarm_arn {
+            a.raw_set("arn", v)?;
+        }
+        alarms.raw_set(idx + 1, a)?;
+    }
+    t.raw_set("alarms", alarms)?;
 
     Ok(t)
 }
@@ -933,9 +1525,9 @@ struct TagWrite {
 ///
 /// Bare is true: reaching for the method at all is asking for propagation, and a
 /// caller who wants it off simply does not call it (or says so explicitly, which
-/// stays readable next to a conditional).
-fn propagate_arg(on: Option<bool>) -> bool {
-    on.unwrap_or(true)
+/// stays readable next to a conditional). Anything but a boolean raises.
+fn propagate_arg(on: Option<Value>) -> LuaResult<bool> {
+    bool_arg("create_or_update_tags", ":propagate_at_launch()", on)
 }
 
 /// Read a `:tags()` argument into entries, per the action's accepted shapes.
@@ -999,8 +1591,12 @@ fn tags_from_value(action: TagAction, value: Value) -> LuaResult<Vec<TagEntry>> 
                 )));
             }
         };
+        // Numbers and booleans are coerced, as `aws.ec2`'s tag writers do.
         let value = match v {
             Value::String(s) => s.to_str()?.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Boolean(b) => b.to_string(),
             other => {
                 return Err(mlua::Error::runtime(format!(
                     "{}: tag value for {key:?} must be a string, got {}",
@@ -1033,7 +1629,7 @@ impl UserData for TagWrite {
         // all is asking for propagation.
         methods.add_function(
             "propagate_at_launch",
-            |_, (ud, on): (AnyUserData, Option<bool>)| {
+            |_, (ud, on): (AnyUserData, Option<Value>)| {
                 {
                     let this = ud.borrow::<Self>()?;
                     if this.action == TagAction::Delete {
@@ -1042,7 +1638,7 @@ impl UserData for TagWrite {
                              'create_or_update_tags'; a delete removes the tag either way",
                         ));
                     }
-                    this.state.lock().unwrap().propagate_at_launch = propagate_arg(on);
+                    this.state.lock().unwrap().propagate_at_launch = propagate_arg(on)?;
                 }
                 Ok(ud)
             },
@@ -1164,7 +1760,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
                 // Optional: no ids means every instance in the account.
                 let ids = match ids {
                     Value::Nil => Vec::new(),
-                    other => value_to_string_list(other)?,
+                    other => list_arg("describe_instances", "instance ids", other)?,
                 };
                 Ok(DescribeInstances {
                     client: c.autoscaling().await,
@@ -1180,6 +1776,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, (group, capacity): (String, i32)| {
             let c = c.clone();
             async move {
+                let group = group_arg("set_desired_capacity", group)?;
                 Ok(SetDesiredCapacity {
                     client: c.autoscaling().await,
                     group,
@@ -1196,6 +1793,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, group: String| {
             let c = c.clone();
             async move {
+                let group = group_arg("update_group", group)?;
                 Ok(UpdateGroup {
                     client: c.autoscaling().await,
                     group,
@@ -1211,6 +1809,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, group: String| {
             let c = c.clone();
             async move {
+                let group = group_arg("start_instance_refresh", group)?;
                 Ok(StartRefresh {
                     client: c.autoscaling().await,
                     group,
@@ -1226,10 +1825,39 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, group: String| {
             let c = c.clone();
             async move {
+                let group = group_arg("describe_instance_refreshes", group)?;
                 Ok(DescribeRefreshes {
                     client: c.autoscaling().await,
                     group,
                     ids: Arc::new(Mutex::new(Vec::new())),
+                })
+            }
+        })?,
+    )?;
+
+    let c = source.clone();
+    exports.raw_set(
+        "describe_scaling_activities",
+        lua.create_async_function(move |_, ()| {
+            let c = c.clone();
+            async move {
+                Ok(DescribeActivities {
+                    client: c.autoscaling().await,
+                    state: Arc::new(Mutex::new(DescribeActivitiesState::default())),
+                })
+            }
+        })?,
+    )?;
+
+    let c = source.clone();
+    exports.raw_set(
+        "describe_policies",
+        lua.create_async_function(move |_, ()| {
+            let c = c.clone();
+            async move {
+                Ok(DescribePolicies {
+                    client: c.autoscaling().await,
+                    state: Arc::new(Mutex::new(DescribePoliciesState::default())),
                 })
             }
         })?,
@@ -1247,6 +1875,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
             lua.create_async_function(move |_, group: String| {
                 let c = c.clone();
                 async move {
+                    let group = group_arg(action.name(), group)?;
                     Ok(TagWrite {
                         client: c.autoscaling().await,
                         action,
@@ -1268,10 +1897,12 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
             lua.create_async_function(move |_, group: String| {
                 let c = c.clone();
                 async move {
+                    let group = group_arg(action.name(), group)?;
                     Ok(RefreshControl {
                         client: c.autoscaling().await,
                         action,
                         group,
+                        wait: Arc::new(Mutex::new(false)),
                     })
                 }
             })?,
@@ -1574,8 +2205,57 @@ mod tests {
         // Never called: the request carries `false`.
         assert!(!TagWriteState::default().propagate_at_launch);
         // Called bare, and called explicitly either way.
-        assert!(propagate_arg(None));
-        assert!(propagate_arg(Some(true)));
-        assert!(!propagate_arg(Some(false)));
+        assert!(propagate_arg(None).unwrap());
+        assert!(propagate_arg(Some(Value::Boolean(true))).unwrap());
+        assert!(!propagate_arg(Some(Value::Boolean(false))).unwrap());
+        // Truthiness is not accepted.
+        assert!(propagate_arg(Some(Value::Integer(0))).is_err());
+    }
+
+    #[test]
+    fn empty_lists_raise() {
+        let lua = Lua::new();
+        let empty = Value::Table(lua.create_table().unwrap());
+        let err = list_arg("describe_groups", "':name()'", empty)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("describe_groups") && err.contains("empty list"), "{err}");
+        let one = Value::String(lua.create_string("a").unwrap());
+        assert_eq!(list_arg("f", "x", one).unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn group_names_must_not_be_empty() {
+        assert!(group_arg("update_group", String::new()).is_err());
+        assert_eq!(group_arg("update_group", "g".into()).unwrap(), "g");
+    }
+
+    #[test]
+    fn launch_template_needs_exactly_one_identifier() {
+        let lua = Lua::new();
+        let ok: Value = lua.load(r#"return {name = "web", version = "$Latest"}"#).eval().unwrap();
+        let spec = launch_template_arg("f", ok).unwrap();
+        assert_eq!(spec.launch_template_name.as_deref(), Some("web"));
+        assert_eq!(spec.version.as_deref(), Some("$Latest"));
+        for bad in [r#"{version = "1"}"#, r#"{id = "lt-1", name = "web"}"#, r#""web""#] {
+            let v: Value = lua.load(format!("return {bad}")).eval().unwrap();
+            assert!(launch_template_arg("f", v).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn refresh_knobs_are_range_checked() {
+        assert!(ranged(":x", 90, 0, 100).is_ok());
+        assert!(ranged(":x", 101, 0, 100).is_err());
+        assert!(ranged(":x", 99, 100, 200).is_err());
+    }
+
+    #[test]
+    fn tag_values_are_coerced_like_ec2() {
+        let lua = Lua::new();
+        let t: Value = lua.load(r#"return {Count = 3, On = true}"#).eval().unwrap();
+        let tags = tags_from_value(TagAction::CreateOrUpdate, t).unwrap();
+        assert_eq!(tags[0].value.as_deref(), Some("3"));
+        assert_eq!(tags[1].value.as_deref(), Some("true"));
     }
 }

@@ -10,12 +10,10 @@ use std::process::{Command, Stdio};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Group {
-    /// The per-program overview chapters (`iq`, `ied`, `ito`, `irun`).
+    /// The per-program overview chapters (`ied`, `ito`).
     ///
-    /// Every program with a `--doc` embeds all of them, so the book is the same
-    /// everywhere; only which one a bare `--doc` opens with differs. `irun` has
-    /// a chapter but no `--doc` to print it — it parses no flags at all — so its
-    /// page is reached as `ito --doc irun`.
+    /// Every program embeds all of them, so the book is the same everywhere;
+    /// only which one a bare `--doc` opens with differs.
     Program,
     Module,
     Language,
@@ -25,7 +23,7 @@ pub enum Group {
 pub struct Topic {
     /// CLI key, e.g. "fs".
     pub name: &'static str,
-    /// Human title, e.g. "fs — virtual filesystem".
+    /// Human title, e.g. "fs — files and directories".
     pub title: &'static str,
     pub group: Group,
     /// The embedded chapter markdown.
@@ -34,14 +32,8 @@ pub struct Topic {
 
 pub static TOPICS: &[Topic] = &[
     Topic {
-        name: "iq",
-        title: "iq — query structured files",
-        group: Group::Program,
-        body: include_str!("../docs/src/binaries/iq.md"),
-    },
-    Topic {
         name: "ied",
-        title: "ied — edit files in a sandbox",
+        title: "ied — reproducible file edits",
         group: Group::Program,
         body: include_str!("../docs/src/binaries/ied.md"),
     },
@@ -52,10 +44,10 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/binaries/ito.md"),
     },
     Topic {
-        name: "irun",
-        title: "irun — scripts as programs",
-        group: Group::Program,
-        body: include_str!("../docs/src/binaries/irun.md"),
+        name: "fmt",
+        title: "fmt — colours, text, tables",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/fmt.md"),
     },
     Topic {
         name: "string",
@@ -70,14 +62,8 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/modules/table.md"),
     },
     Topic {
-        name: "tablefmt",
-        title: "tablefmt — render tables",
-        group: Group::Module,
-        body: include_str!("../docs/src/modules/tablefmt.md"),
-    },
-    Topic {
         name: "fs",
-        title: "fs — virtual filesystem",
+        title: "fs — files and directories",
         group: Group::Module,
         body: include_str!("../docs/src/modules/fs.md"),
     },
@@ -172,6 +158,18 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/modules/aws-autoscaling.md"),
     },
     Topic {
+        name: "aws.cloudtrail",
+        title: "aws.cloudtrail — AWS CloudTrail",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/aws-cloudtrail.md"),
+    },
+    Topic {
+        name: "aws.cloudwatch",
+        title: "aws.cloudwatch — AWS CloudWatch",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/aws-cloudwatch.md"),
+    },
+    Topic {
         name: "task",
         title: "task — concurrent tasks",
         group: Group::Module,
@@ -194,7 +192,7 @@ pub static TOPICS: &[Topic] = &[
     // is far more likely to want.
     Topic {
         name: "ito-module",
-        title: "ito-module — the version guard, import anchors, and the null sentinel",
+        title: "ito-module — the version guard and slug",
         group: Group::Module,
         body: include_str!("../docs/src/modules/ito.md"),
     },
@@ -205,6 +203,18 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/modules/hash.md"),
     },
     Topic {
+        name: "encoding",
+        title: "encoding — binary-to-text encodings",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/encoding.md"),
+    },
+    Topic {
+        name: "ansible",
+        title: "ansible — Ansible Vault",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/ansible.md"),
+    },
+    Topic {
         name: "log",
         title: "log — logging",
         group: Group::Module,
@@ -212,7 +222,7 @@ pub static TOPICS: &[Topic] = &[
     },
     Topic {
         name: "io",
-        title: "io — raw stream writes",
+        title: "io — raw stream access",
         group: Group::Module,
         body: include_str!("../docs/src/modules/io.md"),
     },

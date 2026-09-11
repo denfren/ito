@@ -9,13 +9,13 @@
 //! That is the whole difference from the rooted VFS in [`super::vfs`]: for any
 //! path the VFS would have accepted, this resolves to the same file. Escapes
 //! are the only behavioural delta — which is why the two live side by side
-//! rather than sharing a flag. `iq`/`ied` keep the rooted namespace, where a
+//! rather than sharing a flag. `ied` keep the rooted namespace, where a
 //! `--diff` preview can promise a boundary; `ito` already spawns processes and
 //! opens sockets, so a filesystem boundary would be a pretence.
 //!
 //! `fs.cwd()` reports that work directory, absolute. It exists only here: the
 //! rooted VFS resolves against a root the script is not meant to locate on the
-//! host, so leaking the path there would hand an `iq`/`ied` script something its
+//! host, so leaking the path there would hand an `ied` script something its
 //! own `fs` cannot act on.
 //!
 //! `fs.canonicalize(path)` is its counterpart and host-only for the same
@@ -40,7 +40,7 @@
 //! the content argument is for.
 //!
 //! Writes land immediately (there is nothing to preview and nothing to flush),
-//! and the operations that have no previewable form — `fs.mkdir`, `fs.rmdir`,
+//! and the operations that have no previewable form — `fs.mkdir`, `fs.remove_all`,
 //! `fs.rename`, `fs.copy`, `fs.symlink` — live here rather than in the VFS. They
 //! earn their place from `proc`: a child process needs a directory to be there
 //! *before* it runs, and shelling out to `mkdir` to get one would be a poor
@@ -85,7 +85,7 @@
 //! terminates.
 
 use crate::scripting::finder;
-use crate::scripting::vfs::{remove_now, write_now};
+use crate::scripting::vfs::{remove_now, stat_table, write_now};
 use globset::{Glob, GlobBuilder, GlobMatcher};
 use mlua::{Lua, Table, UserData, UserDataMethods};
 use std::path::{Path, PathBuf};
@@ -146,6 +146,7 @@ fn absolutize(path: &Path) -> PathBuf {
 /// The absolute form stays the internal representation regardless: globs match
 /// against the reported path but the walk itself, and the symlink-cycle checks,
 /// work in real absolute locations. Only the rendering on the way back is short.
+#[derive(Clone)]
 struct OutStyle {
     /// The start directory exactly as the script spelled it, minus a trailing
     /// slash, or `None` when it was already absolute (nothing to re-prefix).
@@ -413,8 +414,9 @@ impl finder::Source for HostSource {
         self.start.clone()
     }
 
-    fn render(&self, path: &Path) -> Option<String> {
-        Some(self.out.render(path))
+    fn renderer(&self) -> finder::Renderer {
+        let out = self.out.clone();
+        std::sync::Arc::new(move |path| Some(out.render(path)))
     }
 }
 
@@ -523,11 +525,12 @@ pub fn register(lua: &Lua) -> Result<()> {
     // gives absolute paths.
     module.set(
         "list",
-        lua.create_function(|_, dir: String| -> Result<Vec<String>> {
+        lua.create_function(|_, dir: Option<String>| -> Result<Vec<String>> {
+            let dir = dir.unwrap_or_else(|| ".".into());
             let abs = absolutize(Path::new(&dir));
             let style = OutStyle::new(&dir, abs.clone());
             let entries = std::fs::read_dir(&abs)
-                .map_err(|e| mlua::Error::runtime(format!("list {}: {e}", abs.display())))?;
+                .map_err(|e| mlua::Error::runtime(format!("list {dir}: {e}")))?;
             let mut out: Vec<String> = Vec::new();
             for entry in entries.flatten() {
                 out.push(style.render(&entry.path()));
@@ -545,6 +548,11 @@ pub fn register(lua: &Lua) -> Result<()> {
         lua.create_function(|lua, dir: Option<String>| -> Result<Vec<Table>> {
             let given = dir.as_deref().unwrap_or(".");
             let start = absolutize(Path::new(given));
+            if !start.is_dir() {
+                return Err(mlua::Error::runtime(format!(
+                    "walk {given}: no such directory"
+                )));
+            }
             let style = OutStyle::new(given, start.clone());
             let mut steps: Vec<WalkStep> = Vec::new();
             let mut ancestors: Vec<PathBuf> =
@@ -574,15 +582,32 @@ pub fn register(lua: &Lua) -> Result<()> {
     module.set(
         "glob",
         lua.create_function(|_, pattern: String| -> Result<Vec<String>> {
-            let pattern_abs = absolutize(Path::new(&pattern));
-            let matcher = build_matcher(&pattern_abs.to_string_lossy())?;
-            let start = absolutize(Path::new("."));
-            // The work directory is the walk root either way; only the spelling
-            // of the answer follows the pattern.
+            // The walk starts at the pattern's literal prefix (every leading
+            // component up to the first one holding a metacharacter, the last
+            // component excluded), so absolute and `../` patterns work and
+            // only that subtree is read. The prefix is glob-escaped, so a
+            // metacharacter in a directory name stays literal.
+            let comps: Vec<&str> = pattern.split('/').collect();
+            let lit = comps[..comps.len() - 1]
+                .iter()
+                .take_while(|c| !c.contains(['*', '?', '[', ']', '{', '}', '\\']))
+                .count();
+            let prefix = comps[..lit].join("/");
+            let rest = comps[lit..].join("/");
+            let given = if prefix.is_empty() && !pattern.starts_with('/') {
+                "."
+            } else if prefix.is_empty() {
+                "/"
+            } else {
+                &prefix
+            };
+            let start = absolutize(Path::new(given));
+            let esc = globset::escape(&start.to_string_lossy());
+            let matcher = build_matcher(&format!("{}/{rest}", esc.trim_end_matches('/')))?;
             let style = if Path::new(&pattern).is_absolute() {
                 OutStyle::absolute()
             } else {
-                OutStyle::new(".", start.clone())
+                OutStyle::new(given, start.clone())
             };
             let mut files: Vec<PathBuf> = Vec::new();
             let mut ancestors: Vec<PathBuf> =
@@ -623,20 +648,102 @@ pub fn register(lua: &Lua) -> Result<()> {
     // fs.read(path) -> String
     module.set(
         "read",
-        lua.create_function(|_, path: String| -> Result<String> {
-            std::fs::read_to_string(&path)
-                .map_err(|e| mlua::Error::runtime(format!("read {path}: {e}")))
+        lua.create_function(|lua, path: String| -> Result<mlua::LuaString> {
+            // Bytes, not text: a Luau string holds any byte sequence.
+            let bytes = std::fs::read(&path)
+                .map_err(|e| mlua::Error::runtime(format!("read {path}: {e}")))?;
+            lua.create_string(bytes)
         })?,
     )?;
 
     // fs.write(path, content)
-    // Written now, parents created now.
+    // Written now, parents created now. `content` is bytes.
     module.set(
         "write",
-        lua.create_function(|_, (path, content): (String, String)| -> Result<()> {
-            write_now(Path::new(&path), &content).map_err(mlua::Error::runtime)
+        lua.create_function(|_, (path, content): (String, mlua::LuaString)| -> Result<()> {
+            write_now(Path::new(&path), &content.as_bytes(), &path).map_err(mlua::Error::runtime)
         })?,
     )?;
+
+    // fs.append(path, content)
+    // Appended now, creating the file (and parents) if absent.
+    module.set(
+        "append",
+        lua.create_function(|_, (path, content): (String, mlua::LuaString)| -> Result<()> {
+            use std::io::Write;
+            if let Some(parent) = Path::new(&path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| mlua::Error::runtime(format!("append {path}: {e}")))?;
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(&content.as_bytes()))
+                .map_err(|e| mlua::Error::runtime(format!("append {path}: {e}")))
+        })?,
+    )?;
+
+    // fs.stat(path) -> {kind, size, mtime, mode} | nil
+    // `nil` if absent. Follows links; `kind` is "file", "dir" or "other".
+    module.set(
+        "stat",
+        lua.create_function(|lua, path: String| -> Result<Option<Table>> {
+            stat_table(lua, Path::new(&path))
+        })?,
+    )?;
+
+    // fs.chmod(path, mode)
+    // Sets the permission bits (an integer, e.g. `0x1ED` for 0755; Luau has no
+    // octal literal). Unix-only, like `fs.symlink`.
+    #[cfg(unix)]
+    module.set(
+        "chmod",
+        lua.create_function(|_, (path, mode): (String, u32)| -> Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| mlua::Error::runtime(format!("chmod {path}: {e}")))
+        })?,
+    )?;
+
+    // fs.temp_dir([prefix]) / fs.temp_file([prefix]) -> String
+    // Creates a fresh, uniquely named directory (or empty file) in the system
+    // temp directory and returns its absolute path. Nothing removes it: that
+    // is the script's to do (`fs.remove_all` / `fs.remove`).
+    for (name, is_dir) in [("temp_dir", true), ("temp_file", false)] {
+        module.set(
+            name,
+            lua.create_function(move |_, prefix: Option<String>| -> Result<String> {
+                let prefix = prefix.unwrap_or_else(|| "ito".into());
+                if prefix.contains(['/', '\\']) {
+                    return Err(mlua::Error::runtime(format!(
+                        "{name}: prefix must not contain a path separator"
+                    )));
+                }
+                for _ in 0..100 {
+                    let p = std::env::temp_dir()
+                        .join(format!("{prefix}-{:016x}", rand::random::<u64>()));
+                    let made = if is_dir {
+                        std::fs::create_dir(&p)
+                    } else {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&p)
+                            .map(|_| ())
+                    };
+                    match made {
+                        Ok(()) => return Ok(p.to_string_lossy().into_owned()),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(mlua::Error::runtime(format!("{name}: {e}"))),
+                    }
+                }
+                Err(mlua::Error::runtime(format!("{name}: no unused name found")))
+            })?,
+        )?;
+    }
 
     // fs.write_new(path[, content]) -> bool
     // Create `path` only if it does not exist, atomically: `O_CREAT|O_EXCL`,
@@ -667,7 +774,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     module.set(
         "write_new",
         lua.create_function(
-            |_, (path, content): (String, Option<String>)| -> Result<bool> {
+            |_, (path, content): (String, Option<mlua::LuaString>)| -> Result<bool> {
                 let p = Path::new(&path);
                 if let Some(parent) = p.parent()
                     && !parent.as_os_str().is_empty()
@@ -683,7 +790,8 @@ pub fn register(lua: &Lua) -> Result<()> {
                 {
                     Ok(mut f) => {
                         use std::io::Write;
-                        f.write_all(content.unwrap_or_default().as_bytes())
+                        let bytes = content.as_ref().map(|c| c.as_bytes());
+                        f.write_all(bytes.as_deref().unwrap_or_default())
                             .map_err(|e| mlua::Error::runtime(format!("write_new {path}: {e}")))?;
                         Ok(true)
                     }
@@ -713,7 +821,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     module.set(
         "remove",
         lua.create_function(|_, path: String| -> Result<()> {
-            remove_now(Path::new(&path)).map_err(mlua::Error::runtime)
+            remove_now(Path::new(&path), &path).map_err(mlua::Error::runtime)
         })?,
     )?;
 
@@ -728,32 +836,56 @@ pub fn register(lua: &Lua) -> Result<()> {
         })?,
     )?;
 
-    // fs.rmdir(path)
-    // Removes a directory and everything under it. An absent path is a
-    // no-op, matching `fs.remove`.
+    // fs.remove_all(path)
+    // `rm -rf`: removes a directory and everything under it (or a file). An
+    // absent path is a no-op, matching `fs.remove`. A symlink is unlinked, not
+    // followed.
     module.set(
-        "rmdir",
+        "remove_all",
         lua.create_function(|_, path: String| -> Result<()> {
-            match std::fs::remove_dir_all(&path) {
+            let p = Path::new(&path);
+            let res = match p.symlink_metadata() {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+                Ok(_) => std::fs::remove_file(p),
+                Err(e) => Err(e),
+            };
+            match res {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(mlua::Error::runtime(format!("rmdir {path}: {e}"))),
+                Err(e) => Err(mlua::Error::runtime(format!("remove_all {path}: {e}"))),
             }
         })?,
     )?;
 
     // fs.rename(from, to)
-    // Parents of `to` are created, as `fs.write` would.
+    // Parents of `to` are created, as `fs.write` would. Across filesystems
+    // (where `rename(2)` fails with EXDEV) it falls back to copy + remove.
     module.set(
         "rename",
         lua.create_function(|_, (from, to): (String, String)| -> Result<()> {
-            if let Some(parent) = Path::new(&to).parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    mlua::Error::runtime(format!("mkdir {}: {e}", parent.display()))
-                })?;
+            if let Some(parent) = Path::new(&to).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| mlua::Error::runtime(format!("mkdir for {to}: {e}")))?;
             }
-            std::fs::rename(&from, &to)
-                .map_err(|e| mlua::Error::runtime(format!("rename {from} -> {to}: {e}")))
+            match std::fs::rename(&from, &to) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                    let (f, t) = (Path::new(&from), Path::new(&to));
+                    let res = if f.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                        copy_tree(f, t).and_then(|()| {
+                            std::fs::remove_dir_all(f).map_err(|e| format!("remove {from}: {e}"))
+                        })
+                    } else {
+                        std::fs::copy(f, t)
+                            .and_then(|_| std::fs::remove_file(f))
+                            .map_err(|e| format!("{e}"))
+                    };
+                    res.map_err(|e| mlua::Error::runtime(format!("rename {from} -> {to}: {e}")))
+                }
+                Err(e) => Err(mlua::Error::runtime(format!("rename {from} -> {to}: {e}"))),
+            }
         })?,
     )?;
 
@@ -766,10 +898,17 @@ pub fn register(lua: &Lua) -> Result<()> {
         "copy",
         lua.create_function(|_, (from, to): (String, String)| -> Result<()> {
             let (from_abs, to_abs) = (absolutize(Path::new(&from)), absolutize(Path::new(&to)));
+            // Copying a file onto itself would truncate it (`open` then copy).
+            if matches!((from_abs.canonicalize(), to_abs.canonicalize()),
+                (Ok(a), Ok(b)) if a == b)
+            {
+                return Err(mlua::Error::runtime(format!(
+                    "copy {from} -> {to}: source and destination are the same"
+                )));
+            }
             if let Some(parent) = to_abs.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    mlua::Error::runtime(format!("mkdir {}: {e}", parent.display()))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| mlua::Error::runtime(format!("mkdir for {to}: {e}")))?;
             }
             // `metadata` follows the link, so a symlinked directory copies
             // as the tree it points at.
@@ -782,20 +921,14 @@ pub fn register(lua: &Lua) -> Result<()> {
                 // keeps finding more to copy. Refuse rather than run away.
                 if to_abs.starts_with(&from_abs) {
                     return Err(mlua::Error::runtime(format!(
-                        "copy {} -> {}: destination is inside the source",
-                        from_abs.display(),
-                        to_abs.display()
+                        "copy {from} -> {to}: destination is inside the source"
                     )));
                 }
                 copy_tree(&from_abs, &to_abs).map_err(mlua::Error::runtime)
             } else {
-                std::fs::copy(&from_abs, &to_abs).map(|_| ()).map_err(|e| {
-                    mlua::Error::runtime(format!(
-                        "copy {} -> {}: {e}",
-                        from_abs.display(),
-                        to_abs.display()
-                    ))
-                })
+                std::fs::copy(&from_abs, &to_abs)
+                    .map(|_| ())
+                    .map_err(|e| mlua::Error::runtime(format!("copy {from} -> {to}: {e}")))
             }
         })?,
     )?;

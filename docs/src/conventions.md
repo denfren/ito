@@ -4,7 +4,16 @@ ito's stdlib follows one consistent convention beyond what Luau itself
 provides: **fluent builders use a `with_*` prefix**. Each `with_*`
 method mutates the builder and returns the same handle, so a whole
 object reads as a single chain, finished by a **terminal** call that is
-*not* `with_*` (e.g. `.to_string()`, `.run()`, `.template(...)`).
+*not* `with_*` (e.g. `.to_string()`, `.run()`, `.send()`, `.interact()`).
+
+A builder with a uniform set of setters may use unprefixed names instead
+(`proc.command(...):arg(...):stdout(...):run()`, `fmt.table.new(...):rows(...):to_string()`,
+`ui.prompt.input_builder():prompt(...):interact()`). The shape is the same:
+constructor, chainable configuration, terminal. Each module chapter's
+`## Conventions` says whether a setter mutates a shared handle (the
+common case: `hcl`, `proc`, `j2`, `ui.prompt`, `fmt.table`) or returns a
+**new** builder and leaves the base unchanged (`encoding.base64.engine`),
+and whether validation happens at the setter or at the terminal.
 
 Luau strings are immutable values, so every ito string function is
 already pure — there is nothing to mutate in place. See

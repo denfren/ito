@@ -5,18 +5,15 @@
 //! script may reach. Everything else is the same code on every path.
 //!
 //! ```ignore
-//! // bin/iq.rs -- the whole binary, minus the early-exit `let else`s
+//! // bin/ito.rs -- the whole binary, minus the early-exit `let else`s
 //! let startup = Startup::begin(cli.common)?;          // -v, -C
-//! let script = startup.script()?;                     // SCRIPT / - / -s
-//! let input = startup.input(..)?;                     // INPUT / - / nothing
-//! let engine = Engine::build(&script, Config::iq(cli.filesystem, cli.quiet, input, argv))?;
-//! let answer = engine.eval(&script).await?;           // chunk, then main()
-//! emit_returned(&answer, &script, "iq", cli.quiet)?;   // return value IS output
+//! let script = startup.script()?;                     // SCRIPT
+//! let engine = Engine::build(&script, Config::ito(argv))?;
+//! engine.eval(&script).await?;                        // chunk, then main()
 //! ```
 //!
 //! `ied` and `ito` differ only in which [`Config`] constructor they name; `ied`
-//! additionally ends with `emit_reports` + `flush_writes`, and `irun` reuses
-//! `Config::ito` verbatim.
+//! additionally ends with `emit_reports` + `flush_writes`.
 //!
 //! Two orderings are load-bearing and both are enforced rather than documented:
 //! registration order lives inside [`Engine::build`], which is the only way to
@@ -27,7 +24,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::cli::{CommonArgs, LoadedScript, ReportArgs};
+use crate::cli::{CommonArgs, ReportArgs};
 
 use crate::scripting::{self as sl, Argv, Vfs};
 
@@ -107,11 +104,11 @@ impl Outcome {
 /// with `call_async` requires one.
 ///
 /// There is no built-in reaction to SIGINT (or any other signal) here: under
-/// `ito`/`irun`, `proc.trap` is the one place a script opts into handling a
+/// `ito`, `proc.trap` is the one place a script opts into handling a
 /// signal, and a signal nothing trapped keeps its default disposition (SIGINT
 /// terminates, as it always did) rather than this function racing the body
-/// against it. `iq`/`ied` register no traps and see the same default behaviour
-/// they always did.
+/// against it. `ied` registers no traps and sees the same default behaviour
+/// it always did.
 pub fn main_with<F>(body: F) -> !
 where
     F: AsyncFnOnce() -> Result<Outcome, RunError>,
@@ -155,7 +152,7 @@ where
 pub struct Startup {
     common: CommonArgs,
     invocation_dir: PathBuf,
-    /// The `-C`-resolved working directory: the `fs` root under `iq`/`ied`, and
+    /// The `-C`-resolved working directory: the `fs` root under `ied`, and
     /// the directory relative paths resolve against under `ito`, whose `fs` has
     /// no root.
     pub working_dir: PathBuf,
@@ -179,8 +176,8 @@ pub fn handle_info_flags(common: &CommonArgs, command: clap::Command) -> Result<
         } else {
             Some(topic.as_str())
         };
-        // The program name picks the default chapter, so `iq --doc` opens on
-        // `iq` while still carrying every other topic.
+        // The program name picks the default chapter, so `ied --doc` opens on
+        // `ied` while still carrying every other topic.
         crate::help::doc(
             command.get_name(),
             topic,
@@ -235,66 +232,19 @@ impl Startup {
     /// Returns `None` when there is no `SCRIPT` and nothing to run — the bare
     /// invocation, which prints the scripts it can find and exits.
     pub fn script(&self) -> Result<Option<Script>, RunError> {
-        let Some(arg) = self.common.script.clone() else {
+        let Some(arg) = self.common.script() else {
             tracing::debug!("No script specified");
             list_available_scripts(&self.working_dir, &self.program_name());
             return Ok(None);
         };
 
-        // `require_root` is the confinement boundary for `require` (see
-        // `scripting::require`), independent of the `fs` root. It is anchored to
-        // the invocation directory for the same reason `SCRIPT` is.
-        let require_root = self
-            .common
-            .require_root
-            .as_ref()
-            .map(|r| self.invocation_dir.join(r));
-
-        if self.common.inline {
-            return Ok(Some(Script::inline(arg, require_root, &self.working_dir)));
-        }
-        if arg == "-" {
-            tracing::trace!("Read from STDIN");
-            return Ok(Some(Script::stdin(require_root, &self.working_dir)?));
-        }
-
-        // A file already has a root: its own directory. Accepting `-r` too would
-        // silently mean one of two different things, so it is refused.
-        if require_root.is_some() {
-            return Err(
-                "-r/--require applies to stdin and -s scripts; a SCRIPT file \
-                        imports relative to its own directory"
-                    .to_string()
-                    .into(),
-            );
-        }
         // Resolved against the invocation cwd, before `-C` took effect, so the
         // absolute path survives the chdir.
-        let path = self.invocation_dir.join(&arg);
+        let path = self.invocation_dir.join(arg);
         if !path.is_file() {
             return Err(format!("no script at '{}'", path.display()).into());
         }
         Ok(Some(Script::file(&path, &self.working_dir)?))
-    }
-
-    /// Read the `INPUT` positional: a file path, or `-` for stdin.
-    ///
-    /// Resolved against the invocation directory like `SCRIPT`, so `-C` moving
-    /// the `fs` root does not move the data out from under a relative path.
-    pub fn input(&self, arg: Option<&str>) -> Result<Option<String>, RunError> {
-        let Some(arg) = arg else { return Ok(None) };
-        if arg == "-" {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| format!("read input from stdin: {e}"))?;
-            return Ok(Some(buf));
-        }
-        let path = self.invocation_dir.join(arg);
-        std::fs::read_to_string(&path)
-            .map(Some)
-            .map_err(|e| format!("read input {}: {e}", path.display()).into())
     }
 
     /// The name this binary was invoked as, for messages that suggest commands.
@@ -315,9 +265,14 @@ impl Startup {
 
 /// A loaded script, with the two roots that govern it resolved.
 pub struct Script {
-    loaded: LoadedScript,
-    /// The `require` confinement boundary, or `None` when imports are denied.
-    require_root: Option<PathBuf>,
+    /// How this script names itself in errors: its path as given.
+    label: String,
+    /// The source, shebang commented out.
+    source: String,
+    /// The `require` confinement boundary: the script's own directory.
+    require_root: PathBuf,
+    /// The script file itself, absolute and symlink-resolved (`fs.script()`).
+    abs_path: PathBuf,
     /// The `-C`-resolved working directory: the `fs` root where `fs` is rooted,
     /// and what relative paths resolve against where it is not.
     vfs_root: PathBuf,
@@ -326,27 +281,10 @@ pub struct Script {
 }
 
 impl Script {
-    /// A `-s`/`--script` expression.
-    ///
-    /// No file, so no directory of its own: imports are denied unless `-r` named
-    /// a root. The cwd it happened to be run from is not a boundary anyone chose.
-    fn inline(source: String, require_root: Option<PathBuf>, vfs_root: &Path) -> Self {
-        let loaded = LoadedScript {
-            label: "<expression>".into(),
-            source,
-        };
-        Self::synthetic(loaded, require_root, vfs_root)
-    }
-
-    /// A script piped in on stdin. Same rootlessness as inline.
-    fn stdin(require_root: Option<PathBuf>, vfs_root: &Path) -> Result<Self, RunError> {
-        let loaded = load_script_file(Path::new("-")).map_err(RunError::from)?;
-        Ok(Self::synthetic(loaded, require_root, vfs_root))
-    }
-
     /// A script file, which anchors the require root to its own directory.
     fn file(path: &Path, vfs_root: &Path) -> Result<Self, RunError> {
-        let loaded = load_script_file(path).map_err(RunError::from)?;
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("script read error {}: {e}", path.display()))?;
         // Follow symlinks first: a script installed as `~/.local/bin/<name>`
         // pointing at `~/scripts/<name>.luau` keeps its modules next to the
         // *real* file, not next to the launcher. Anchoring on the link would
@@ -364,43 +302,13 @@ impl Script {
         // need not resolve back to the file itself.
         let chunk_name = format!("@{}", abs.with_extension("").display());
         Ok(Self {
-            loaded: LoadedScript {
-                label: loaded.label,
-                source: strip_shebang(loaded.source),
-            },
-            require_root: Some(require_root),
+            label: path.display().to_string(),
+            source: comment_out_shebang(source),
+            require_root,
+            abs_path: abs,
             vfs_root: vfs_root.to_path_buf(),
             chunk_name,
         })
-    }
-
-    /// Shared tail of [`Self::inline`] and [`Self::stdin`]: a script with no file
-    /// of its own, so its chunk name has to be synthesized.
-    fn synthetic(loaded: LoadedScript, require_root: Option<PathBuf>, vfs_root: &Path) -> Self {
-        let chunk_name = match &require_root {
-            // Inside the require root, so relative imports resolve there.
-            Some(root) => format!(
-                "@{}",
-                root.join(loaded.label.trim_matches(['<', '>'])).display()
-            ),
-            // No file and no root: `require` is denied anyway, so the chunk gets
-            // an honest `=` label rather than a path it does not have.
-            None => format!("={}", loaded.label),
-        };
-        Self {
-            loaded: LoadedScript {
-                label: loaded.label,
-                source: strip_shebang(loaded.source),
-            },
-            require_root,
-            vfs_root: vfs_root.to_path_buf(),
-            chunk_name,
-        }
-    }
-
-    /// How this script names itself in errors (`<expression>`, `<stdin>`, a path).
-    pub fn label(&self) -> &str {
-        &self.loaded.label
     }
 
     /// The `fs` root.
@@ -408,9 +316,14 @@ impl Script {
         &self.vfs_root
     }
 
-    /// The `require` confinement boundary, or `None` where imports are denied.
-    pub fn require_root(&self) -> Option<&Path> {
-        self.require_root.as_deref()
+    /// The script file, absolute and symlink-resolved.
+    pub fn abs_path(&self) -> &Path {
+        &self.abs_path
+    }
+
+    /// The `require` confinement boundary: the script's own directory.
+    pub fn require_root(&self) -> &Path {
+        &self.require_root
     }
 }
 
@@ -435,8 +348,9 @@ fn remove_random(lua: &mlua::Lua) -> Result<(), RunError> {
 /// clock/date/difftime/time), so this restores the Lua 5.1 name rather than
 /// inventing one — a script reaching for the environment reaches where it
 /// expects to. Read-only on purpose: there is no setter, because a per-command
-/// `proc`/`ssh` `:env()` covers passing a variable to a child without mutating
-/// process-wide state that every later task would then observe.
+/// `proc`'s `:env()` covers passing a variable to a child without mutating
+/// process-wide state that every later task would then observe (`ssh` has no
+/// `:env()`; sshd owns the remote environment).
 ///
 /// Like [`remove_random`], this reaches into a stdlib table and so only works
 /// before `seal` freezes it.
@@ -457,29 +371,11 @@ fn add_getenv(lua: &mlua::Lua) -> Result<(), RunError> {
 /// which is why this is one choice rather than two that could disagree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fs {
-    /// No `fs` at all. A script reads only what it was handed.
-    None,
     /// Rooted at the working directory, escapes rejected. `writes` decides
     /// whether the write half exists (see [`sl::vfs::Writes`]).
     Rooted { writes: sl::vfs::Writes },
     /// The host filesystem: no root, writes land immediately.
     Host,
-}
-
-/// Who owns stdout, and so how the script's output reaches it.
-///
-/// One choice rather than two, because "is there a `print`?" and "what is
-/// written at the end?" are the same question asked twice. A binary whose
-/// answer travels back as a value cannot also have a `print` writing to the
-/// same stream.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Stdout {
-    /// The script's return value is the output: no `print` at all, not even
-    /// Luau's built-in.
-    Returned,
-    /// `print` writes to stdout, or to the log when `echo` is false — which is
-    /// how a report that owns stdout avoids being interleaved with it.
-    Print { echo: bool },
 }
 
 /// What a script may reach: the whole of what differs between the binaries.
@@ -489,8 +385,8 @@ pub enum Stdout {
 /// binary's surface can be read (and diffed) in one place — see the
 /// per-binary constructors below.
 ///
-/// `input` and `argv` are here for uniformity, not as capabilities: what a
-/// script is *handed* is the same everywhere (see `cli::InputArgs`).
+/// `argv` is here for uniformity, not as a capability: what a script is
+/// *handed* is the same everywhere.
 pub struct Config {
     pub fs: Fs,
     /// `proc`/`ssh`/`aws`/`task`, plus `os.getenv`.
@@ -502,67 +398,42 @@ pub struct Config {
     /// a report on what it *would* do needs determinism for a reason that has
     /// nothing to do with whether it can spawn a process.
     pub ambient: bool,
-    pub stdout: Stdout,
-    /// The `input` global: raw, unparsed text. `None` leaves it undefined.
-    pub input: Option<String>,
-    /// The script's own arguments, after `::`.
+    /// Whether `print` writes. False under `-q`, and under the reports that own
+    /// stdout; the call is then a silent no-op.
+    pub print: bool,
+    /// The script's own arguments, everything after `SCRIPT`.
     pub argv: Argv,
 }
 
 impl Config {
-    /// `iq` — a filter: the return value is the output, `fs` is opt-in via `-f`
-    /// and read-only, and nothing ambient may feed an answer that should depend
-    /// only on its input.
-    pub fn iq(filesystem: bool, input: Option<String>, argv: Argv) -> Self {
-        Self {
-            fs: if filesystem {
-                Fs::Rooted {
-                    writes: sl::vfs::Writes::Denied,
-                }
-            } else {
-                Fs::None
-            },
-            host_io: false,
-            ambient: false,
-            stdout: Stdout::Returned,
-            input,
-            argv,
-        }
-    }
-
-    /// `ied` — buffered edits. A report owns stdout, so `print` goes to the log
-    /// rather than interleaving with the diff or the file list.
+    /// `ied` — buffered edits. A report owns stdout, so `-d`/`-l` imply `-q`:
+    /// `print` is silenced rather than landing inside the diff or file list.
     ///
     /// A preview is only worth anything if the run it previews computes the same
     /// change set, so nothing ambient may feed into one.
-    pub fn ied(quiet: bool, report: &ReportArgs, input: Option<String>, argv: Argv) -> Self {
+    pub fn ied(quiet: bool, report: &ReportArgs, argv: Argv) -> Self {
         Self {
             fs: Fs::Rooted {
                 writes: sl::vfs::Writes::Buffered,
             },
             host_io: false,
             ambient: false,
-            stdout: Stdout::Print {
-                echo: !(quiet || report.diff || report.changed),
-            },
-            input,
+            print: !(quiet || report.diff || report.changed),
             argv,
         }
     }
 
-    /// `ito` (and `irun`, which is the same engine with a different argument
-    /// source) — the full toolset. Writes land immediately, since a subprocess
+    /// `ito` — the full toolset. Writes land immediately, since a subprocess
     /// would not see a buffered one.
     ///
     /// Keeps the ambient state: a binary that already spawns processes and opens
     /// sockets would gain nothing from being denied the clock.
-    pub fn ito(quiet: bool, input: Option<String>, argv: Argv) -> Self {
+    pub fn ito(argv: Argv) -> Self {
         Self {
             fs: Fs::Host,
             host_io: true,
             ambient: true,
-            stdout: Stdout::Print { echo: !quiet },
-            input,
+            print: true,
             argv,
         }
     }
@@ -600,13 +471,8 @@ impl Engine {
         let lua = mlua::Lua::new();
 
         // Replace Luau's default `require` (an unconfined `FsRequirer`) with
-        // ito's own. With no root there is nothing to confine to, so `require`
-        // becomes one that only explains itself: leaving the default in place
-        // would be an unconfined requirer, the opposite of the intent.
-        match &script.require_root {
-            Some(root) => sl::require::register(&lua, root.clone())?,
-            None => sl::require::register_denied(&lua)?,
-        }
+        // ito's own, confined to the script's directory tree.
+        sl::require::register(&lua, script.require_root.clone())?;
 
         // The modules every binary has: formats, paths, regex, logging, string
         // methods, the `ito` module, and the script's own `argv`.
@@ -616,38 +482,43 @@ impl Engine {
         // runner calls it when present), and `ito.version_check` already
         // asserts compatibility -- which is the only thing a script did with
         // the version.
+        sl::null::register(&lua)?;
+        sl::codec::register_array(&lua)?;
         sl::json::register(&lua)?;
         sl::path::register(&lua)?;
         sl::re::register(&lua)?;
         sl::toml::register(&lua)?;
         sl::yaml::register(&lua)?;
         sl::hcl::register(&lua)?;
-        sl::tablefmt::register(&lua)?;
         sl::time::register(&lua)?;
         // Hashing a value is a pure byte-to-digest conversion, so it goes
         // everywhere; only the `_file` forms read the filesystem, and those are
         // added under `host_io` below.
         sl::hash::register(&lua)?;
+        sl::encoding::register(&lua)?;
+        // `ansible.vault` is a pure cipher over its arguments, like `hash`, so
+        // it goes everywhere too.
+        sl::ansible::register(&lua)?;
         sl::ito::register(&lua, env!("CARGO_PKG_VERSION"))?;
         sl::log::register(&lua)?;
-        sl::string::register(&lua)?;
-        // The ANSI styling methods are pure string transforms, so every binary
-        // has them; `ito.colors` is the switch that decides whether they emit
-        // anything, and `reset` clears a previous run's setting (the switch is
-        // process-wide, so a second `build` in one process must not inherit it).
-        sl::ansi::reset();
-        sl::ansi::register(&lua)?;
-        sl::ansi::register_switch(&lua)?;
+        // `print`: vanilla, to stdout, in every binary. The `io` handles are
+        // host-only and join under `host_io`.
+        sl::print::register(&lua, config.print)?;
+        // `fmt`: styles, the colour switch (`fmt.colors`), text helpers and
+        // tables; pure, so every binary has it. Also the `string` sugar methods.
+        sl::fmt::ansi::reset();
+        sl::print::reset();
+        sl::fmt::register(&lua)?;
 
         // `cli` reads the command line as given, so it takes `argv` before
         // `argv::register` hands ownership to the global -- a script may
         // reassign that global, and the declared interface should describe the
         // invocation rather than whatever the script last stored there.
         //
-        // It writes to stdout, which `iq` and `ied` otherwise own, and still
-        // belongs on both: what it prints is *terminal*, so a run that prints
-        // help never reaches `emit_returned`/`emit_reports` and cannot
-        // interleave with either. Nothing in it is capability-bearing.
+        // It writes to stdout, which `ied`'s reports otherwise own, and still
+        // belongs there: what it prints is *terminal*, so a run that prints
+        // help never reaches `emit_reports` and cannot interleave with it.
+        // Nothing in it is capability-bearing.
         sl::cli::register(&lua, &config.argv.0)?;
         sl::argv::register(&lua, config.argv)?;
 
@@ -661,7 +532,6 @@ impl Engine {
         // erroring -- the honest model for a binary that can already spawn a
         // subprocess to do the same thing (see `sl::rfs`).
         let vfs = match config.fs {
-            Fs::None => None,
             Fs::Rooted { writes } => {
                 let vfs = Vfs::new(script.vfs_root())?;
                 sl::vfs::register_with(&lua, &vfs, writes)?;
@@ -683,11 +553,11 @@ impl Engine {
             // reason `os.getenv` does: they report host locations, which is
             // only a script's business where its `fs` is the host filesystem
             // too.
-            sl::ito::register_host_paths(&lua, script.require_root().map(Path::to_path_buf))?;
-            // `ito.pid()` joins them: a pid is ambient state that differs
-            // between two runs, which is the same line the rest of this block
-            // draws.
-            sl::ito::register_host_pid(&lua)?;
+            sl::ito::register_host_paths(
+                &lua,
+                script.require_root().to_path_buf(),
+                script.abs_path().to_path_buf(),
+            )?;
             // `ito.slug()` joins them: it's random, the same line
             // `remove_random` draws around `math.random` below.
             sl::ito::register_host_slug(&lua)?;
@@ -697,23 +567,27 @@ impl Engine {
             // the containment that root exists to provide. The pure
             // string/buffer forms were registered with the core, above.
             sl::hash::register_host_files(&lua)?;
-            // `io.write`/`io.writeln`/`io.ewrite`/`io.ewriteln`: raw stream
-            // writes, host-only for the reason `print`/`Stdout` are one
-            // choice above -- `iq`'s stdout is its return value and `ied`'s
-            // is its report, so neither can hand a script an uncoordinated
-            // second writer onto the same stream.
-            sl::io::register_host(&lua)?;
+            // `ansible.vault.load_password_file` (reads or executes a path) and
+            // `ansible.vault.encrypt` (random) join `hash.*_file` here rather
+            // than the pure half registered with the core.
+            sl::ansible::register_host(&lua)?;
+            // `io.stdout`/`io.stderr`/`io.stdin` and the default-handle calls:
+            // raw stream access, host-only -- `ied`'s stdout is shared with its
+            // report, so it does not hand a script a second kind of writer
+            // (nor stdin, nor stderr).
+            sl::io::register(&lua)?;
             // The clock-reading and local-zone half of `time`, host-only for
             // the reason `os.getenv` is: each answer depends on ambient state
             // the caller never passed, which an `ied --diff` preview must not
             // read or it could disagree with the `--write` after it.
             sl::time::register_host_time(&lua)?;
-            // `ito.is_tty()`, and with it the right for `ito.colors(nil)` to
-            // detect: both read ambient state (stdout's terminal-ness, the
-            // CLICOLOR variables), so the styling methods stay pure under
-            // `iq`/`ied` and a script there turns them on explicitly.
-            sl::ansi::register_host_detect(&lua)?;
+            // `fmt.is_tty()`, and with it the right for `fmt.colors(nil)` to
+            // detect: both read ambient state (terminal-ness, CLICOLOR), so the
+            // styles stay pure under `ied`.
+            sl::fmt::register_host(&lua)?;
             sl::proc::register(&lua)?;
+            // `proc.pid()`: ambient state, the same line this block draws.
+            sl::ito::register_host_pid(&lua)?;
             sl::ssh::register(&lua)?;
             sl::aws::register(&lua)?;
             // `ui.prompt`/`ui.progress`: terminal interaction is ambient
@@ -740,49 +614,14 @@ impl Engine {
             remove_random(&lua)?;
         }
 
-        match config.stdout {
-            // Luau installs its own `print`, so withholding ours is not enough
-            // -- the built-in has to go, or a second channel would interleave
-            // with the returned value on the same stream.
-            Stdout::Returned => lua.globals().raw_remove("print")?,
-            Stdout::Print { echo } => {
-                let print = if echo {
-                    lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
-                        use std::io::Write;
-                        let mut out = std::io::stdout().lock();
-                        let parts: Vec<String> = args.iter().map(display_value).collect();
-                        let _ = writeln!(out, "{}", parts.join("\t"));
-                        Ok(())
-                    })?
-                } else {
-                    lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
-                        let parts: Vec<String> = args.iter().map(display_value).collect();
-                        tracing::info!(target: "ito::lua::print", "{}", parts.join("\t"));
-                        Ok(())
-                    })?
-                };
-                lua.globals().raw_set("print", print)?;
-            }
-        }
-
-        // Raw text, not parsed: stdin carries no indication of its own format,
-        // and a file's extension is a hint rather than a fact, so the script
-        // says which parser it wants (`json.parse(input)`). Absent rather than
-        // empty when nothing was passed, so a script can tell the two apart.
-        if let Some(text) = &config.input {
-            let value = lua.create_string(text)?;
-            lua.globals().raw_set("input", value)?;
-        }
-
-        // `j2` now that the `fs` decision is known -- guessing "allowed" would
-        // let a template read the disk in a run that exposes no `fs` at all.
+        // `j2` now that the `fs` decision is known -- an include is a file read,
+        // so it gets exactly the access `fs` got.
         match config.fs {
             Fs::Rooted { .. } => sl::j2::register(
                 &lua,
                 vfs.as_ref().expect("a rooted fs built a VFS just above"),
             )?,
             Fs::Host => sl::j2::register_host(&lua)?,
-            Fs::None => sl::j2::register_without_fs(&lua)?,
         }
 
         // Luau sandbox mode makes the stdlib tables read-only and proxies
@@ -809,6 +648,13 @@ impl Engine {
     /// value wins — a script written that way puts its answer in `main`, and the
     /// chunk itself returns nothing.
     pub async fn eval(&self, script: &Script) -> Result<mlua::Value, RunError> {
+        let result = self.eval_inner(script).await;
+        // Stop spinners and settle the display, whether or not the script failed.
+        sl::ui::progress::teardown();
+        result
+    }
+
+    async fn eval_inner(&self, script: &Script) -> Result<mlua::Value, RunError> {
         // A `cli.parse()` that printed help or a usage error unwinds through the
         // script as an error, but it is not one: the text is already on the
         // right stream, and the only thing left is the exit code. Recognised
@@ -819,12 +665,12 @@ impl Engine {
                 code,
                 message: String::new(),
             },
-            None => RunError::script(format!("script error in {}: {e}", script.loaded.label)),
+            None => RunError::script(format!("script error in {}: {e}", script.label)),
         };
 
         let chunk_value: mlua::Value = self
             .lua
-            .load(&script.loaded.source)
+            .load(&script.source)
             .set_name(script.chunk_name.clone())
             .call_async(())
             .await
@@ -844,6 +690,14 @@ impl Engine {
             tasks.drain().await.map_err(fail)?;
         }
 
+        if sl::print::pipe_broken() {
+            // The script may have `pcall`ed the write error away; the run was
+            // still cut short.
+            return Err(RunError {
+                code: sl::print::SIGPIPE_EXIT,
+                message: String::new(),
+            });
+        }
         Ok(answer)
     }
 
@@ -861,75 +715,38 @@ impl Engine {
 // Phase 5: output
 // ---------------------------------------------------------------------------
 
-/// Write a script's return value to stdout, verbatim.
-///
-/// Verbatim means no added trailing newline, so `$(iq ...)` and a pipe both get
-/// exactly what was returned.
-///
-/// A non-string is a script error rather than a coercion: `tostring` on a table
-/// yields `table: 0x...`, which is never the answer anyone wanted, so
-/// stringifying would turn a visible mistake into silently wrong output.
-pub fn emit_returned(
-    answer: &mlua::Value,
-    script: &Script,
-    program: &str,
-    quiet: bool,
-) -> Result<(), RunError> {
-    if quiet {
-        return Ok(());
-    }
-    let label = &script.loaded.label;
-    let text = match answer {
-        mlua::Value::String(s) => s.to_str()?.to_string(),
-        mlua::Value::Nil => {
-            return Err(RunError::script(format!(
-                "{program} expects {label} to return a string; it returned nothing. \
-                 End the script with `return <string>` (json.to_string(..) or \
-                 table.concat(..) if the answer is structured)."
-            )));
-        }
-        other => {
-            let ty = other.type_name();
-            // "an integer", not "a integer".
-            let article = if ty.starts_with(['a', 'e', 'i', 'o', 'u']) {
-                "an"
-            } else {
-                "a"
-            };
-            return Err(RunError::script(format!(
-                "{program} expects {label} to return a string; it returned {article} {ty}. \
-                 Serialize it first, e.g. `return json.to_string(result)`."
-            )));
-        }
-    };
-    use std::io::Write;
-    std::io::stdout()
-        .lock()
-        .write_all(text.as_bytes())
-        .map_err(|e| format!("write output: {e}"))?;
-    Ok(())
-}
-
 /// Print the `--diff`/`--list-changed` report and compute the run's outcome.
 ///
 /// Both report against the *buffered* writes, so they are meaningful whether or
 /// not the caller goes on to flush. clap enforces that they are mutually
-/// exclusive.
+/// exclusive. Both imply `-q`, so the script's `print` is already silenced and
+/// the report owns stdout.
 pub fn emit_reports(vfs: &Vfs, report: &ReportArgs) -> Result<Outcome, RunError> {
     // The set of real changes -- buffered writes differing from disk -- is the
     // shared basis for the listing and the exit status.
     let changed = vfs.changed().map_err(|e| format!("changed: {e}"))?;
 
     use std::io::Write;
+    // A reader that went away (`ied -d | head`) is the SIGPIPE exit, not a failure.
+    let werr = |what: &str, e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            RunError {
+                code: sl::print::SIGPIPE_EXIT,
+                message: String::new(),
+            }
+        } else {
+            RunError::from(format!("write {what}: {e}"))
+        }
+    };
     let mut out = std::io::stdout().lock();
     if report.changed {
         for path in &changed {
-            writeln!(out, "{path}").map_err(|e| format!("write changed: {e}"))?;
+            writeln!(out, "{path}").map_err(|e| werr("changed", e))?;
         }
     }
     if report.diff {
         write!(out, "{}", vfs.diff().map_err(|e| format!("diff: {e}"))?)
-            .map_err(|e| format!("write diff: {e}"))?;
+            .map_err(|e| werr("diff", e))?;
     }
 
     Ok(Outcome {
@@ -956,39 +773,51 @@ pub fn flush_writes(vfs: &Vfs, report: &ReportArgs) -> Result<(), RunError> {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// `tostring`-style rendering for `print`/`debug_print` arguments.
-fn display_value(v: &mlua::Value) -> String {
-    v.to_string().unwrap_or_else(|e| format!("<error: {e}>"))
-}
-
 /// Install the log subscriber at the verbosity `-v` asked for.
 ///
 /// Call it straight after parsing and before any check that can fail: an error
 /// raised earlier has nowhere to be written, and a usage mistake would exit
 /// non-zero in silence.
+///
+/// Records are written through `ui.progress`'s pause, so a log line never
+/// garbles a live bar. Level labels are coloured only when stderr is a
+/// terminal and `NO_COLOR` is unset.
 pub fn init_tracing(verbosity: u8) {
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
-    // ITO_LOG takes precedence, then RUST_LOG (the EnvFilter default).
-    let filter = EnvFilter::try_from_env("ITO_LOG")
-        .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| {
-            // `-v` raises the level for the `ito` target only — the runner and
+    // ITO_LOG takes precedence, then RUST_LOG; an invalid value is reported
+    // rather than silently ignored.
+    let from_env = |var: &str| -> Option<EnvFilter> {
+        let text = std::env::var(var).ok()?;
+        match EnvFilter::try_new(&text) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("warning: ignoring invalid {var}={text:?}: {e}");
+                None
+            }
+        }
+    };
+    let filter = from_env("ITO_LOG")
+        .or_else(|| from_env("RUST_LOG"))
+        .unwrap_or_else(|| {
+            // `-v` raises the level for the `ito` target only -- the runner and
             // the stdlib, which is what a script's own `log.*` calls come out
-            // as. Every other crate stays at `warn` however loud `-v` gets:
-            // the noise they produce at `debug` and `trace` is about their
-            // internals, not the run. `ITO_LOG`/`RUST_LOG` above are the escape
-            // hatch when those are wanted.
+            // as. Every other crate stays at `warn` however loud `-v` gets.
+            // The `ito` target defaults to `info`, so a script's `log.info` is
+            // visible out of the box.
             let level = match verbosity {
-                0 => return EnvFilter::new("warn"),
-                1 => "info",
-                2 => "debug",
+                0 => "info",
+                1 => "debug",
                 _ => "trace",
             };
             EnvFilter::new(format!("warn,ito={level}"))
         });
+    let ansi =
+        io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(io::stderr)
+        .with_writer(|| sl::ui::progress::SuspendedStderr)
+        .with_ansi(ansi)
         .with_target(false)
         .without_time()
         .try_init()
@@ -1068,27 +897,9 @@ fn abs_from(base: &Path, p: &Path) -> PathBuf {
 
 /// Turn a leading shebang line (`#!...`) into a Luau comment (`--...`) so Luau
 /// doesn't choke on the `#`, without shifting any line numbers.
-fn strip_shebang(mut source: String) -> String {
+fn comment_out_shebang(mut source: String) -> String {
     if source.starts_with("#!") {
         source.replace_range(..2, "--");
     }
     source
-}
-
-pub(crate) fn load_script_file(p: &Path) -> Result<LoadedScript, String> {
-    if p.as_os_str() == "-" {
-        use std::io::Read;
-        let mut source = String::new();
-        std::io::stdin()
-            .read_to_string(&mut source)
-            .map_err(|e| format!("stdin read error: {e}"))?;
-        return Ok(LoadedScript {
-            label: "<stdin>".into(),
-            source,
-        });
-    }
-    let label = p.display().to_string();
-    let source = std::fs::read_to_string(p)
-        .map_err(|e| format!("script read error {}: {e}", p.display()))?;
-    Ok(LoadedScript { label, source })
 }

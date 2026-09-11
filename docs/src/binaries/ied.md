@@ -1,22 +1,57 @@
-# `ied` — edit files in a sandbox
+# `ied` — reproducible file edits
 
-Give `ied` a [Luau](https://luau.org) script and a directory, and it
-proposes changes to the files it finds there. By default it proposes
-only: nothing is written unless you ask for it.
+`ied` is `ito` with the world taken away: the same Luau runner and
+standard library, restricted to the files in one directory. Give it a
+[Luau](https://luau.org) script and a directory, and it proposes changes
+to the files it finds there. By default it proposes only: nothing is
+written unless you ask for it.
+
+Everything this page does not list as unavailable works as it does in
+`ito`.
 
 ```sh
 ied fix.luau                  # compute the changes, write nothing
-ied fix.luau -d               # show them as a diff
-ied fix.luau -l               # list the files that would change
-ied fix.luau -e               # exit 1 if anything would change
-ied fix.luau -w               # apply them
-ied fix.luau data.json -w     # ... with a file handed to it as `input`
-ied fix.luau -w :: src lib    # ... with arguments for the script itself
+ied -d fix.luau               # show them as a diff
+ied -l fix.luau               # list the files that would change
+ied -e fix.luau               # exit 1 if anything would change
+ied -w fix.luau               # apply them
+ied -w fix.luau src lib       # ... with arguments for the script itself
 ```
+
+`ied`'s own flags go before the script path. Everything after it belongs
+to the script and reaches it verbatim as the global `argv` — so in
+`ied fix.luau -w`, the `-w` is the script's, and nothing is written.
 
 That default makes it usable as a linter or a config-propagation check:
 run it in CI with `-e` and a non-zero exit means the tree has drifted
 from what the script says it should be.
+
+## Reproducibility
+
+An `ied` run is a function of two things: **the state of the work
+directory and the script**. The same pair always produces the same change
+set, on any machine, at any time. That is what makes a bare run a
+trustworthy preview, `-e` a usable CI check, and `-d` output safe to
+review and then apply with `-w`: the changes you inspected are the changes
+that get written.
+
+Anything that would let a third input in is therefore absent. These
+globals are not stubbed or policy-checked — they do not exist, so
+`if proc then` or `if os then` is a usable feature test:
+
+| Input | What is absent |
+| --- | --- |
+| time | `time.now`/`till`/`ago`, the `_local` family (host time zone), `os.clock`/`date`/`time`/`difftime` |
+| randomness | `math.random`/`randomseed`, `ansible.vault.encrypt` (fresh salt per call) |
+| environment | `os.getenv`, `fs.cwd`, `fs.script`, `fs.require_root`/`require_dir`, `proc.pid`, `ito.slug` |
+| files outside the work directory | `fs` is rooted at the work directory: `..` and symlink escapes are errors, and `hash.*_file` does not exist |
+| other processes and machines | `proc`, `ssh`, `aws`, `task` |
+| the terminal | `io`, `ui`, `fmt.is_tty`; colour auto-detection resolves to off (`fmt.colors(true)` opts in) |
+| effects with no preview | `fs.append`/`mkdir`/`remove_all`/`rename`/`copy`/`chmod`/`symlink`/`temp_*`/`write_new`, `fs.finder():grep()` |
+
+Arguments (`argv`) are part of the invocation, so a script may take data
+through them; the files they name are read from inside the tree. The only
+output besides `print` is `log.*`, which goes to stderr.
 
 ## The operating model
 
@@ -46,38 +81,34 @@ later `fs.write` or `fs.remove` replaces an earlier one:
 fs.write("a", "x") fs.remove("a") fs.write("a", "y")   -- writes "y"
 ```
 
-**Files are all it can reach.** There is no way to run a command, open a
-network connection, or read the environment. The script sees a virtual
-filesystem rooted at the working directory (`-C`), and paths that escape
-that root with `..` are rejected.
+**Reports own stdout.** `--diff` and `--list-changed` write their report
+to stdout, so they imply `-q`: the script's `print` is silenced and cannot
+land inside the diff you are about to pipe into `patch`. Use `log.*` for
+diagnostics: it goes to stderr.
 
-**Reports own stdout.** `--diff` and `--list-changed` write to stdout and
-imply `--quiet`, so a script's `print` output can never interleave with a
-diff you are about to pipe into `patch`.
+**`-q` silences `print`.** `-q`/`--quiet` turns the script's `print`
+(`tostring` of each argument, tab-joined, newline-terminated) into a
+silent no-op. It affects nothing else: not the report, not logs, not exit
+codes or `-w`. Combined with `-d` or `-l` it is redundant.
 
-**Data can arrive on the command line.** An optional `INPUT` positional —
-a file path, or `-` for stdin — reaches the script as the global `input`:
+**Data is read through `fs`.** A file the script should take its values
+from is named as one of its arguments and read like any other, from
+inside the tree:
 
 ```sh
-ied fix.luau versions.json -d       # input = the file's text
-curl -s "$URL" | ied fix.luau - -d  # input = stdin
+ied -d fix.luau versions.json
 ```
 
-`input` is **raw text**, never parsed for you: a file's extension is a
-hint rather than a fact, and stdin carries no indication of its format, so
-the script says which parser it wants.
-
 ```lua
-local wanted = json.parse(input)
+local wanted = json.parse(fs.read(argv[1]))
 for name, version in pairs(wanted) do
     fs.write(name .. "/VERSION", version)
 end
 ```
 
-Omit the positional and `input` is nil, which is distinct from an empty
-string — a script can tell "nothing was passed" from "something empty was
-passed". The files the script *edits* still come from `fs`; `input` is the
-one value handed in from outside the tree.
+What `fs.read` returns is **raw text**, never parsed for you: a file's
+extension is a hint rather than a fact, so the script says which parser it
+wants.
 
 ## Modules
 
@@ -92,13 +123,18 @@ one value handed in from outside the tree.
 | [`hcl`](../modules/hcl.md) | parse and emit HCL, including format-preserving edits |
 | [`j2`](../modules/j2.md) | render Jinja2 templates |
 | [`re`](../modules/re.md) | regular expressions |
-| [`string`](../modules/string.md) | character-aware string helpers, ANSI styling |
-| [`table`](../modules/table.md) | arrays and objects |
-| [`ito`](../modules/ito.md) | the version guard, the `null` sentinel, and the colour switch |
-| [`log`](../modules/log.md) | logging to stderr |
+| [`fmt`](../modules/fmt.md) | colours, text helpers, status symbols, aligned tables |
+| [`string`](../modules/string.md) | character-aware string helpers (sugar over `fmt`) |
+| [`table`](../modules/table.md) | arrays and objects, and the `table.array` marker (plus the global `null`) |
+| [`ito`](../modules/ito.md) | the version guard (no `ito.slug`) |
+| [`hash`](../modules/hash.md) | MD5/SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 of a string or buffer (no `_file` forms) |
+| [`encoding`](../modules/encoding.md) | base64, with an engine builder for other alphabets |
+| [`ansible`](../modules/ansible.md) | decrypt Ansible Vault text, `is_vault` (no `encrypt`) |
+| [`log`](../modules/log.md) | logging to stderr, the only route to it |
 | [`cli`](../modules/cli.md) | declare the script's own options and arguments, with a generated `--help` |
 
-Print any of them with `--doc <topic>`, e.g. `ied --doc fs`.
+The modules `proc`, `ssh`, `aws`, `task`, `io` and `ui` are absent. Print
+any topic with `--doc <topic>`, e.g. `ied --doc fs`.
 
 ## Gotchas
 
@@ -106,14 +142,9 @@ Print any of them with `--doc <topic>`, e.g. `ied --doc fs`.
 different rendering of the same change set; asking for both is a usage
 error.
 
-**`SCRIPT` and `INPUT` cannot both be `-`.** Stdin can only be read once.
-Use `-s` for an inline script, or name a file for one of the two.
-
-**`INPUT` is not a `cli.arg()`.** The input file is `ied`'s own
-positional, matched before `::`, so a script's
-[`cli`](../modules/cli.md) declarations never see it — `cli.arg("file")`
-reads whatever came *after* `::`, which is a different thing. The data
-arrives as `input`, as always.
+**`-w` goes before the script.** After the script path it is one of the
+script's arguments, so `ied fix.luau -w` computes the change set and drops
+it, like a bare run. The same holds for `-d`, `-l`, `-e`, `-q` and `-C`.
 
 **A "change" means differing from disk.** Writing a file the exact bytes
 it already contains is not a change: it does not appear in `--diff` or
@@ -126,4 +157,6 @@ surgical changes that leave the rest of the file byte-identical.
 
 **Exit codes.** `0` success, `1` success *with* changes (only under
 `-e`/`--exit-code`, like `git diff --exit-code`), `2` a failure that is
-not the script's fault, `3` a failure in the script itself.
+not the script's fault, `3` a failure in the script itself, `141` the
+output pipe went away (`| head`; the run was cut short, and `-w` does not
+apply its buffered edits).

@@ -1,11 +1,11 @@
 # args — passing values to scripts
 
-Everything after a bare `::` on the command line belongs to the script.
-The part before it is parsed as usual; the part after is handed through
-verbatim as the global `argv`.
+Everything after the script path on the command line belongs to the
+script. The program's own flags come before the path and are parsed as
+usual; the part after it is handed through verbatim as the global `argv`.
 
 ```sh
-ito deploy.luau -v :: --env prod --dry-run
+ito -v deploy.luau --env prod --dry-run
 ```
 
 ```lua
@@ -16,40 +16,47 @@ print(argv[1])      -- "--env"
 
 | | |
 | --- | --- |
-| `argv` | An array of strings: the arguments given after `::`. |
+| `argv` | An array of strings: the arguments given after the script path. |
 
-Three things to know:
+Four things to know:
 
 - **`argv[1]` is not the program name.** Unlike a C `argv`, only the
   strings you actually passed appear, so `argv[1]` is the first script
   argument and `#argv` is how many there were.
-- **It is always a table.** A run with no `::` sees an empty one, never
-  `nil`, so `#argv` and `ipairs(argv)` work unconditionally.
+- **It is always a table.** A run with no script arguments sees an empty
+  one, never `nil`, so `#argv` and `ipairs(argv)` work unconditionally.
+- **It is read-only.** The sandbox freezes it, so `table.remove(argv, 1)`
+  or `argv[1] = ...` raises. To take a subcommand off the front, copy the
+  rest (`local rest = table.move(argv, 2, #argv, 1, {})`) and hand that to
+  `cli.parse(rest)`.
 - **Nothing is interpreted.** No option map, no type coercion, no name
-  rules — `--env`, `-x`, `prod` and `::` are all just strings. Parsing
-  them is the script's job, which is what lets a script define whatever
-  grammar suits it.
-
-Only the *first* `::` separates; later ones are ordinary arguments.
-
-```sh
-ito run.luau :: a :: b     # argv == { "a", "::", "b" }
-```
-
-## Without the separator: `irun`
-
-`::` exists because `ito` and the script share a command line. When the
-script should own that line outright — chiefly in a `#!` line —
-[`irun`](binaries/irun.md) drops every flag of its own, takes the script
-path as its single argument, and hands the rest straight to `argv`:
+  rules — `--env`, `-x`, `prod` and even the program's own flag
+  spellings are all just strings once they follow the script path.
+  Parsing them is the script's job, which is what lets a script define
+  whatever grammar suits it.
 
 ```sh
-irun deploy.luau --env prod    # argv == { "--env", "prod" }
+ito run.luau -v --doc x     # argv == { "-v", "--doc", "x" }
 ```
 
-`argv` behaves identically either way; only who claimed the arguments
-changes. Under `irun` there is nothing to separate, so `::` is not special
-and arrives as a plain string like anything else.
+## In a shebang
+
+Because the script owns everything after its path, a script run through a
+`#!` line owns its whole command line:
+
+```lua
+#!/usr/bin/env -S ito
+print(table.concat(argv, " "))
+```
+
+```sh
+./deploy --env prod    # the kernel runs: ito ./deploy --env prod
+                       # argv == { "--env", "prod" }
+```
+
+Flags written into the shebang itself come before the path the kernel
+appends, so they are still the program's: `#!/usr/bin/env -S ito -C /srv`
+sets the working directory and leaves `argv` alone.
 
 ## Parsing them: `cli`
 

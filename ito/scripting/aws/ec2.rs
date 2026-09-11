@@ -21,6 +21,17 @@
 //! answer rather than an error. The shape is uniform across both so that one
 //! `:send()` convention holds for the whole `aws` surface.
 //!
+//! # Instance status
+//!
+//! `describe_instance_status` is AWS's own verdict on an instance — the
+//! two-minute system/instance status checks plus any scheduled maintenance
+//! event — as opposed to `describe_instances`' `state`, which is only EC2's
+//! *intended* lifecycle state. A `running` instance can still be failing its
+//! system status check; that distinction is the reason this is a separate
+//! call rather than a field folded into `describe_instances`. Stopped
+//! instances have no checks to report and are excluded by default, matching
+//! the API; `:include_all_instances()` asks for them anyway.
+//!
 //! # Actions
 //!
 //! The lifecycle actions (`start`/`stop`/`reboot`/`terminate`) are the only
@@ -64,26 +75,10 @@ use mlua::{
 };
 use std::sync::{Arc, Mutex};
 
-use super::{BoxError, ClientSource, format_error_chain, lua_err, value_to_string_list};
-
-/// Format a timestamp as RFC 3339, which keeps it comparable and printable in
-/// Luau, which has no native date type.
-fn date_to_string(dt: &aws_smithy_types::DateTime) -> Option<String> {
-    dt.fmt(aws_smithy_types::date_time::Format::DateTime).ok()
-}
-
-/// The `{ ok = .. }` envelope every operation returns as its first value.
-fn envelope(lua: &Lua, ok: bool) -> LuaResult<Table> {
-    let t = lua.create_table()?;
-    t.raw_set("ok", ok)?;
-    Ok(t)
-}
-
-/// Return `(envelope, data)`, the pair every `:send()` resolves to.
-fn respond(lua: &Lua, ok: bool, data: Value) -> LuaResult<MultiValue> {
-    let env = envelope(lua, ok)?;
-    Ok(MultiValue::from_vec(vec![Value::Table(env), data]))
-}
+use super::{
+    BoxError, ClientSource, array, date_to_string, format_error_chain, is_not_found, lua_err,
+    non_empty, respond, string_list,
+};
 
 /// Collect a `Tag` list into a `{[key] = value}` table.
 ///
@@ -107,6 +102,18 @@ fn tags_to_table(lua: &Lua, tags: Option<Vec<aws_sdk_ec2::types::Tag>>) -> LuaRe
 /// match: that one is a real answer to raise on.
 fn is_dry_run_success(err: &impl ProvideErrorMetadata) -> bool {
     err.code() == Some("DryRunOperation")
+}
+
+/// The answer to an accepted `:dry_run()`: nothing ran, so the data is an empty
+/// table and the envelope says `dry_run = true`.
+fn dry_run_ok(lua: &Lua) -> LuaResult<MultiValue> {
+    let env = lua.create_table()?;
+    env.raw_set("ok", true)?;
+    env.raw_set("dry_run", true)?;
+    Ok(MultiValue::from_vec(vec![
+        Value::Table(env),
+        Value::Table(array(&lua, lua.create_table()?)),
+    ]))
 }
 
 /// Shared request state, mutated in place by the builder methods.
@@ -150,7 +157,12 @@ impl DescribeInstances {
         let mut stream = req.into_paginator().items().send();
         let mut instances = Vec::new();
         while let Some(reservation) = stream.next().await {
-            let reservation = reservation?;
+            let reservation = match reservation {
+                Ok(r) => r,
+                // An unknown id is "no match", not a failure.
+                Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
             instances.extend(reservation.instances.unwrap_or_default());
         }
         Ok(instances)
@@ -163,7 +175,8 @@ impl UserData for DescribeInstances {
         // Each corresponds to a real EC2 filter, so the available methods
         // describe the actual API surface.
 
-        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Vec<String>)| {
+        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Value)| {
+            let ids = string_list("ec2:ids", ids)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -174,6 +187,7 @@ impl UserData for DescribeInstances {
         });
 
         methods.add_function("id", |_, (ud, id): (AnyUserData, String)| {
+            let id = non_empty("ec2:id", id)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -189,7 +203,7 @@ impl UserData for DescribeInstances {
         methods.add_function(
             "tag",
             |_, (ud, key, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = string_list("ec2:tag", values)?;
                 push_filter(&ud, format!("tag:{key}"), values)?;
                 Ok(ud)
             },
@@ -197,31 +211,31 @@ impl UserData for DescribeInstances {
 
         // `tag-key` — instances carrying the key, regardless of value.
         methods.add_function("tag_key", |_, (ud, keys): (AnyUserData, Value)| {
-            let keys = value_to_string_list(keys)?;
+            let keys = string_list("ec2:tag_key", keys)?;
             push_filter(&ud, "tag-key".to_string(), keys)?;
             Ok(ud)
         });
 
         methods.add_function("instance_state", |_, (ud, states): (AnyUserData, Value)| {
-            let states = value_to_string_list(states)?;
+            let states = string_list("ec2:instance_state", states)?;
             push_filter(&ud, "instance-state-name".to_string(), states)?;
             Ok(ud)
         });
 
         methods.add_function("instance_type", |_, (ud, types): (AnyUserData, Value)| {
-            let types = value_to_string_list(types)?;
+            let types = string_list("ec2:instance_type", types)?;
             push_filter(&ud, "instance-type".to_string(), types)?;
             Ok(ud)
         });
 
         methods.add_function("vpc_id", |_, (ud, ids): (AnyUserData, Value)| {
-            let ids = value_to_string_list(ids)?;
+            let ids = string_list("ec2:vpc_id", ids)?;
             push_filter(&ud, "vpc-id".to_string(), ids)?;
             Ok(ud)
         });
 
         methods.add_function("subnet_id", |_, (ud, ids): (AnyUserData, Value)| {
-            let ids = value_to_string_list(ids)?;
+            let ids = string_list("ec2:subnet_id", ids)?;
             push_filter(&ud, "subnet-id".to_string(), ids)?;
             Ok(ud)
         });
@@ -229,7 +243,7 @@ impl UserData for DescribeInstances {
         // `Name` is a tag, not an instance attribute; this is sugar for
         // `:tag("Name", ...)` and inherits the same wildcard support.
         methods.add_function("name", |_, (ud, names): (AnyUserData, Value)| {
-            let names = value_to_string_list(names)?;
+            let names = string_list("ec2:name", names)?;
             push_filter(&ud, "tag:Name".to_string(), names)?;
             Ok(ud)
         });
@@ -239,7 +253,7 @@ impl UserData for DescribeInstances {
         methods.add_function(
             "filter",
             |_, (ud, name, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = string_list("ec2:filter", values)?;
                 push_filter(&ud, name, values)?;
                 Ok(ud)
             },
@@ -266,7 +280,7 @@ impl UserData for DescribeInstances {
             }
             // Always ok: no matches is an empty table, and anything that could
             // have gone wrong has already raised.
-            respond(&lua, true, Value::Table(out))
+            respond(&lua, true, Value::Table(array(&lua, out)))
         });
     }
 }
@@ -364,6 +378,7 @@ struct DescribeImages {
 impl UserData for DescribeImages {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_function("id", |_, (ud, id): (AnyUserData, String)| {
+            let id = non_empty("ec2:id", id)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -373,7 +388,8 @@ impl UserData for DescribeImages {
             Ok(ud)
         });
 
-        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Vec<String>)| {
+        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Value)| {
+            let ids = string_list("ec2:ids", ids)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -387,7 +403,7 @@ impl UserData for DescribeImages {
         // `self`, `amazon`, `aws-marketplace`. Without one, the result is every
         // public AMI in the region, which is never what a script wants.
         methods.add_function("owner", |_, (ud, owners): (AnyUserData, Value)| {
-            let owners = value_to_string_list(owners)?;
+            let owners = string_list("ec2:owner", owners)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -398,7 +414,7 @@ impl UserData for DescribeImages {
         });
 
         methods.add_function("name", |_, (ud, names): (AnyUserData, Value)| {
-            let names = value_to_string_list(names)?;
+            let names = string_list("ec2:name", names)?;
             push_image_filter(&ud, "name".to_string(), names)?;
             Ok(ud)
         });
@@ -406,7 +422,7 @@ impl UserData for DescribeImages {
         methods.add_function(
             "tag",
             |_, (ud, key, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = string_list("ec2:tag", values)?;
                 push_image_filter(&ud, format!("tag:{key}"), values)?;
                 Ok(ud)
             },
@@ -414,19 +430,19 @@ impl UserData for DescribeImages {
 
         // `tag-key` — images carrying the key, regardless of value.
         methods.add_function("tag_key", |_, (ud, keys): (AnyUserData, Value)| {
-            let keys = value_to_string_list(keys)?;
+            let keys = string_list("ec2:tag_key", keys)?;
             push_image_filter(&ud, "tag-key".to_string(), keys)?;
             Ok(ud)
         });
 
         methods.add_function("state", |_, (ud, states): (AnyUserData, Value)| {
-            let states = value_to_string_list(states)?;
+            let states = string_list("ec2:state", states)?;
             push_image_filter(&ud, "state".to_string(), states)?;
             Ok(ud)
         });
 
         methods.add_function("architecture", |_, (ud, arches): (AnyUserData, Value)| {
-            let arches = value_to_string_list(arches)?;
+            let arches = string_list("ec2:architecture", arches)?;
             push_image_filter(&ud, "architecture".to_string(), arches)?;
             Ok(ud)
         });
@@ -444,7 +460,7 @@ impl UserData for DescribeImages {
         methods.add_function(
             "filter",
             |_, (ud, name, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = string_list("ec2:filter", values)?;
                 push_image_filter(&ud, name, values)?;
                 Ok(ud)
             },
@@ -475,12 +491,19 @@ impl UserData for DescribeImages {
             let mut idx = 0;
             let mut stream = req.into_paginator().items().send();
             while let Some(image) = stream.next().await {
-                let image = image.map_err(|e| lua_err(BoxError::from(e)))?;
+                let image = match image {
+                    Ok(v) => v,
+                    // An unknown id is "no match", not a failure.
+                    Err(e) if is_not_found(&e) => {
+                        return respond(&lua, true, Value::Table(array(&lua, lua.create_table()?)));
+                    }
+                    Err(e) => return Err(lua_err(BoxError::from(e))),
+                };
                 idx += 1;
                 out.raw_set(idx, image_to_table(&lua, image)?)?;
             }
 
-            respond(&lua, true, Value::Table(out))
+            respond(&lua, true, Value::Table(array(&lua, out)))
         });
     }
 }
@@ -562,6 +585,7 @@ struct DescribeSnapshots {
 impl UserData for DescribeSnapshots {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_function("id", |_, (ud, id): (AnyUserData, String)| {
+            let id = non_empty("ec2:id", id)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -571,7 +595,8 @@ impl UserData for DescribeSnapshots {
             Ok(ud)
         });
 
-        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Vec<String>)| {
+        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Value)| {
+            let ids = string_list("ec2:ids", ids)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -584,7 +609,7 @@ impl UserData for DescribeSnapshots {
         // As for images: without an owner the result is every public snapshot
         // in the region.
         methods.add_function("owner", |_, (ud, owners): (AnyUserData, Value)| {
-            let owners = value_to_string_list(owners)?;
+            let owners = string_list("ec2:owner", owners)?;
             ud.borrow::<Self>()?
                 .state
                 .lock()
@@ -595,13 +620,13 @@ impl UserData for DescribeSnapshots {
         });
 
         methods.add_function("volume_id", |_, (ud, ids): (AnyUserData, Value)| {
-            let ids = value_to_string_list(ids)?;
+            let ids = string_list("ec2:volume_id", ids)?;
             push_snapshot_filter(&ud, "volume-id".to_string(), ids)?;
             Ok(ud)
         });
 
         methods.add_function("status", |_, (ud, states): (AnyUserData, Value)| {
-            let states = value_to_string_list(states)?;
+            let states = string_list("ec2:status", states)?;
             push_snapshot_filter(&ud, "status".to_string(), states)?;
             Ok(ud)
         });
@@ -609,7 +634,7 @@ impl UserData for DescribeSnapshots {
         methods.add_function(
             "tag",
             |_, (ud, key, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = string_list("ec2:tag", values)?;
                 push_snapshot_filter(&ud, format!("tag:{key}"), values)?;
                 Ok(ud)
             },
@@ -617,7 +642,7 @@ impl UserData for DescribeSnapshots {
 
         // `tag-key` — snapshots carrying the key, regardless of value.
         methods.add_function("tag_key", |_, (ud, keys): (AnyUserData, Value)| {
-            let keys = value_to_string_list(keys)?;
+            let keys = string_list("ec2:tag_key", keys)?;
             push_snapshot_filter(&ud, "tag-key".to_string(), keys)?;
             Ok(ud)
         });
@@ -625,7 +650,7 @@ impl UserData for DescribeSnapshots {
         methods.add_function(
             "filter",
             |_, (ud, name, values): (AnyUserData, String, Value)| {
-                let values = value_to_string_list(values)?;
+                let values = string_list("ec2:filter", values)?;
                 push_snapshot_filter(&ud, name, values)?;
                 Ok(ud)
             },
@@ -652,12 +677,19 @@ impl UserData for DescribeSnapshots {
             let mut idx = 0;
             let mut stream = req.into_paginator().items().send();
             while let Some(snapshot) = stream.next().await {
-                let snapshot = snapshot.map_err(|e| lua_err(BoxError::from(e)))?;
+                let snapshot = match snapshot {
+                    Ok(v) => v,
+                    // An unknown id is "no match", not a failure.
+                    Err(e) if is_not_found(&e) => {
+                        return respond(&lua, true, Value::Table(array(&lua, lua.create_table()?)));
+                    }
+                    Err(e) => return Err(lua_err(BoxError::from(e))),
+                };
                 idx += 1;
                 out.raw_set(idx, snapshot_to_table(&lua, snapshot)?)?;
             }
 
-            respond(&lua, true, Value::Table(out))
+            respond(&lua, true, Value::Table(array(&lua, out)))
         });
     }
 }
@@ -711,6 +743,228 @@ fn snapshot_to_table(lua: &Lua, snapshot: Snapshot) -> LuaResult<Table> {
     }
 
     t.raw_set("tags", tags_to_table(lua, snapshot.tags)?)?;
+
+    Ok(t)
+}
+
+// --- describe_instance_status ------------------------------------------------
+
+/// Shared request state, mutated in place by the builder methods.
+#[derive(Default, Clone)]
+struct DescribeInstanceStatusState {
+    instance_ids: Vec<String>,
+    filters: Vec<(String, Vec<String>)>,
+    include_all_instances: bool,
+}
+
+/// Builder for `DescribeInstanceStatus`, finalized with `:send()`.
+///
+/// AWS's own verdict on an instance — the two-minute status checks plus any
+/// scheduled maintenance event — as opposed to `describe_instances`' `state`,
+/// which is EC2's *intended* lifecycle state. A `running` instance can still
+/// fail its system status check.
+struct DescribeInstanceStatus {
+    client: Client,
+    state: Arc<Mutex<DescribeInstanceStatusState>>,
+}
+
+impl UserData for DescribeInstanceStatus {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_function("id", |_, (ud, id): (AnyUserData, String)| {
+            let id = non_empty("ec2:id", id)?;
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .instance_ids
+                .push(id);
+            Ok(ud)
+        });
+
+        methods.add_function("ids", |_, (ud, ids): (AnyUserData, Value)| {
+            let ids = string_list("ec2:ids", ids)?;
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .instance_ids
+                .extend(ids);
+            Ok(ud)
+        });
+
+        // Off by default, matching the API: a stopped instance has no status
+        // checks to report, so including it would only add empty rows.
+        methods.add_function("include_all_instances", |_, ud: AnyUserData| {
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .include_all_instances = true;
+            Ok(ud)
+        });
+
+        // The same tag helpers `describe_instances` has: the health of the
+        // instances carrying a tag is one question, and without these it
+        // takes two round trips to ask.
+        methods.add_function(
+            "tag",
+            |_, (ud, key, values): (AnyUserData, String, Value)| {
+                let values = string_list("ec2:tag", values)?;
+                push_status_filter(&ud, format!("tag:{key}"), values)?;
+                Ok(ud)
+            },
+        );
+
+        methods.add_function("tag_key", |_, (ud, keys): (AnyUserData, Value)| {
+            let keys = string_list("ec2:tag_key", keys)?;
+            push_status_filter(&ud, "tag-key".to_string(), keys)?;
+            Ok(ud)
+        });
+
+        // `Name` is a tag, not an instance attribute; sugar for `:tag("Name", …)`.
+        methods.add_function("name", |_, (ud, names): (AnyUserData, Value)| {
+            let names = string_list("ec2:name", names)?;
+            push_status_filter(&ud, "tag:Name".to_string(), names)?;
+            Ok(ud)
+        });
+
+        methods.add_function(
+            "filter",
+            |_, (ud, name, values): (AnyUserData, String, Value)| {
+                let values = string_list("ec2:filter", values)?;
+                push_status_filter(&ud, name, values)?;
+                Ok(ud)
+            },
+        );
+
+        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
+            let (client, state) = {
+                let this = ud.borrow::<Self>()?;
+                (this.client.clone(), this.state.lock().unwrap().clone())
+            };
+
+            let mut req = client.describe_instance_status();
+            if !state.instance_ids.is_empty() {
+                req = req.set_instance_ids(Some(state.instance_ids));
+            }
+            if state.include_all_instances {
+                req = req.include_all_instances(true);
+            }
+            if !state.filters.is_empty() {
+                req = req.set_filters(Some(build_filters(state.filters)));
+            }
+
+            let out = lua.create_table()?;
+            let mut idx = 0;
+            let mut stream = req.into_paginator().items().send();
+            while let Some(status) = stream.next().await {
+                let status = match status {
+                    Ok(v) => v,
+                    // An unknown id is "no match", not a failure.
+                    Err(e) if is_not_found(&e) => {
+                        return respond(&lua, true, Value::Table(array(&lua, lua.create_table()?)));
+                    }
+                    Err(e) => return Err(lua_err(BoxError::from(e))),
+                };
+                idx += 1;
+                out.raw_set(idx, instance_status_to_table(&lua, status)?)?;
+            }
+
+            respond(&lua, true, Value::Table(array(&lua, out)))
+        });
+    }
+}
+
+/// Append a filter to a [`DescribeInstanceStatus`] builder's shared state.
+fn push_status_filter(ud: &AnyUserData, name: String, values: Vec<String>) -> LuaResult<()> {
+    ud.borrow::<DescribeInstanceStatus>()?
+        .state
+        .lock()
+        .unwrap()
+        .filters
+        .push((name, values));
+    Ok(())
+}
+
+fn status_summary_to_table(
+    lua: &Lua,
+    summary: aws_sdk_ec2::types::InstanceStatusSummary,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+    if let Some(v) = summary.status {
+        t.raw_set("status", v.as_str().to_string())?;
+    }
+    let details = lua.create_table()?;
+    for (idx, d) in summary.details.unwrap_or_default().into_iter().enumerate() {
+        let dt = lua.create_table()?;
+        if let Some(v) = d.name {
+            dt.raw_set("name", v.as_str().to_string())?;
+        }
+        if let Some(v) = d.status {
+            dt.raw_set("status", v.as_str().to_string())?;
+        }
+        if let Some(v) = d.impaired_since.as_ref().and_then(date_to_string) {
+            dt.raw_set("impaired_since", v)?;
+        }
+        details.raw_set(idx + 1, dt)?;
+    }
+    t.raw_set("details", details)?;
+    Ok(t)
+}
+
+fn instance_status_to_table(
+    lua: &Lua,
+    status: aws_sdk_ec2::types::InstanceStatus,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+
+    if let Some(v) = status.instance_id {
+        t.raw_set("instance_id", v)?;
+    }
+    if let Some(v) = status.availability_zone {
+        t.raw_set("availability_zone", v)?;
+    }
+    if let Some(state) = status.instance_state {
+        if let Some(name) = state.name {
+            t.raw_set("instance_state", name.as_str().to_string())?;
+        }
+        if let Some(code) = state.code {
+            t.raw_set("instance_state_code", code)?;
+        }
+    }
+    if let Some(v) = status.instance_status {
+        t.raw_set("instance_status", status_summary_to_table(lua, v)?)?;
+    }
+    if let Some(v) = status.system_status {
+        t.raw_set("system_status", status_summary_to_table(lua, v)?)?;
+    }
+
+    // Scheduled maintenance events (reboot, retirement, ...) that explain a
+    // status change without a health-check failure behind it.
+    let events = lua.create_table()?;
+    for (idx, event) in status.events.unwrap_or_default().into_iter().enumerate() {
+        let e = lua.create_table()?;
+        if let Some(v) = event.instance_event_id {
+            e.raw_set("id", v)?;
+        }
+        if let Some(v) = event.code {
+            e.raw_set("code", v.as_str().to_string())?;
+        }
+        if let Some(v) = event.description {
+            e.raw_set("description", v)?;
+        }
+        if let Some(v) = event.not_before.as_ref().and_then(date_to_string) {
+            e.raw_set("not_before", v)?;
+        }
+        if let Some(v) = event.not_after.as_ref().and_then(date_to_string) {
+            e.raw_set("not_after", v)?;
+        }
+        if let Some(v) = event.not_before_deadline.as_ref().and_then(date_to_string) {
+            e.raw_set("not_before_deadline", v)?;
+        }
+        events.raw_set(idx + 1, e)?;
+    }
+    t.raw_set("events", events)?;
 
     Ok(t)
 }
@@ -818,7 +1072,7 @@ impl UserData for LifecycleAction {
                         .await;
                     match out {
                         Ok(out) => out.starting_instances.unwrap_or_default(),
-                        Err(e) if is_dry_run_success(&e) => return respond(&lua, true, Value::Nil),
+                        Err(e) if is_dry_run_success(&e) => return dry_run_ok(&lua),
                         Err(e) => return Err(lua_err(BoxError::from(e))),
                     }
                 }
@@ -833,7 +1087,7 @@ impl UserData for LifecycleAction {
                         .await;
                     match out {
                         Ok(out) => out.stopping_instances.unwrap_or_default(),
-                        Err(e) if is_dry_run_success(&e) => return respond(&lua, true, Value::Nil),
+                        Err(e) if is_dry_run_success(&e) => return dry_run_ok(&lua),
                         Err(e) => return Err(lua_err(BoxError::from(e))),
                     }
                 }
@@ -846,7 +1100,7 @@ impl UserData for LifecycleAction {
                         .await;
                     match out {
                         Ok(out) => out.terminating_instances.unwrap_or_default(),
-                        Err(e) if is_dry_run_success(&e) => return respond(&lua, true, Value::Nil),
+                        Err(e) if is_dry_run_success(&e) => return dry_run_ok(&lua),
                         Err(e) => return Err(lua_err(BoxError::from(e))),
                     }
                 }
@@ -861,7 +1115,7 @@ impl UserData for LifecycleAction {
                         .await;
                     match out {
                         Ok(_) => Vec::new(),
-                        Err(e) if is_dry_run_success(&e) => return respond(&lua, true, Value::Nil),
+                        Err(e) if is_dry_run_success(&e) => return dry_run_ok(&lua),
                         Err(e) => return Err(lua_err(BoxError::from(e))),
                     }
                 }
@@ -871,7 +1125,7 @@ impl UserData for LifecycleAction {
             for (idx, change) in changes.into_iter().enumerate() {
                 out.raw_set(idx + 1, state_change_to_table(&lua, change)?)?;
             }
-            respond(&lua, true, Value::Table(out))
+            respond(&lua, true, Value::Table(array(&lua, out)))
         });
     }
 }
@@ -987,7 +1241,16 @@ fn value_to_tag_specs(value: Value, allow_key_only: bool, action: &str) -> LuaRe
     // The sequence part first: these are bare keys.
     let seq_len = t.raw_len();
     for idx in 1..=seq_len {
-        let key: String = t.raw_get(idx)?;
+        // Strict: a number would coerce to a string key (`{123}`) unnoticed.
+        let key = match t.raw_get::<Value>(idx)? {
+            Value::String(s) if !s.as_bytes().is_empty() => s.to_str()?.to_string(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "{action}: tag keys must be non-empty strings, got {}",
+                    other.type_name()
+                )));
+            }
+        };
         if !allow_key_only {
             return Err(mlua::Error::runtime(format!(
                 "{action}: tags must be a {{[key] = value}} map, got a key without a value ({key:?})"
@@ -1103,7 +1366,7 @@ impl UserData for TagRequest {
                         .await;
                     match out {
                         Ok(_) => {}
-                        Err(e) if is_dry_run_success(&e) => return respond(&lua, true, Value::Nil),
+                        Err(e) if is_dry_run_success(&e) => return dry_run_ok(&lua),
                         Err(e) => return Err(lua_err(BoxError::from(e))),
                     }
                 }
@@ -1117,7 +1380,7 @@ impl UserData for TagRequest {
                         .await;
                     match out {
                         Ok(_) => {}
-                        Err(e) if is_dry_run_success(&e) => return respond(&lua, true, Value::Nil),
+                        Err(e) if is_dry_run_success(&e) => return dry_run_ok(&lua),
                         Err(e) => return Err(lua_err(BoxError::from(e))),
                     }
                 }
@@ -1153,9 +1416,10 @@ fn check_tag_request(action: TagAction, state: &TagState) -> LuaResult<Vec<TagSp
         }));
     };
 
-    // An empty *given* set is only a mistake on create; `delete_tags` with an
-    // explicitly empty set is the caller having said what they meant.
-    if action == TagAction::Create && tags.is_empty() {
+    // An empty set is a mistake on both: `create_tags` has nothing to write,
+    // and EC2 reads an empty `delete_tags` list as "delete every tag" (the SDK
+    // even omits the empty list from the request).
+    if tags.is_empty() {
         return Err(mlua::Error::runtime(format!(
             "{}: expected at least one tag",
             action.name()
@@ -1222,6 +1486,20 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         })?,
     )?;
 
+    let c = source.clone();
+    exports.raw_set(
+        "describe_instance_status",
+        lua.create_async_function(move |_, ()| {
+            let c = c.clone();
+            async move {
+                Ok(DescribeInstanceStatus {
+                    client: c.ec2().await,
+                    state: Arc::new(Mutex::new(DescribeInstanceStatusState::default())),
+                })
+            }
+        })?,
+    )?;
+
     // The four lifecycle actions differ only in the enum they carry, so they
     // are registered from one list rather than four near-identical closures.
     for (name, action) in [
@@ -1238,7 +1516,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
             lua.create_async_function(move |_, ids: Value| {
                 let c = c.clone();
                 async move {
-                    let instance_ids = value_to_string_list(ids)?;
+                    let instance_ids = string_list(name, ids)?;
                     Ok(LifecycleAction {
                         client: c.ec2().await,
                         action,
@@ -1269,7 +1547,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
             lua.create_async_function(move |_, resources: Value| {
                 let c = c.clone();
                 async move {
-                    let resources = value_to_string_list(resources)?;
+                    let resources = string_list(name, resources)?;
                     Ok(TagRequest {
                         client: c.ec2().await,
                         action,
@@ -1342,20 +1620,20 @@ mod tests {
     fn accepts_single_string_or_list() {
         let lua = Lua::new();
         let single = Value::String(lua.create_string("web").unwrap());
-        assert_eq!(value_to_string_list(single).unwrap(), vec!["web"]);
+        assert_eq!(string_list("t", single).unwrap(), vec!["web"]);
 
         let list = lua.create_table().unwrap();
         list.raw_set(1, "web").unwrap();
         list.raw_set(2, "api").unwrap();
         assert_eq!(
-            value_to_string_list(Value::Table(list)).unwrap(),
+            string_list("t", Value::Table(list)).unwrap(),
             vec!["web", "api"]
         );
     }
 
     #[test]
     fn rejects_non_string_values() {
-        let err = value_to_string_list(Value::Integer(42)).unwrap_err();
+        let err = string_list("t", Value::Integer(42)).unwrap_err();
         assert!(
             err.to_string()
                 .contains("expected string or array of strings")
@@ -1484,6 +1762,46 @@ mod tests {
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].name(), Some("instance-state-name"));
         assert_eq!(filters[0].values(), ["running", "stopped"]);
+    }
+
+    /// The status builder's tag helpers map onto the same EC2 filter names
+    /// `describe_instances` uses, so a tagged set's health is one call.
+    #[test]
+    fn instance_status_tag_helpers_build_ec2_filters() {
+        let lua = Lua::new();
+        let ud = lua
+            .create_userdata(DescribeInstanceStatus {
+                client: Client::new(
+                    &aws_config::SdkConfig::builder()
+                        .behavior_version(aws_config::BehaviorVersion::latest())
+                        .build(),
+                ),
+                state: Arc::new(Mutex::new(DescribeInstanceStatusState::default())),
+            })
+            .unwrap();
+        lua.globals().raw_set("status", ud.clone()).unwrap();
+
+        lua.load(r#"status:name("web"):tag("Env", "prod"):tag_key("Owner")"#)
+            .exec()
+            .unwrap();
+
+        let filters = ud
+            .borrow::<DescribeInstanceStatus>()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .filters
+            .clone();
+
+        assert_eq!(
+            filters,
+            vec![
+                ("tag:Name".to_string(), vec!["web".to_string()]),
+                ("tag:Env".to_string(), vec!["prod".to_string()]),
+                ("tag-key".to_string(), vec!["Owner".to_string()]),
+            ]
+        );
     }
 
     // --- tagging -----------------------------------------------------------
@@ -1629,10 +1947,10 @@ mod tests {
         assert!(delete.contains("':tags()'"), "{delete}");
     }
 
-    /// An explicitly empty set is a mistake on create but the caller's own
-    /// words on delete.
+    /// An empty set is an error on both: on delete EC2 would read it as "every
+    /// tag" (P0-1).
     #[test]
-    fn empty_tag_set_is_create_only_error() {
+    fn empty_tag_set_is_rejected_on_both() {
         let state = TagState {
             resources: vec!["i-abc".to_string()],
             tags: Some(Vec::new()),
@@ -1640,9 +1958,25 @@ mod tests {
         };
 
         assert!(check_tag_request(TagAction::Create, &state).is_err());
-        assert_eq!(
-            check_tag_request(TagAction::Delete, &state).unwrap(),
-            Vec::new()
-        );
+        assert!(check_tag_request(TagAction::Delete, &state).is_err());
+    }
+
+    #[test]
+    fn empty_ids_and_numeric_tag_keys_are_rejected() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        assert!(string_list("ec2:ids", Value::Table(t)).is_err());
+        let t = lua.create_table().unwrap();
+        t.raw_set(1, 123).unwrap();
+        assert!(value_to_tag_specs(Value::Table(t), true, "delete_tags").is_err());
+    }
+
+    #[test]
+    fn dry_run_answer_is_flagged_with_empty_data() {
+        let lua = Lua::new();
+        let mv = dry_run_ok(&lua).unwrap().into_vec();
+        let Value::Table(env) = &mv[0] else { panic!() };
+        assert!(env.raw_get::<bool>("dry_run").unwrap());
+        assert!(matches!(mv[1], Value::Table(_)));
     }
 }

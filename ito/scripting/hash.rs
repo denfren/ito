@@ -1,13 +1,17 @@
 //! Luau bindings for the common cryptographic digests.
 //!
-//! Registered as the global `hash`. Four algorithms — `md5`, `sha1`, `sha256`
-//! and `sha512` — each in three forms:
+//! Registered as the global `hash`. Six algorithms — `md5`, `sha1`, `sha224`,
+//! `sha256`, `sha384` and `sha512` — each in four forms:
 //!
 //! ```lua
 //! hash.sha256("abc")             --> "ba7816bf..." (lowercase hex)
 //! hash.sha256_bytes("abc")       --> a 32-byte buffer
 //! hash.sha256_file("archive.gz") --> "..." (hex, streamed, never read into Luau)
+//! hash.sha256_file_bytes("a.gz") --> a 32-byte buffer
 //! ```
+//!
+//! Hex output is lowercase: compare an uppercase published digest with
+//! `:lower()`. `_file` paths are taken as bytes (non-UTF-8 names work on unix).
 //!
 //! **Hex is the default return** because it is what a hash is nearly always
 //! wanted for — a name, a comparison against a published checksum, a cache key —
@@ -25,13 +29,14 @@
 //!
 //! `register` installs the string/buffer forms, which are **pure**: bytes in,
 //! digest out, no ambient state. [`register_host_files`] adds the `_file` forms
-//! under `host_io` (`ito`/`irun`), because reading a path by name is a
-//! filesystem read, and under `iq`/`ied` that would bypass the rooted VFS's
+//! under `host_io` (`ito`), because reading a path by name is a
+//! filesystem read, and under `ied` that would bypass the rooted VFS's
 //! containment entirely — `Source::render` settles which paths may be *named*,
 //! and a hash of a file outside the root leaks its contents a bit at a time just
 //! as surely as reading it would. Absent rather than stubbed, so
-//! `if hash.sha256_file then` is a usable feature test; under `iq`/`ied` a
-//! script reads through `fs` and hashes the result.
+//! `if hash.sha256_file then` is a usable feature test; under `ied` a
+//! script reads through `fs` and hashes the result (`fs.read` fails on
+//! non-UTF-8 content, so binary files need `ito`). A rooted `_file` form is possible but not provided.
 //!
 //! ## Not here
 //!
@@ -41,10 +46,11 @@
 //! an updatable object is the shape to add if hashing something that is neither a
 //! value nor a file ever comes up, and adding it later costs nothing.
 
+use crate::scripting::encoding::hex_encode;
 use md5::Md5;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -106,7 +112,7 @@ fn add_value_forms<D: Digest + 'static>(
 ) -> LuaResult<()> {
     exports.raw_set(
         name,
-        lua.create_function(|_, value: Value| Ok(hex::encode(digest_value::<D>(&value)?)))?,
+        lua.create_function(|_, value: Value| Ok(hex_encode(digest_value::<D>(&value)?)))?,
     )?;
     exports.raw_set(
         format!("{name}_bytes"),
@@ -115,7 +121,7 @@ fn add_value_forms<D: Digest + 'static>(
     Ok(())
 }
 
-/// Install `<name>_file` for one algorithm.
+/// Install `<name>_file` (hex) and `<name>_file_bytes` (buffer) for one algorithm.
 fn add_file_form<D: Digest + Send + 'static>(
     lua: &Lua,
     exports: &Table,
@@ -123,17 +129,35 @@ fn add_file_form<D: Digest + Send + 'static>(
 ) -> LuaResult<()> {
     exports.raw_set(
         format!("{name}_file"),
-        lua.create_async_function(|_, path: String| async move {
-            let path = PathBuf::from(path);
-            let display = path.display().to_string();
-            let digest = tokio::task::spawn_blocking(move || digest_file_blocking::<D>(&path))
-                .await
-                .map_err(|e| mlua::Error::runtime(format!("hash task failed: {e}")))?
-                .map_err(|e| mlua::Error::runtime(format!("failed to hash '{display}': {e}")))?;
-            Ok(hex::encode(digest))
+        lua.create_async_function(|_, path: mlua::LuaString| async move {
+            Ok(hex_encode(digest_path::<D>(&path).await?))
+        })?,
+    )?;
+    exports.raw_set(
+        format!("{name}_file_bytes"),
+        lua.create_async_function(|lua, path: mlua::LuaString| async move {
+            lua.create_buffer(digest_path::<D>(&path).await?)
         })?,
     )?;
     Ok(())
+}
+
+/// Hash the file named by a Luau string on a blocking thread. The path is
+/// taken as bytes, so a non-UTF-8 name works on unix (Luau strings are bytes).
+async fn digest_path<D: Digest + Send + 'static>(path: &mlua::LuaString) -> LuaResult<Vec<u8>> {
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&path.as_bytes()))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(path.to_str()?.to_string());
+    // Same wording as `fs` read errors: `<verb> <path>: <cause>`.
+    let display = path.display().to_string();
+    tokio::task::spawn_blocking(move || digest_file_blocking::<D>(&path))
+        .await
+        .map_err(|e| mlua::Error::runtime(format!("hash task failed: {e}")))?
+        .map_err(|e| mlua::Error::runtime(format!("hash {display}: {e}")))
 }
 
 /// Register the `hash` module's pure half: the string/buffer forms, on every
@@ -142,7 +166,9 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
     let exports = lua.create_table()?;
     add_value_forms::<Md5>(lua, &exports, "md5")?;
     add_value_forms::<Sha1>(lua, &exports, "sha1")?;
+    add_value_forms::<Sha224>(lua, &exports, "sha224")?;
     add_value_forms::<Sha256>(lua, &exports, "sha256")?;
+    add_value_forms::<Sha384>(lua, &exports, "sha384")?;
     add_value_forms::<Sha512>(lua, &exports, "sha512")?;
     lua.globals().raw_set("hash", exports)?;
     Ok(())
@@ -150,7 +176,7 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
 
 /// Add the `_file` forms to the already-registered `hash` table.
 ///
-/// Host-only (`ito`/`irun`), for the reason given in the module docs: naming a
+/// Host-only (`ito`), for the reason given in the module docs: naming a
 /// path to read is a filesystem capability, and the rooted binaries' `fs` is
 /// where that question is already answered. Like the other reach-into-a-table
 /// steps in `Engine::build`, this must run before `sandbox(true)` freezes it.
@@ -158,7 +184,9 @@ pub fn register_host_files(lua: &Lua) -> LuaResult<()> {
     let exports: Table = lua.globals().get("hash")?;
     add_file_form::<Md5>(lua, &exports, "md5")?;
     add_file_form::<Sha1>(lua, &exports, "sha1")?;
+    add_file_form::<Sha224>(lua, &exports, "sha224")?;
     add_file_form::<Sha256>(lua, &exports, "sha256")?;
+    add_file_form::<Sha384>(lua, &exports, "sha384")?;
     add_file_form::<Sha512>(lua, &exports, "sha512")?;
     Ok(())
 }
@@ -179,6 +207,7 @@ mod tests {
             let lua = Lua::new();
             register(&lua)?;
             register_host_files(&lua)?;
+            crate::scripting::encoding::register(&lua)?;
             lua.load(script).exec_async().await
         })
     }
@@ -276,9 +305,60 @@ mod tests {
     }
 
     #[test]
+    fn sha224_and_sha384_vectors() {
+        eval(
+            r#"
+            assert(hash.sha224("abc") == "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7")
+            assert(hash.sha384("abc") == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed" ..
+                "8086072ba1e7cc2358baeca134c825a7")
+        "#,
+        )
+        .unwrap();
+    }
+
+    /// Non-UTF-8 input: pinned digest of bytes FF FE 00 01.
+    #[test]
+    fn non_utf8_vector_is_pinned() {
+        eval(
+            r#"
+            local raw = string.char(255, 254, 0, 1)
+            assert(hash.sha256(raw) == hash.sha256(buffer.fromstring(raw)))
+            assert(hash.sha1(raw) == hash.sha1(buffer.fromstring(raw)))
+            assert(#hash.sha256(raw) == 64)
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn file_bytes_form_matches_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let script = format!(
+            r#"
+            local b = hash.sha256_file_bytes("{path}")
+            assert(buffer.len(b) == 32)
+            assert(encoding.base64.encode(b) == encoding.base64.encode(hash.sha256_bytes("abc")))
+        "#,
+            path = path.display()
+        );
+        eval(&script).unwrap();
+    }
+
+    #[test]
+    fn file_forms_are_absent_without_host_files() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        lua.load("assert(hash.sha256_file == nil and hash.sha256_file_bytes == nil)")
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
     fn missing_file_raises() {
         let err = eval(r#"hash.sha256_file("/no/such/file-xyz")"#).unwrap_err();
-        assert!(err.to_string().contains("failed to hash"), "got: {err}");
+        assert!(err.to_string().contains("hash /no/such/file-xyz"), "got: {err}");
     }
 
     #[test]

@@ -23,17 +23,15 @@ defaults):
 - `docs/src/binaries/<binary>.md` — the affected program's chapter. Each
   covers one binary's operating model, its module list, and its gotchas.
   Written **self-contained**: a chapter never mentions or compares itself
-  to the others, because a reader arrives at exactly one of them. The
-  exception is `irun`, which is defined by its relationship to `ito` and
-  so points at that chapter for everything they share.
+  to the others, because a reader arrives at exactly one of them.
 - `README.md` — the capability summary and the `## Scripting` module list.
 - `ito/cli.rs` — clap `help`/`long_about`/`about` strings are themselves
   user-facing; keep them in sync.
 - `docs/src/intro.md` — only if the change touches what it documents (the
-  `--doc` help workflow, the "no positional input / `-C` is the root"
-  framing, or the exit-code summary).
+  `--doc` help workflow, the `<binary> [<flags>] <script> [<args>...]`
+  grammar and `-C` framing, or the exit-code summary).
 - `docs/src/args.md` — only for the script-argument surface (`argv`):
-  the `::` separator, and `irun`'s separator-free form.
+  everything after `<script>` belongs to the script.
 
 When the **Luau/stdlib surface** changes (functions, modules, builders,
 injected globals):
@@ -57,13 +55,12 @@ Notes:
   patterns" (the name of that pattern syntax, which Luau inherits), the
   sentence in `ito-vs-luau.md` defining Luau as a Lua 5.1 dialect, and
   Rust identifiers like `mlua::Lua`.
-- **One book, three front doors.** Every binary *with a `--doc`* embeds
-  every topic, so the registry is shared and `--doc <topic>` reaches
-  everything from any of them. A bare `--doc` prints the invoking
-  program's own chapter followed by the topic list; `help::doc` takes the
-  program name (from the clap `Command`) to pick it. Keep all four binary
-  chapters in `TOPICS` — `irun` has a chapter but no flag to print it
-  (it parses nothing), so its page is reached as `ito --doc irun`.
+- **One book, two front doors.** Every binary embeds every topic, so
+  the registry is shared and `--doc <topic>` reaches everything from
+  either. A bare `--doc` prints the invoking program's own chapter
+  followed by the topic list; `help::doc` takes the program name (from
+  the clap `Command`) to pick it. Keep both binary chapters in
+  `TOPICS`.
 - **Placeholder convention in prose docs** (README, `docs/src/**`,
   `help.rs` markdown strings, this file): write argument placeholders
   lowercase and angle-bracketed — `<path>` for required, `[<path>]` for
@@ -80,18 +77,145 @@ Notes:
 
 ### `docs/src/modules/*.md` structure
 
-Every module chapter follows the same shape: a summary table, a short
-motivating example, a general-rules/conventions section for whatever cuts
-across multiple functions, then **one section per function** (or method)
-with — only the subsections that apply, never a placeholder for one that
-doesn't:
+Every module chapter has the same skeleton. Only the sections that apply
+are present — never an empty placeholder.
 
-- one-line "what is it"
-- signature
-- parameters, described individually
-- return value(s)
-- error conditions (raise vs. `nil`/empty, precisely)
-- an example
+1. `# \`module\` — one-line scope`. Backticks around a global name; the
+   text after the dash is a lower-case sentence fragment.
+2. A short intro: what the module is for, and in one sentence its
+   capability delta (`not in ied`, pure vs. ambient), naming the feature
+   test (`if fs.append then`) where one exists.
+3. One or more summary tables (see below).
+4. `## Example` — one short, realistic snippet.
+5. `## Conventions` — rules that cut across several functions, including
+   the builder guidance below. Topic sections (`## Value mapping`,
+   `## Naming`) may sit beside it; the general-rules section is always
+   named `## Conventions`, never `## General rules` or `## Rules`. A
+   chapter whose cross-cutting rules are one named topic may name that
+   section instead (`## Value mapping` in `json`/`toml`;
+   `## Not a round-trip` / `## Format-preserving edits` in `yaml`).
+6. One section per callable, in summary-table order, then any topic
+   sections (`## Tagging`, `## Notes on structural edits`).
+
+#### Summary table
+
+The main table is exactly two columns: `| Function | Effect |`.
+
+- Use `Function` for callables, `Method` for handle methods in a chapter
+  with both, `Value` for constants, `Name` for a mixed table.
+- The second column is always `Effect`. There is no `Signature`,
+  `Returns` or `Description` column: fold the arguments into the first
+  cell (`json.parse(text, [name])`) and the result into the effect.
+- An `Availability` third column is allowed only when availability
+  genuinely varies per row and is central to the chapter (`fmt`, `ito`,
+  the write table in `fs`).
+- Auxiliary family tables may use the columns that family needs
+  (`| Shorthand | Builder | Returns |`, `| Constant | Value |`), but they
+  are secondary and never replace the main index.
+
+#### Per-callable section
+
+```markdown
+## `module.function`
+
+One prose sentence: what it is.
+
+**Signature:** `module.function(arg: type, opt?: type) -> ret`
+
+**Parameters:**
+- `arg` — what it is, its accepted types, its default.
+- `opt` — ... (optional)
+
+**Returns:** the type and shape, including `nil`/empty cases.
+
+**Errors:** what raises, what returns `nil`/`false`/`{}`, with the stable
+message prefix where one exists.
+
+```lua
+local x = module.function("a")
+print(x)   --> "..."
+```
+```
+
+Rules:
+
+- The heading is exactly `## \`<module>.<function>\`` — fully qualified,
+  no argument list, no ` — description`. A family of aliases/overloads
+  shares one heading, each segment naming the callable
+  (`## \`hash.md5\` / \`hash.sha1\` / ...`); a later segment may elide a
+  repeated prefix (`## \`fmt.starts_with\` / \`ends_with\` / \`contains\``).
+  A method is `## \`<Type>:<method>\`` (`pool:spawn`, `cursor:kind`,
+  `J2Engine:template`); a method documented under its constructor may be
+  `### \`<Type>:<method>\`` inside that constructor's `##` section (the
+  `fs.finder` methods are the model).
+- Field labels are exactly, bold and with a colon: `**Signature:**`,
+  `**Parameters:**`, `**Returns:**`, `**Errors:**`. Never `Return value`,
+  `Error conditions`, `Shape`, `Availability`, or a colon-less variant.
+- `**Signature:**` is one inline-code line. Use a fenced ```lua block
+  only when it genuinely wraps or lists several overloads. Type every
+  argument: `name: string`, `name?: string`, `...: any`; the arrow is
+  `->`, not `→`. Optional arguments use `?` in the signature and
+  `[<name>]` in prose/tables.
+- `**Parameters:**` describes each argument. With more than one, use
+  one bullet per argument: `- \`name\` — what it is, its type limits, its
+  default.` A single argument may be inline (`` `name` — … ``), and a call
+  with no arguments omits the label or writes `none.`
+- `**Returns:**` states the type and shape; several values are written
+  `(a, b)`. Omit it only when the call returns nothing.
+- `**Errors:**` says precisely what raises versus what returns
+  `nil`/`false`/`{}` (and why). Omit it only when the call cannot raise.
+- The example is one bare fenced ```lua block after `**Errors:**`, with
+  `-->` marking an expression's result and `--` for commentary. There is
+  no `**Example:**` label.
+- `**Methods:**` is the one extra bold label, used by a builder
+  constructor to index its methods (see below).
+- Cross-links use the chapter file and the heading's actual slug
+  (``[`fmt.trimmed`](fmt.md#fmttrimmed)``).
+
+#### Documenting builders
+
+A builder is a constructor that returns a handle, configuration methods
+that return the handle so calls chain, and a terminal that consumes it.
+The per-callable blocks document each method; `## Conventions` must also
+answer the whole-chain questions, in this order:
+
+1. **Constructor → chain → terminal.** Name the constructor
+   (`hcl.builder()`, `proc.command(program)`, `task.pool(n)`,
+   `aws.ec2.describe_instances()`, `encoding.base64.engine()`), say that
+   every configuration method returns the builder, and name the terminal
+   (`:to_string()`, `:run()`/`:spawn()`, `:await()`, `:send()`,
+   `:interact()`, `encode`/`decode`). A terminal is never `with_*`.
+2. **Mutable or immutable.** Say whether a setter mutates a shared handle
+   in place (aliases observe later calls) or returns a *new* builder (the
+   base keeps its settings). Both exist: `hcl`, `proc`, `j2`,
+   `ui.prompt` and `fmt.table` mutate a shared handle and return it;
+   `encoding.base64.engine` returns a new engine from every step. Do not
+   write "chainable" without saying which.
+3. **Method index.** The constructor's section carries a `**Methods:**`
+   list or table naming every setter and terminal, so the reader sees the
+   whole surface before the individual sections. The individual sections
+   follow in that order.
+4. **When validation happens.** Say whether a bad value raises at the
+   setter or at the terminal: `j2.with_syntax` raises at the setter,
+   `ui.prompt` validates at `:interact()`, `aws` ids are checked at the
+   entry call or at `:send()`. This is the most useful fact after the
+   chain shape.
+5. **Terminal result and async.** `:send()` → `(envelope, data)`;
+   `:run()` → the result table; `:await()` → the task results;
+   `:interact()` → the answer; `:to_string()` → text. Mark the async ones
+   (`:send()`, `:run()`, `:interact()`) explicitly.
+6. **Aliasing and replacement.** Say whether a setter replaces the whole
+   value (`aws...:tags()`, `:items()`, `:defaults()`) or accumulates
+   (`:tag()`, `:arg()`, `:item()`); a reader must not have to guess.
+
+If a builder has one uniform method family, a `**Methods:**` table under
+its constructor is enough; a method with non-obvious behaviour still gets
+its own `###`/`##` section and still appears in the index. Never document
+a builder only as a prose example with no method index.
+
+Naming follows `docs/src/conventions.md`: fluent configuration methods use
+`with_*`; a terminal is not `with_*`; the constructor is called with `.`
+and handle methods with `:`.
 
 Ground truth is always the Rust source in `ito/scripting/`, not the
 existing prose — a rewrite pass re-derives every claim from the
@@ -105,42 +229,61 @@ and reads (doesn't write) the shared Rust source.
 
 ## Architecture
 
-Four binaries share one Luau runner and one stdlib. Three of them differ
-in what a script may reach; the fourth (`irun`) matches `ito` exactly and
-differs only in who owns the command line. The capability boundary is
-**the absence of the globals themselves**, not a policy check, so
-`if fs.write then` is a usable feature test:
+Two binaries share one Luau runner and one stdlib. `ito` is the normal,
+full-featured one; `ied` is the restricted variant, and docs describe
+only what is *absent* there. The restriction's rationale is
+**reproducibility**: an `ied` run is a function of work-directory state +
+script, so anything ambient (clock, host zone, environment, randomness,
+processes, network, terminal, paths outside `-C`) is withheld — keep that
+in mind when deciding whether a new global belongs in `ied`. The capability
+boundary is **the absence of the globals themselves**, not a policy check,
+so `if fs.write then` is a usable feature test:
 
-| | `iq` | `ied` | `ito` | `irun` |
-| --- | --- | --- | --- | --- |
-| read files, parse formats | ✓ (`-f`) | ✓ | ✓ | ✓ |
-| `fs` namespace | rooted at `-C` | rooted at `-C` | the host filesystem | the host filesystem |
-| `fs.write`/`fs.remove` | — | buffered | direct | direct |
-| `fs.finder():grep()`/`:grep_files()` | — | — | ✓ | ✓ |
-| preview writes (`-d`/`-l`/`-e`), commit (`-w`) | — | ✓ | — | — |
-| `proc`/`ssh`/`aws.ec2`/`task`, `os.getenv` | — | — | ✓ | ✓ |
-| `fs.cwd`, `ito.require_root`/`require_dir` | — | — | ✓ | ✓ |
-| `time` value conversions, incl. named zones (bundled tzdb) | ✓ | ✓ | ✓ | ✓ |
-| `time.now`/`parse`/`format_local` | — | — | ✓ | ✓ |
-| ANSI styling methods, `ito.colors` | ✓ (auto = off) | ✓ (auto = off) | ✓ | ✓ |
-| `ito.is_tty`, colour auto-detection | — | — | ✓ | ✓ |
-| parses its own flags | ✓ | ✓ | ✓ | — |
+| | `ied` | `ito` |
+| --- | --- | --- |
+| read files, parse formats | ✓ | ✓ |
+| `fs` namespace | rooted at `-C` | the host filesystem |
+| `fs.write`/`fs.remove` | buffered | direct |
+| `fs.finder():grep()`/`:grep_files()` | — | ✓ |
+| preview writes (`-d`/`-l`/`-e`), commit (`-w`) | ✓ | — |
+| `proc`/`ssh`/`aws.ec2`/`task`, `os.getenv` | — | ✓ |
+| `fs.cwd`, `fs.script`, `fs.require_root`/`require_dir`, `proc.pid`, `ito.slug` | — | ✓ |
+| `hash` values, `encoding`, `ansible.vault.decrypt`/`is_vault` | ✓ | ✓ |
+| `hash.*_file`, `ansible.vault.encrypt`/`load_password_file` | — | ✓ |
+| `print` (vanilla, stdout) | ✓ | ✓ |
+| `io.stdout`/`stderr`/`stdin` handles, `io.write`/`read`/`lines`/`flush` | — | ✓ |
+| `ui.prompt`/`ui.progress` | — | ✓ |
+| `time` value conversions, incl. named zones (bundled tzdb) | ✓ | ✓ |
+| `time.now`/`till`/`ago`, `_local` parse/format/add/sub | — | ✓ |
+| `fmt` styles, text helpers, tables, `fmt.colors` | ✓ (auto = off) | ✓ |
+| `fmt.is_tty`, colour auto-detection | — | ✓ |
 
-Each *flag-parsing* binary has **its own clap `Parser`**
-(`IqCli`/`IedCli`/`ItoCli`), so a flag exists only where it means
-something — `iq --diff` is an unknown flag, not an accepted no-op. Shared
-groups (`CommonArgs`, `InputArgs`, `ReportArgs`) are flattened in by
-whichever binary applies them. `irun` has no `Parser` at all.
+Each binary has **its own clap `Parser`** (`IedCli`/`ItoCli`),
+so a flag exists only where it means something — `ito --diff` is an
+unknown flag, not an accepted no-op. Shared groups (`CommonArgs`,
+`ReportArgs`) are flattened in by whichever binary applies them.
 
 Per-binary specifics:
 
-- **`iq`** — a filter. The script's **return value is the output** (must
-  be a string, written to stdout verbatim); there is no `print`. `fs` is
-  opt-in via `-f` and read-only; `-C` without `-f` is a usage error.
 - **`ied`** — buffered edits. Writes queue and are applied **only** with
   `-w`/`--write`; a bare run computes the change set, reports on it, and
-  drops it. `-d`/`--diff` and `-l`/`--list-changed` are mutually
-  exclusive and each imply `-q`.
+  drops it (so it is also the read-only query tool). `-d`/`--diff` and
+  `-l`/`--list-changed` are mutually exclusive and each **imply `-q`**.
+  Its output surface is `print` alone (no `io`, so stderr is reachable
+  only via `log.*`); `-q` is only about `print` — it makes it a silent
+  no-op (`Config::print`), leaving reports, logs and exit codes alone, so
+  a report owns stdout. `ito` has no `-q` at all (`-v`/`-vv` raise log
+  verbosity only): scripts control their own output.
+- **Output sink.** `print` is vanilla (`tostring` per argument,
+  tab-joined, newline; a plain table prints `table: 0x…`, not JSON) and
+  never rerouted to the log (under `-q` it is silent). `print` (`print.rs`) and the `ito`-only `io`
+  handles (`io.rs`) all go through one `print::emit(stream, bytes)`:
+  progress bars paused, flushed on every write (a deliberate difference
+  from vanilla's buffering, so output interleaves with logs and bars), and
+  a broken pipe (`| head`) unwinds quietly to exit 141 (128 + SIGPIPE: the run was cut short; a `PIPE_BROKEN` flag keeps that true even if the script `pcall`ed the error). `io.stdout:write` is strict like vanilla
+  (strings and numbers only) and chains; there is no `io.open` (`fs` owns
+  files) and no `io.output`/`io.input` setters (`proc` redirects cover
+  that). `log.*` keeps its own JSON table rendering.
 - **`ito`** — the full toolset. Its `fs` is the **host filesystem**
   (`rfs.rs`), not a rooted VFS: relative paths resolve against the `-C`
   work directory, absolute paths and `..` reach outside it, and outward
@@ -152,55 +295,34 @@ Per-binary specifics:
   under `host_io`; there is deliberately no setter — a command's own
   `:env()` scopes a variable to the child instead of mutating process-wide
   state every later task would see). The host-location readers live here
-  for the same reason: `fs.cwd()`, plus `ito.require_root()`/
-  `ito.require_dir()` (the `require` anchors as values —
-  `require_dir` reads the *calling* chunk's name off the Luau stack, so a
-  `require`d module gets its own directory; both are registered under
-  `host_io` by `sl::ito::register_host_paths`). The clock joins them:
-  `time.now`, plus `time.parse` and `time.format_local`, which may read
-  the host's UTC *offset* (`sl::time::register_host_time`).
+  for the same reason: `fs.cwd()`, plus `fs.require_root()`/
+  `fs.require_dir()`/`fs.script()` (the `require` anchors and the running
+  script as values — `require_dir` reads the *calling* chunk's name off the
+  Luau stack, so a `require`d module gets its own directory; all are
+  registered onto `fs` under `host_io` by `sl::ito::register_host_paths`),
+  and `proc.pid()` (`register_host_pid`), `ito.slug()`. The clock joins them:
+  `time.now`, `time.till`/`time.ago`, plus the `_local` parse/format/add/sub
+  family, which read the host's time zone (`sl::time::register_host_time`).
   No preview flags: nothing is held back to preview. Also carries
   `--ai-skill-init`.
-- **`irun`** — `ito`'s engine composition with **no argument parsing at
-  all**: no clap `Parser`, no `CommonArgs`, no `::`. `argv[1]` is the
-  script path and every later argument is the script's, reaching it
-  verbatim as `argv`. It exists for `#!/usr/bin/env -S irun`, where the
-  binary and the script share one command line and the script should win
-  it. Nothing is intercepted **on purpose** — not `-C`, not `-v`, not
-  `--doc` — because claiming any spelling would take it from the script
-  forever; don't "improve" this by adding a flag or a `--` terminator. It
-  reuses `Startup` by building a default `CommonArgs` with only `script`
-  set, so script resolution (and its shebang handling) has one
-  implementation, not two. A bare `irun` is a usage error rather than the
-  script listing: whoever reached for it already has a specific file.
 
-Common to the three flag-parsing binaries: `<script>` (a **path** — no name lookup or search
-list), `-` for stdin, `-s <str>` for inline, `-r <dir>` to give a
-stdin/inline script an import root, `-C` (repeatable, make-style) for the
-working directory and `fs` root, `-v`, `--doc [<topic>]`, `--completion
-<shell>`. A bare invocation lists the scripts found in `./`, `ito/` and
-`.ito/`. Script paths resolve against the **invocation cwd, before `-C`
-applies** (so a `#!/usr/bin/env -S ito -C <dir>` shebang script is still
-found — the kernel passes it as `./<script>`). The only other positional
-is `INPUT`.
-
-`INPUT` (`InputArgs`, flattened by all three) is an optional path or `-`,
-read by `Startup::input` and installed as the `input` global by
-`Engine::build` — raw, unparsed text, `nil` when omitted so a script
-can tell "nothing passed" from "something empty passed". It is **not** a
-capability: what a script may *reach* is the boundary between the
-binaries, what it is *handed* is not, so the spelling is the same
-everywhere and both runtime pieces were always binary-agnostic. `SCRIPT`
-and `INPUT` cannot both be `-` (stdin is readable once); each binary's
-`validate` delegates that check to `InputArgs::validate`. The read happens
-*before* the engine is built, so a missing file fails before a script can
-buffer an edit or spawn a command.
-
-Also common to those three: a bare `::` ends the binary's own arguments.
-Everything after it is the script's, reaching it verbatim as the global
-`argv` (see `scripting/argv.rs`) — the only way to pass *those three* a
-script's arguments. `irun` needs no separator, having no arguments of its
-own to end.
+The grammar is `<binary> [<flags>] <script> [<args>...]` for both.
+The binary's flags — `-C` (repeatable, make-style) for the working
+directory and `fs` root, `-v`, `--doc [<topic>]`, `--completion <shell>`,
+plus the binary's own — go **before** `<script>` (a **path** — no name
+lookup or search list). Everything after it is the script's, reaching it
+verbatim as the global `argv` (see `scripting/argv.rs`) and `cli.parse`,
+flag-looking tokens included, so a `#!/usr/bin/env -S ito` script owns
+its whole command line. This is one clap positional
+(`CommonArgs::script_and_args`, `trailing_var_arg` +
+`allow_hyphen_values`) rather than `script` + `args`, because clap only
+stops taking flags once the *last* positional starts collecting. A bare
+invocation lists the scripts found in `./`, `ito/` and `.ito/`. Script
+paths resolve against the **invocation cwd, before `-C` applies** (so a
+`#!/usr/bin/env -S ito -C <dir>` shebang script is still found — the
+kernel passes it as `./<script>`). A leading shebang line is turned into
+a Luau comment (`comment_out_shebang` in `run.rs`) rather than removed, so line
+numbers stay correct.
 
 Reports and `print()` go to stdout; all logging goes to stderr.
 
@@ -208,7 +330,8 @@ Exit codes: `0` success (no changes under `--exit-code`); `1` success
 *with* changes (only under `-e`/`--exit-code`, `git diff --exit-code`
 style — a "change" is a buffered write differing from disk); `2` generic
 failure not the script's fault (usage, `-C`, script load, output/flush);
-`3` the script's fault (parse/compile or runtime error). These are
+`3` the script's fault (parse/compile or runtime error); `141` the output
+pipe went away (`| head`; 128 + SIGPIPE, the run was cut short). These are
 modeled by `RunError { code, message }` in `run.rs` (`From<String>`
 defaults to `2`; `RunError::script` is `3`).
 
@@ -218,9 +341,9 @@ A Cargo workspace (root `Cargo.toml`, `resolver = "3"`). Shared
 dependency versions live in `[workspace.dependencies]`; members
 inherit via `.workspace = true`. Members:
 
-- **`ito/`** — the library crate plus **four** binaries (sources at the
+- **`ito/`** — the library crate plus **two** binaries (sources at the
   crate root, not `src/`; every `[[bin]]` and `[lib]` uses an explicit
-  `path`). `bin/{ito,iq,ied,irun}.rs` are each a short `main` over the
+  `path`). `bin/{ito,ied}.rs` are each a short `main` over the
   phases in `run.rs`; what a binary *does* is the `Config` it names, so
   the capability surface is one struct literal per binary rather than a
   call sequence each could get differently.
@@ -233,10 +356,10 @@ inherit via `.workspace = true`. Members:
 
 | File | Responsibility |
 | --- | --- |
-| `bin/{ito,iq,ied,irun}.rs` | One `main` each: parse, `Startup`, name a `Config`, `Engine::build`, `eval`, emit. They differ in **which `Config` constructor they name** and what they do with the result — nothing else. |
-| `run.rs` | The run phases. `Startup::begin` applies `-C` and captures the invocation cwd (script paths resolve against the latter, *before* the chdir, so a shebang script survives it); `Startup::script`/`input` load the sources; `handle_info_flags` handles the print-and-exit flags (`--doc` → `help::doc` with the program name, `--completion`). **`Config` is the whole of what differs between the binaries** — `fs: Fs::{None,Rooted{writes},Host}`, `host_io`, `ambient`, `stdout: Stdout::{Returned,Print{echo}}`, plus `input`/`argv` (uniform, not capabilities). `Config::iq`/`ied`/`ito` are the per-binary profiles; `irun` reuses `Config::ito` verbatim, so the two cannot drift. `Engine::build` is the *only* constructor: it makes the `mlua`/Luau state (`mlua::Lua::new()` installs Luau's default `require`, **replaced** by ito's `ItoRequirer` via `scripting::require::register` — confined to the entry script's directory tree, the *require root*, independent of the `fs`/`-C` root; see `docs/src/luau/require.md`), registers the core, `cli`+`argv`, `fs`, host I/O, drops ambient state, installs `print`/`input`, then `j2`, then `sandbox(true)`. Registration order is settled *inside* `build` rather than being a rule callers follow: `proc` before `ssh` (redirect targets), `j2` after the `fs` choice (`Fs::Rooted` → `j2::register`, `Fs::Host` → `register_host`, `Fs::None` → `register_without_fs` — an include is a file read, so it gets exactly the access `fs` got), `sandbox` last (it freezes the tables `remove_random`/`add_getenv`/`time::register_host_time` reach into). `Engine::vfs()` is an `Option` (`Some` only under `Fs::Rooted`), and only `ied` calls it. `Engine::eval` runs the chunk (named `@<abs path minus extension>`, so `require`'s caller-detection — which keys off the chunk name, Luau's `debug.info` convention — resolves relative to the entry script), then calls a global `main` if defined, then **drains outstanding `task`s**. Afterwards `emit_returned` (`iq`), `emit_reports` and `flush_writes` (`ied`); the drain-before-flush rule is `eval`'s own doing. Everything is `async` under a current-thread tokio runtime + `LocalSet` (`main_with`). Also holds `RunError`/`Outcome` and `init_tracing`. |
-| `cli.rs` | clap layer: one `Parser` per binary (`IqCli`/`IedCli`/`ItoCli`), each flattening the shared groups it applies — so a binary's flag set is what its struct declares, with no runtime filtering. `CommonArgs` is script source + `-C` + `-v` + the `--doc`/`--completion` exits; `ReportArgs` is `-w`/`-d`/`-l`/`-e` (only `IedCli`). `ParseWithArgv` is a blanket trait that splits the command line at the first bare `::` before clap sees it — everything after is the script's, so no binary can forget to. |
-| `help.rs` | `--doc` implementation: the `TOPICS` registry (`include_str!`s `docs/src/**`, including all three binary chapters), topic lookup, the grouped listing, the per-program default page, and the styled-markdown-through-a-pager `emit` (honors `--doc-plain`/`--doc-no-pager`/`NO_COLOR`). |
+| `bin/{ito,ied}.rs` | One `main` each: parse, `Startup`, name a `Config`, `Engine::build`, `eval`, emit. They differ in **which `Config` constructor they name** and what they do with the result — nothing else. |
+| `run.rs` | The run phases. `Startup::begin` applies `-C` and captures the invocation cwd (script paths resolve against the latter, *before* the chdir, so a shebang script survives it); `Startup::script` loads the script (or lists the available ones when none was given); `handle_info_flags` handles the print-and-exit flags (`--doc` → `help::doc` with the program name, `--completion`). **`Config` is the whole of what differs between the binaries** — `fs: Fs::{Rooted{writes},Host}`, `host_io`, `ambient`, `print` (whether `print` writes), plus `argv` (uniform, not a capability). `Config::ied`/`ito` are the per-binary profiles. `Engine::build` is the *only* constructor: it makes the `mlua`/Luau state (`mlua::Lua::new()` installs Luau's default `require`, **replaced** by ito's `ItoRequirer` via `scripting::require::register` — confined to the entry script's directory tree, the *require root*, independent of the `fs`/`-C` root; see `docs/src/luau/require.md`), registers the core (including `print`), `cli`+`argv`, `fs`, host I/O (including `io`), drops ambient state, then `j2`, then `sandbox(true)`. Registration order is settled *inside* `build` rather than being a rule callers follow: `proc` before `ssh` (redirect targets), `j2` after the `fs` choice (`Fs::Rooted` → `j2::register`, `Fs::Host` → `register_host` (`register_without_fs` is currently unused) — an include is a file read, so it gets exactly the access `fs` got), `sandbox` last (it freezes the tables `remove_random`/`add_getenv`/`time::register_host_time` reach into). `Engine::vfs()` is an `Option` (`Some` only under `Fs::Rooted`), and only `ied` calls it. `Engine::eval` runs the chunk (named `@<abs path minus extension>`, so `require`'s caller-detection — which keys off the chunk name, Luau's `debug.info` convention — resolves relative to the entry script), then calls a global `main` if defined, then **drains outstanding `task`s**. Afterwards `emit_reports` and `flush_writes` (`ied`); the drain-before-flush rule is `eval`'s own doing. Everything is `async` under a current-thread tokio runtime + `LocalSet` (`main_with`). Also holds `RunError`/`Outcome` and `init_tracing`. |
+| `cli.rs` | clap layer: one `Parser` per binary (`IedCli`/`ItoCli`), each flattening the shared groups it applies — so a binary's flag set is what its struct declares, with no runtime filtering. `CommonArgs` is `-C` + `-v` + the `--doc`/`--completion` exits + the trailing `SCRIPT [ARGS]...` positional (`script()`/`argv()` split it); `ReportArgs` is `-w`/`-d`/`-l`/`-e` (only `IedCli`). |
+| `help.rs` | `--doc` implementation: the `TOPICS` registry (`include_str!`s `docs/src/**`, including both binary chapters), topic lookup, the grouped listing, the per-program default page, and the styled-markdown-through-a-pager `emit` (honors `--doc-plain`/`--doc-no-pager`/`NO_COLOR`). |
 | `lib.rs` | Library crate root: `pub mod cli; pub mod help; pub mod run; pub mod scripting;`. `run` and `cli` are public because the binaries live outside the library. |
 
 ### Scripting standard library (`ito/scripting/`)
@@ -245,16 +368,20 @@ Each module lives in its own file (or directory) and exposes a Rust
 `register(&Lua, …)` that installs a global table. **The Rust file name
 matches the Luau global**, so `mod.rs` reads like the script-visible
 surface: `fs` is the exception — it has *two* implementations, `vfs.rs`
-(the rooted VFS `iq`/`ied` get, named for the type) and `rfs.rs` (the
+(the rooted VFS `ied` gets, named for the type) and `rfs.rs` (the
 real filesystem `ito` gets) — as is `redirect.rs`, which is not a module
 of its own (see below). The
 per-module doc comment at the top of each file is the authoritative
 surface description; consult it rather than duplicating it here.
 
 Globals: `fs`, `path`, `time`, `json`, `toml`, `yaml`, `hcl`, `j2`, `re`,
-`log`, `io`, `ito`, `proc`, `ssh`, `aws` (holding `aws.ec2`), `task`, `argv`,
-`cli`, `ui` (holding `ui.prompt`, `ui.progress`), plus `string` method
-additions. `mod.rs` re-exports `Argv`, `Vfs` and `PathMapper`.
+`hash`, `encoding`, `ansible` (holding `ansible.vault`), `fmt` (holding
+`fmt.table`), `log`, `io`, `ito`, `proc`, `ssh`, `aws` (holding `aws.config`,
+`aws.ec2`, `aws.s3`, `aws.autoscaling`, `aws.cloudtrail`, `aws.cloudwatch`),
+`task`, `argv`, `cli`, `ui` (holding `ui.prompt`, `ui.progress`), `null` (the
+null sentinel, `null.rs`), `table.array` (the array marker, added onto Luau's
+`table` by `codec::register_array`), plus `string` method additions (sugar
+over `fmt`). `mod.rs` re-exports `Argv`, `Vfs` and `PathMapper`.
 
 Two structural notes:
 
@@ -277,8 +404,8 @@ Two structural notes:
   `tokio::task::spawn_blocking`, the same shape `hash.rs`'s `_file` reads use,
   since a terminal prompt has no async form and this is the single-threaded
   runtime every I/O module shares. `ui.prompt`'s theme choice reads
-  `ansi::enabled()` (made `pub` for this) so a prompt's colour tracks
-  `ito.colors()` the way `string:red()` does, rather than a separate switch.
+  `fmt::ansi::enabled()` (made `pub` for this) so a prompt's colour tracks
+  `fmt.colors()` the way `string:red()` does, rather than a separate switch.
 
 There is **no injected-global magic left**: no `MAIN`, no `ITO_VERSION`,
 no `debug_print`. A `main` function marks the entry point (the runner
@@ -286,7 +413,7 @@ calls it when present, and *not* for `require`d modules),
 `ito.version_check` asserts compatibility, and `log.debug` logs.
 
 `cli.rs` is the *opt-in* parser over those arguments, registered by
-`Engine::build` for all four binaries. `cli.opt`/`cli.arg` declare into
+`Engine::build` for both binaries. `cli.opt`/`cli.arg` declare into
 one process-wide registry and return opaque handles, read either by calling
 them (`handle()`, the documented spelling) or via `handle:get()` — one
 `Value` read behind both a `Call` metamethod and a method, since a handle
@@ -304,10 +431,9 @@ anyone's intent. The `/` remains the explicit override, naming the halves
 by side (`f/`, `/force`, `f/force`) — which is what keeps `/f` → `--f`
 expressible rather than lost to the default.
 `cli.parse` consumes the registry, and reading before that raises. It is
-registered for every binary despite writing to stdout, which `iq` (whose
-return value *is* stdout) and `ied` (whose reports own it) otherwise hold — both
-can still have it because what it prints is **terminal**: the run unwinds
-out of `eval`, so it never reaches `emit_returned`/`emit_reports`/
+registered for every binary despite writing to stdout, which `ied`'s
+reports share — it can still have it because what it prints is **terminal**:
+the run unwinds out of `eval`, so it never reaches `emit_reports`/
 `flush_writes` and cannot interleave with them or commit anything. Nothing
 in it is capability-bearing. Both exits
 leave through a `CliExit` sentinel that `Engine::eval` recognises via
@@ -321,9 +447,8 @@ duplicate raises at the declaring call, a malformed command line exits 2.
 No program name appears in the usage line — under a shebang `argv[0]` is
 the interpreter, not the script.
 
-`argv.rs` is the script's own arguments: `Argv::split` partitions the raw
-command line at the first bare `::` (the CLI does this before clap), and
-`register` installs the tail as the global `argv` — a plain list of
+`argv.rs` is the script's own arguments: `CommonArgs::argv` takes
+everything after `SCRIPT`, and `register` installs it as the global `argv` — a plain list of
 strings, **not** prefixed with the program name. Nothing is parsed for the
 script: there is no option map, no type coercion and no name validation,
 because every script wants a different grammar. `ito.opt`/`ito.flag` and
@@ -333,7 +458,7 @@ re-add them.
 A couple of notes that aren't obvious from any single file:
 
 - **Two `fs` implementations, one Luau global.** `vfs.rs` is the rooted
-  VFS (`iq`/`ied`): a `PathMapper` translates a root-relative
+  VFS (`ied`): a `PathMapper` translates a root-relative
   script-visible path to a real one and rejects `..`/symlink escapes.
   `rfs.rs` is the host filesystem (`ito`): no root, no mapper, no base —
   `-C` already did `set_current_dir`, so `std::fs` resolves relative
@@ -360,7 +485,7 @@ A couple of notes that aren't obvious from any single file:
   `add_methods_with_follow`, so the rooted finder simply lacks them. They
   are the only finder methods that *open* a matched file, and `Source::
   render` settles which paths may be named, not which bytes may be read;
-  exposing them on `iq`/`ied` means extending containment to reads.
+  exposing them on `ied` means extending containment to reads.
   Terminal rather than chainable because a `:grep(a):grep(b)` would owe an
   answer about whether contents AND or OR the way `Clause`s do, and
   because ending the chain is what lets the result carry the line and its
@@ -385,10 +510,11 @@ A couple of notes that aren't obvious from any single file:
   `BTreeMap<PathBuf, Action>` shared by the module's closures and the
   host's `Vfs`, last call wins) and the host flushes after the script
   returns **only under `-w`/`--write`**; scripts cannot read their own
-  buffered writes. `Denied` (`iq`) registers no write functions at all.
+  buffered writes. `Denied` registers no write functions at all (no binary
+  uses it since `iq` was dropped).
   There is no `Direct` — `ito` gets `rfs` instead, which writes
   immediately and also carries the operations with no previewable form
-  (`fs.mkdir`/`rmdir`/`rename`/`copy`).
+  (`fs.mkdir`/`remove_all`/`rename`/`copy`).
 
   There is deliberately **no script-facing `fs.flush`/`fs.clear`**: when
   the buffer reaches disk is the host's call alone, which is what lets
@@ -396,96 +522,110 @@ A couple of notes that aren't obvious from any single file:
   re-add them.
 - **`time` is one global registered in two halves** (`time.rs`), the same
   shape `ito.rs` uses: `register` installs the pure value conversions
-  everywhere, `register_host_time` adds the clock (`now`)
-  and the two functions that may read the host's UTC offset
-  (`parse`/`format_local`) under `host_io`. The line is *ambient state*,
-  not "does it touch dates": RFC 3339 requires an offset, so parsing a
-  full timestamp is a pure conversion, while an offset-less
-  `"2026-08-10"` needs the local zone to place it and so cannot be in the
-  shared half. `time.parse` is therefore host-only **in full** rather
-  than being a shared function that sometimes reads ambient state — a
-  script tests `if time.parse then` and falls back to
-  `time.parse_rfc3339`. **Named zones are on the pure side**: the zone
-  arrives as an *argument* and resolves against the **bundled** tzdb
-  (`tzdb-bundle-always`, ~310KB), so `format_tz`/`parse_tz`/`zone_offset`
-  give the same answer on every machine and live in all four binaries.
-  That is also why the tzdb is bundled rather than read from the system
-  (`tzdb-zoneinfo`) — a host-dependent lookup would make them ambient and
-  force them out of `iq`/`ied`. The cost is rules frozen at build time,
-  which a release refreshes. There is deliberately **no**
-  `zone_offset(t)` defaulting to the host zone and no `local_zone()`:
-  either would smuggle ambient state into a function that looks pure.
-  `format_offset` (a *fixed* offset) is separate from `format_tz` because
-  a fixed offset is DST-blind, and conflating them would hide that; each
-  rejects the other's argument, and both reject an offset/zone passed
-  where a strftime pattern belongs (a pattern without `%` formats to
-  itself, so that mistake used to return plausible-looking literal text).
-  `register_host_time` also rebinds
-  `diff`/`add`/`sub` to the same implementations with the local offset
-  supplied, so the calendar and coercion behaviour cannot drift between
-  the two registrations. Backed by `jiff` with `default-features = false`
-  (no tzdb bundle: `tz-system` reports the host's *offset*, which is all
-  these render). **Deltas are one surface, not a layered pair**:
-  `time.delta` is the single coercion (number → seconds, string →
-  `humantime::parse_duration`) that *every* delta-taking function calls,
-  so `add`/`round`/`format_delta`/`task.wait` cannot disagree about what
-  `1h30m` means — `task` already used that grammar, and the delta surface
-  moved onto it rather than keeping a second one. There is no ISO 8601
-  spelling and no `parse_delta*` family; don't re-add them. Months and
-  years are rejected *before* humantime sees them (`calendar_unit`),
-  because it accepts both against fixed 30.44/365.25-day approximations —
-  exactly the invented answer this module refuses; `add`/`sub` take them,
-  having a timestamp to anchor. **Deltas are unsigned** — a duration is a
-  magnitude, `"-90s"` is not a spelling — but subtraction is not, so
-  `format_delta` prints a negative with a leading `-` rather than
-  refusing the caller's own arithmetic. `format_delta` is hand-rolled
-  (`d`/`h`/`m`/`s`) because neither candidate renders it: jiff's
-  `SignedDuration` is calendar-less and stops at the hour (4 days prints
-  as `96h`), humantime's formatter spells large units out (`4days 2h`)
-  and approximates years/months. **The second is the display
-  resolution** — the sub-second part is truncated, since a computed delta
-  is fractional and rendering it gave `173h 44m 24s 737ms 129µs 927ns`;
-  the clock itself is left alone, so a *parsed* timestamp keeps the
-  precision it was written with. `time.round` truncates a delta **toward
-  zero** (an age must not overstate) and returns **one** value, so it
-  composes into `format_delta`; `round_with_rest` is the two-value form,
-  split off because a trailing multi-value call expands into the next
-  call's *arguments* — `format_delta(round(d, "h"))` silently passed the
-  remainder as the formatter's second argument. Its units stop at the
-  second below (nothing finer is displayable) and the week above (for the
-  reason a month is not a delta). Numbers, not strings: rounding and
-  formatting are separate questions. There is no `time.since`/`until`:
-  an age is `time.diff(t, time.now())`, which puts the direction at the
-  call site instead of in a name whose sign convention must be recalled.
-- **`ansi.rs` is a Rust module but not a Luau one**, like `redirect.rs`: it
-  installs its styling onto the **`string` table** (`("x"):red()`), because a
-  style applies to text and reads better with the text on the left. It is
-  registered in **two halves** for the reason `time` is: `register` +
-  `register_switch` (the pure string transforms and `ito.colors`) go
-  everywhere, while `register_host_detect` (`ito.is_tty`, and the right for
-  `ito.colors(nil)` *auto* to detect) is host-only — auto reads stdout's
-  terminal-ness and `NO_COLOR`/`CLICOLOR`/`CLICOLOR_FORCE`
+  everywhere, `register_host_time` adds the clock (`now`, `till`, `ago`)
+  and the `_local` half under `host_io`. **Every parser/formatter is named
+  `parse_<format>[_<zone>]`/`format_<format>[_<zone>]`**: no zone suffix
+  means the format carries its own zone (`rfc3339`, `rfc2822`); `_utc`
+  means the value carries none and is read/written in UTC; `_tz` takes an
+  extra `zone` argument and resolves it against the **bundled** tzdb
+  (`tzdb-bundle-always`, ~310KB), so it lives in both binaries; `_local`
+  reads/writes in the host's time zone (its DST rules at that instant, not just the current offset) and is host-only. Only `civil`
+  (an offset-less date/date-time) and `fmt` (a caller-supplied strftime
+  pattern) get the full suffix family — `rfc3339`/`rfc2822` get none, since
+  a `_utc` variant on a format that already carries its own zone would be a
+  redundant assertion. There is deliberately **no** zone-less overload
+  defaulting to the host zone and no `local_zone()`: either would smuggle
+  ambient state into a function that looks pure. `parse_civil_*` rejects
+  input that already carries an offset, rather than silently ignoring it.
+  `format_fmt_*`/`parse_fmt_*` take the zone as a separate argument from
+  the pattern, and reject a pattern that looks like an offset/zone (a
+  pattern without `%` formats to itself, which is a plausible-looking wrong
+  answer). `register_host_time` implements `add_local`/`sub_local` with the
+  same `shift` helper `add_utc`/`sub_utc`/`add_tz`/`sub_tz` use, parameterized
+  only by zone, so the calendar and coercion behaviour cannot drift between
+  them. Backed by `jiff` with `default-features = false` plus `tz-system` (the
+  host zone for `_local`) and `tzdb-bundle-always` (named zones).
+  **Deltas are one surface**: `time.parse_delta` is the single coercion
+  (number → seconds, string → `humantime::parse_duration`, a bare number in
+  a string is an error) that *every* delta-taking function calls —
+  `add_*`/`sub_*`, `truncate`/`count`, `format_delta`, `task.wait` and the
+  other `task` deadlines (`task.rs` has no parser of its own, only
+  `parse_delta_value`) — so none can disagree about what `1h30m` means.
+  There is no ISO 8601 / `P1D` spelling and no jiff `Span` spelling; don't
+  re-add one. **A day is a fixed 24h everywhere** (`"1d"`, `86400`,
+  `time.days(1)`, including under `add_tz`/`add_local`). Months and years
+  are rejected by `parse_delta` *before* humantime sees them
+  (`calendar_unit`), because it accepts both against fixed
+  30.44/365.25-day approximations — exactly the invented answer this module
+  refuses; only `add_*`/`sub_*` take them (`"1M"`, `"2y"`), having a
+  timestamp to anchor and so being calendar-correct.
+  **Deltas are unsigned** — a duration is a magnitude, `"-90s"` is not a
+  spelling — but subtraction is not, so `format_delta` prints a negative
+  with a leading `-` rather than refusing the caller's own arithmetic.
+  `format_delta` is hand-rolled (`d`/`h`/`m`/`s`) because neither candidate
+  renders it: jiff's `SignedDuration` is calendar-less and stops at the
+  hour (4 days prints as `96h`), humantime's formatter spells large units
+  out (`4days 2h`) and approximates years/months. **The second is the
+  display resolution** — the sub-second part is truncated, since a
+  computed delta is fractional and rendering it gave
+  `173h 44m 24s 737ms 129µs 927ns`; the clock itself is left alone, so a
+  *parsed* timestamp keeps the precision it was written with.
+  `time.minutes`/`hours`/`days` build a delta from a count;
+  `time.truncate(secs, unit)` floors a delta to whole units, in seconds,
+  and `time.count(secs, unit)` does the same division but returns the unit
+  count (the per-unit `truncate_*`/`count_*` spellings are gone). Both stop
+  at the day — a week has no builder here and a month/year has no fixed
+  length. `time.till(t)`/
+  `time.ago(t)` are `t - now()`/`now() - t`, named for the direction so a
+  reader doesn't have to recall a subtraction's argument order; named
+  `till` rather than `until` because `until` is a Luau reserved word and
+  could never be reached with dot-call syntax. Timestamp arguments accept
+  Unix seconds or an RFC 3339 (then RFC 2822) string, via `TimeArg`.
+- **`fmt` is one global over a directory** (`fmt/{mod,ansi,text,table}.rs`),
+  replacing the former `ansi.rs`/`tablefmt`/`string`-method impls. `mod.rs`
+  owns `def`, which registers every string-subject function **twice from one
+  implementation** — `fmt.red(s)` and the `string` method `s:red()` — so the
+  method is sugar and the two cannot drift; styling reads better with the
+  text on the left, which is why the methods stay. `text.rs` is the
+  character-/escape-aware helpers (`fmt.strip`, `fmt.width`, `trimmed`,
+  `padded_start`/`padded_end`, `replaced_at`, `without_ansi`, …);
+  `fmt.width` counts escape-stripped characters by `unicode-width`, so it is
+  escape-aware and handles wide glyphs, but is not a full terminal model.
+  `table.rs` is `fmt.table.new(columns)` over `comfy_table` (pure, no
+  terminal dependence; there is no `t:print`). `ansi.rs` is registered in
+  **two halves** for the reason `time` is: `register` (styles, status
+  symbols, `fmt.colors`) goes everywhere, while `register_host` (`fmt.is_tty`,
+  and the right for `fmt.colors(nil)` *auto* to detect) is host-only — auto
+  reads stdout's terminal-ness and `NO_COLOR`/`CLICOLOR`/`CLICOLOR_FORCE`
   (<https://bixense.com/clicolors/>), which is ambient state an `ied --diff`
-  must not see. So **auto resolves to off under `iq`/`ied`** and a script
-  there opts in with `ito.colors(true)`; the methods themselves are pure and
-  exist in all four. The switch is a process-wide `AtomicU8` (one run, one
-  answer, and a `require`d module's setting is visible to its importer), which
-  is why `Engine::build` calls `ansi::reset()` — two builds in one process
-  (the test suite) must not inherit each other's state. `ito.colors` is a
-  function taking a `Variadic`, not an `Option<bool>` field: reading has to
-  *resolve* auto, and `ito.colors()` (read) must be distinguishable from
-  `ito.colors(nil)` (reset to auto). Each style closes with the **specific**
-  reset (`39`/`49`/`22`…), not the blanket `0`, so `("x"):red():bold()` keeps
+  must not see. So **auto resolves to off under `ied`** and a script
+  there opts in with `fmt.colors(true)`; the styles themselves are pure and
+  exist in both. The switch is a process-wide `AtomicU8` (one run, one
+  answer, and a `require`d module's setting is visible to its importer),
+  which is why `Engine::build` calls `ansi::reset()` — two builds in one
+  process (the test suite) must not inherit each other's state (tests that
+  move it take `fmt::TEST_LOCK`). `fmt.colors` is a function taking a
+  `Variadic`, not an `Option<bool>` field: reading has to *resolve* auto,
+  and `fmt.colors()` (read) must be distinguishable from `fmt.colors(nil)`
+  (reset to auto). Each style closes with the **specific** reset
+  (`39`/`49`/`22`…), not the blanket `0`, so `("x"):red():bold()` keeps
   both — don't "simplify" that to `\27[0m`. `if_color`/`if_nocolor` are the
   alternative-text pair (one optional argument, `""` when omitted); they are
   **eager selectors, not guards** — Luau has evaluated both sides before
-  either is called, and laziness is what a plain `if ito.colors()` is for.
+  either is called, and laziness is what a plain `if fmt.colors()` is for.
   They deliberately **do not inspect the receiver** for escape sequences: the
   switch decides, which keeps `("[ok]"):if_nocolor("✔")` meaningful and stops
-  the answer depending on whether an inner style emitted anything. No 256-colour/truecolour
-  constructor and no `ansi.style{…}` builder yet; `string.width` counts
-  escape-stripped `chars()` rather than pulling in `unicode-width`, so it is
-  escape-aware but not a full terminal width model.
+  the answer depending on whether an inner style emitted anything.
+  `fmt.ok`/`fail`/`warn`/`info` are status symbols with an ASCII fallback
+  chosen by the same switch. No 256-colour/truecolour constructor and no
+  style-builder yet.
+- **`null` and the array marker are values, not modules.** `null.rs`
+  installs the global `null` (mlua's serde null light-userdata, so every
+  conversion — codecs and the aws response conversion — agrees on it; `toml`
+  has no null and raises). `codec.rs` holds the shared codec rules and
+  `register_array` adds `table.array(t?)`, mlua's `array_metatable`, which
+  parsers attach to every array they produce so an empty one serializes as
+  `[]`. `ito.null`/`json.null`/`ito.is_null` are gone.
 - YAML is backed by the `yamlito` crate's value model (`yamlito::Yaml`);
   `yaml::parse`/`to_string` are not a round-trip (emitting owns the
   layout).

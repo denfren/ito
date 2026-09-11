@@ -1,23 +1,32 @@
 //! ito's own Luau `require` resolver.
 //!
 //! Replaces mlua's default [`FsRequirer`] to enforce ito's rules
-//! (`docs/src/lua/require.md`):
+//! (`docs/src/luau/require.md`):
 //!
 //! - **Confinement.** Imports are limited to the directory tree of the
 //!   *entry* script — the `root`. `../`-relative paths may not walk above
-//!   it. For `ito <path>` the root is the directory containing `<path>`;
-//!   for `-s`/`--script` (inline) or `ito -` (stdin, no script file) it is
-//!   the working directory (the `-C` root). This is independent of the
-//!   `fs` VFS root, which constrains file *operations*, not imports.
+//!   it, and neither may a symlink: the root is canonicalized, and a module
+//!   file is canonicalized before it is accepted, so a link leading out of the
+//!   tree is an error (and aliases such as macOS's `/tmp` -> `/private/tmp`
+//!   do not trip the textual check). For `ito <path>` the root is the
+//!   directory containing `<path>`. This is independent of the `fs` VFS root,
+//!   which constrains file *operations*, not imports.
 //! - **Relative to the requirer.** Each `require` resolves relative to the
-//!   directory of the file that calls it, same as upstream Luau.
+//!   directory of the file that calls it, same as upstream Luau. A module is
+//!   named by its real (canonical) file, so a symlinked module resolves beside
+//!   the target and is cached once however it was reached.
 //! - **Candidate order.** For a path segment `foo`:
 //!     1. if `foo` already ends in `.lua`/`.luau`, only that exact file;
-//!     2. otherwise `foo.luau` then `foo.lua`;
+//!     2. otherwise `foo.luau` then `foo.lua` (the extension is *appended*, so
+//!        `config.prod` names `config.prod.luau`);
 //!     3. fallback: `foo/init.luau` then `foo/init.lua`.
 //!   *All* candidates are checked: more than one match is an error that
 //!   names the conflicting files; no match is an error that lists the
-//!   paths that were checked.
+//!   paths that were checked. At the root itself only `init.*` counts — the
+//!   root's sibling `<root>.lua` is not a candidate. Resolution problems
+//!   surface when the module is *loaded*, not while walking intermediate
+//!   segments, so an ambiguous intermediate name no longer masks the real
+//!   target.
 //! - **Aliases.** `@name/rest` resolves `name` through the `aliases` table
 //!   of the nearest `.luaurc`, as upstream Luau does. Two deviations keep
 //!   the confinement guarantee intact: the search for `.luaurc` stops at
@@ -30,6 +39,7 @@
 //! [`FsRequirer`]: mlua::luau::FsRequirer
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::path::{Component, Path, PathBuf};
 use std::result::Result as StdResult;
@@ -46,28 +56,33 @@ const FILE_EXTENSIONS: &[&str] = &["luau", "lua"];
 /// The config file consulted for alias definitions.
 const CONFIG_FILENAME: &str = ".luaurc";
 
+/// What a navigated path resolved to: a single module file, a bare directory
+/// (`None`, a valid *intermediate* step), or the message explaining why not.
+type Resolution = StdResult<Option<PathBuf>, String>;
+
 /// ito's `require` navigator. See the module docs for the rules.
 #[derive(Debug)]
 pub struct ItoRequirer {
     /// Confinement boundary: no navigation may resolve above this path.
+    /// Canonical where the filesystem allows.
     root: PathBuf,
     /// Absolute logical path to the current module (not yet mapped to a file).
     abs_path: PathBuf,
-    /// Path relative to the requirer, used only for the chunk name.
-    rel_path: PathBuf,
-    /// The physical file backing the current module, if one resolved.
-    resolved_path: Option<PathBuf>,
+    /// The outcome of resolving `abs_path`, if a module was navigated to.
+    resolved: Option<Resolution>,
 }
 
 impl ItoRequirer {
-    /// Create a requirer confined to `root` (the entry script's directory,
-    /// or the working directory for inline/stdin scripts).
+    /// Create a requirer confined to `root` (the entry script's directory).
     pub fn new(root: PathBuf) -> Self {
+        // Canonical, so a symlink-resolved module file can be compared to it.
+        let root = root
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_path(&root));
         Self {
-            root: normalize_path(&root),
+            root,
             abs_path: PathBuf::new(),
-            rel_path: PathBuf::new(),
-            resolved_path: None,
+            resolved: None,
         }
     }
 
@@ -99,22 +114,20 @@ impl ItoRequirer {
                 path.display()
             ))));
         }
-        let resolved = Self::resolve_module(&path)?;
-        self.abs_path = path.clone();
-        self.rel_path = path;
-        self.resolved_path = resolved;
+        self.resolved = Some(self.resolve_module(&path));
+        self.abs_path = path;
         Ok(())
     }
 
     /// Resolve a logical module path to a physical file following ito's
     /// candidate order, or classify why it could not.
     ///
-    /// `Ok(Some(file))` — a single module file matched.
+    /// `Ok(Some(file))` — a single module file matched (canonical path).
     /// `Ok(None)`       — `path` is an existing directory with no `init`
     ///                    module (a valid *intermediate* directory).
-    /// `Err(..)`        — ambiguous (names the files) or not found (lists
-    ///                    the checked paths).
-    fn resolve_module(path: &Path) -> StdResult<Option<PathBuf>, NavigateError> {
+    /// `Err(..)`        — ambiguous (names the files), not found (lists the
+    ///                    checked paths) or outside the root.
+    fn resolve_module(&self, path: &Path) -> Resolution {
         let mut checked: Vec<PathBuf> = Vec::new();
         let mut matches: Vec<PathBuf> = Vec::new();
 
@@ -124,35 +137,59 @@ impl ItoRequirer {
         );
 
         if has_lua_ext {
-            // The segment carries an explicit extension: only that file.
+            // The segment carries an explicit extension: only that exact file
+            // (no extension search, no `init` fallback).
             checked.push(path.to_path_buf());
             if path.is_file() {
                 matches.push(path.to_path_buf());
             }
         } else {
-            // `foo.luau`, then `foo.lua`.
-            for ext in FILE_EXTENSIONS {
-                let candidate = path.with_extension(ext);
-                checked.push(candidate.clone());
-                if candidate.is_file() {
-                    matches.push(candidate);
+            // At the root only `init.*` counts; `<root>.lua` beside it is
+            // outside the tree.
+            if path != self.root {
+                // `foo.luau`, then `foo.lua`; appended, not substituted, so a
+                // dotted name keeps its dot.
+                for ext in FILE_EXTENSIONS {
+                    let mut name = OsString::from(path.as_os_str());
+                    name.push(format!(".{ext}"));
+                    let candidate = PathBuf::from(name);
+                    checked.push(candidate.clone());
+                    if candidate.is_file() {
+                        matches.push(candidate);
+                    }
                 }
             }
-        }
 
-        // Fallback: a directory module `foo/init.{luau,lua}`.
-        if path.is_dir() {
-            for ext in FILE_EXTENSIONS {
-                let candidate = path.join(format!("init.{ext}"));
-                checked.push(candidate.clone());
-                if candidate.is_file() {
-                    matches.push(candidate);
+            // Fallback: a directory module `foo/init.{luau,lua}`.
+            if path.is_dir() {
+                for ext in FILE_EXTENSIONS {
+                    let candidate = path.join(format!("init.{ext}"));
+                    checked.push(candidate.clone());
+                    if candidate.is_file() {
+                        matches.push(candidate);
+                    }
                 }
             }
         }
 
         match matches.len() {
-            1 => Ok(Some(matches.pop().unwrap())),
+            1 => {
+                // Backstop: the file's real location must be inside the root,
+                // whatever path (or symlink) led to it.
+                let file = matches.pop().unwrap();
+                let real = file
+                    .canonicalize()
+                    .map_err(|e| format!("could not resolve module '{}': {e}", file.display()))?;
+                if !self.within_root(&real) {
+                    return Err(format!(
+                        "module '{}' resolves outside the script root '{}': '{}'",
+                        file.display(),
+                        self.root.display(),
+                        real.display()
+                    ));
+                }
+                Ok(Some(real))
+            }
             0 => {
                 // A bare existing directory with no module is a valid
                 // intermediate path (e.g. `sub` in `./sub/lib`).
@@ -164,10 +201,10 @@ impl ItoRequirer {
                     .map(|p| format!("  {}", p.display()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                Err(NavigateError::Other(mlua::Error::runtime(format!(
+                Err(format!(
                     "no module found for '{}'; checked:\n{listed}",
                     path.display()
-                ))))
+                ))
             }
             _ => {
                 let listed = matches
@@ -175,10 +212,10 @@ impl ItoRequirer {
                     .map(|p| format!("  {}", p.display()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                Err(NavigateError::Other(mlua::Error::runtime(format!(
+                Err(format!(
                     "ambiguous module for '{}'; multiple files match:\n{listed}",
                     path.display()
-                ))))
+                ))
             }
         }
     }
@@ -190,17 +227,28 @@ impl Require for ItoRequirer {
     }
 
     fn reset(&mut self, chunk_name: &str) -> StdResult<(), NavigateError> {
-        // The requirer chunk name is `@<abs path minus extension>`; the
-        // navigator immediately calls `to_parent` to move from this file to
-        // its directory before applying the require path's components.
+        // The requirer chunk name is `@<abs path>` (the entry script's has no
+        // extension); the navigator immediately calls `to_parent` to move from
+        // this file to its directory before applying the require path's
+        // components.
         let stripped = chunk_name
             .strip_prefix(CHUNK_PREFIX)
             .ok_or(NavigateError::NotFound)?;
-        let abs = normalize_path(Path::new(normalize_chunk_name(stripped)));
-        self.abs_path = abs.clone();
-        self.rel_path = abs;
-        // The requirer is the entry chunk itself; no module file to resolve.
-        self.resolved_path = None;
+        let mut abs = normalize_path(Path::new(normalize_chunk_name(stripped)));
+        // Module chunks keep their extension; `@self` names the path without it.
+        if matches!(abs.extension().and_then(|s| s.to_str()), Some("lua" | "luau")) {
+            abs.set_extension("");
+        }
+        // A required `pkg/init.luau` stands in for the directory `pkg`, so its
+        // relative paths start beside `pkg` (`@self` names the inside). The
+        // entry script is not a module: an entry `init.luau` sits *in* the root
+        // and resolves `./` within it.
+        if abs.file_stem().is_some_and(|s| s == "init") && abs.parent() != Some(&self.root) {
+            abs.pop();
+        }
+        self.abs_path = abs;
+        // The requirer is the calling chunk itself; no module file to resolve.
+        self.resolved = None;
         Ok(())
     }
 
@@ -227,12 +275,8 @@ impl Require for ItoRequirer {
         if !self.within_root(&abs_path) {
             return Err(NavigateError::NotFound);
         }
-        let mut rel_parent = self.rel_path.clone();
-        rel_parent.pop();
-        let resolved = Self::resolve_module(&abs_path)?;
+        self.resolved = Some(self.resolve_module(&abs_path));
         self.abs_path = abs_path;
-        self.rel_path = normalize_path(&rel_parent);
-        self.resolved_path = resolved;
         Ok(())
     }
 
@@ -245,22 +289,26 @@ impl Require for ItoRequirer {
                 abs_path.display()
             ))));
         }
-        let resolved = Self::resolve_module(&abs_path)?;
-        self.rel_path = self.rel_path.join(name);
+        self.resolved = Some(self.resolve_module(&abs_path));
         self.abs_path = abs_path;
-        self.resolved_path = resolved;
         Ok(())
     }
 
     fn has_module(&self) -> bool {
-        self.resolved_path
-            .as_deref()
-            .map(Path::is_file)
-            .unwrap_or(false)
+        match &self.resolved {
+            Some(Ok(Some(file))) => file.is_file(),
+            // Not found / ambiguous / escaping: claim a module so the loader
+            // can raise the descriptive error instead of a generic one.
+            Some(Err(_)) => true,
+            _ => false,
+        }
     }
 
     fn cache_key(&self) -> String {
-        self.resolved_path.as_deref().unwrap().display().to_string()
+        match &self.resolved {
+            Some(Ok(Some(file))) => file.display().to_string(),
+            _ => self.abs_path.display().to_string(),
+        }
     }
 
     fn has_config(&self) -> bool {
@@ -278,10 +326,19 @@ impl Require for ItoRequirer {
     }
 
     fn loader(&self, lua: &Lua) -> Result<Function> {
-        let name = format!("{CHUNK_PREFIX}{}", self.rel_path.display());
-        lua.load(self.resolved_path.as_deref().unwrap())
-            .set_name(name)
-            .into_function()
+        match &self.resolved {
+            // The real file, extension kept, so tracebacks name something
+            // openable and `fs.require_dir()` is the file's own directory.
+            Some(Ok(Some(file))) => lua
+                .load(file.as_path())
+                .set_name(format!("{CHUNK_PREFIX}{}", file.display()))
+                .into_function(),
+            Some(Err(msg)) => Err(mlua::Error::runtime(msg.clone())),
+            _ => Err(mlua::Error::runtime(format!(
+                "no module found for '{}'",
+                self.abs_path.display()
+            ))),
+        }
     }
 }
 
@@ -319,23 +376,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Install ito's `require` as the global, confined to `root`.
 pub fn register(lua: &Lua, root: PathBuf) -> Result<()> {
     let require = lua.create_require_function(ItoRequirer::new(root))?;
-    lua.globals().raw_set("require", require)?;
-    Ok(())
-}
-
-/// Install a `require` that always fails, for scripts with no import root.
-///
-/// A stdin or `-s` script has no directory of its own, and the working
-/// directory it happened to be run from is not a boundary anyone chose. Rather
-/// than guess one, imports are refused until `-r` names a directory.
-pub fn register_denied(lua: &Lua) -> Result<()> {
-    let require = lua.create_function(|_, path: String| -> Result<mlua::Value> {
-        Err(mlua::Error::runtime(format!(
-            "cannot require '{path}': imports are disabled for scripts read from \
-             stdin or -s, which have no directory to resolve against; \
-             pass -r <dir> to import from that directory"
-        )))
-    })?;
     lua.globals().raw_set("require", require)?;
     Ok(())
 }

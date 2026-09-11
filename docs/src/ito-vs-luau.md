@@ -17,8 +17,8 @@ plain global tables before your script runs. Call their functions with
 | Module | What it provides |
 | --- | --- |
 | [`string`](modules/string.md) | A few extra pure string functions, added to Luau's own `string` table |
-| [`table`](modules/table.md) | Luau's own `table` library covers arrays and objects |
-| [`fs`](modules/fs.md) | Virtual filesystem — read, write, list, remove |
+| [`table`](modules/table.md) | Luau's own `table` library, plus `table.array` and the global `null` |
+| [`fs`](modules/fs.md) | Read, write, list, remove files |
 | [`path`](modules/path.md) | Path manipulation |
 | [`re`](modules/re.md) | Regular expressions (the `regex` crate's syntax, not Lua patterns) |
 | [`json`](modules/json.md) | JSON parse / emit |
@@ -26,7 +26,7 @@ plain global tables before your script runs. Call their functions with
 | [`yaml`](modules/yaml.md) | YAML parse / emit |
 | [`hcl`](modules/hcl.md) | HCL parse / emit |
 | [`j2`](modules/j2.md) | Jinja2 template rendering |
-| [`ito`](modules/ito.md) | Version guard, script flags, the shared `null` sentinel |
+| [`ito`](modules/ito.md) | Version guard, `ito.slug`, and `os.getenv` |
 
 ## `require` looks like Luau's — and is confined
 
@@ -40,9 +40,7 @@ stops at the root, so a config in a parent directory cannot redirect a
 confined script's imports.
 
 The require root is **independent of the `fs`/`-C` root**, which constrains
-file *operations* rather than imports. A stdin or `-s` script has no
-directory of its own, so imports are refused until `-r <dir>` names a root.
-See [require](luau/require.md) for exactly how paths resolve.
+file *operations* rather than imports. See [require](luau/require.md) for exactly how paths resolve.
 
 ```lua
 local m = require("./lib")   -- loads lib.lua next to this script
@@ -52,31 +50,25 @@ print(m.hello())
 ## What's sandboxed
 
 A script cannot touch the filesystem, spawn processes, or read
-environment/OS state except through ito's own modules. How much of that is
-reachable depends on which binary runs the script (`iq` reads only what it
-is handed, `ied` adds buffered writes, `ito` adds the host); what follows
-holds for all three unless it says otherwise:
+environment/OS state except through ito's own modules:
 
-- **No file I/O.** Luau's `io` library is not present at all. All file
-  access goes through [`fs`](modules/fs.md), which is rooted at the
-  working directory and buffers writes until the run completes.
-- **No ambient state, in the sandboxed binaries.** `iq` and `ied` remove
-  the `os` table (`os.clock`/`os.date`/`os.time`/`os.difftime`) along with
-  `math.random`/`math.randomseed`. Both hand a script input the caller
-  never gave it and cannot see, so two runs of one script could disagree —
-  and `ied`'s whole premise is that the change set it previews is the one
-  it would write. `ito` keeps them: it already spawns processes and opens
-  sockets, so withholding the clock from it would be a pretence. Like
-  `fs.write`, they are *absent* rather than stubbed, so `if os then` is a
-  usable feature test. The rest of `math` is untouched, and
-  [`task.wait`](modules/task.md) is how you sleep in any of the three.
-- **No environment access, except in `ito`.** Luau's sandboxed `os` has no
-  `getenv` at all; `ito` puts it back, so `os.getenv(<name>)` reads a
-  variable there and nowhere else. It is the only key on `os` that varies
-  by binary, so test for it directly — `if os.getenv then` — rather than
-  for the table. There is no setter in any binary: pass a variable to a
+- **No file I/O.** Luau's file-oriented `io` functions (`io.open` and
+  friends) are not present; ito has its own stream-handle
+  [`io`](modules/io.md). All file access goes through
+  [`fs`](modules/fs.md).
+- **Environment access is re-added.** Luau's sandboxed `os` has no
+  `getenv` at all; ito puts it back, so `os.getenv(<name>)` reads a
+  variable. There is no setter: pass a variable to a
   child with a command's own [`:env()`](modules/proc.md) instead of
   mutating state that every later task would observe.
+- **`ied` removes ambient state.** An `ied` run must be reproducible — the
+  same work-directory state and script, the same result — so it has no
+  `os` table (`os.clock`/`os.date`/`os.time`/`os.difftime`, `os.getenv`) and
+  no `math.random`/`math.randomseed`: both hand a script input the caller
+  never gave it. They are *absent* rather than stubbed, so `if os then` is
+  a usable feature test. The rest of `math` is untouched, and
+  [`task.wait`](modules/task.md) is how you sleep where `task` exists. See
+  [Reproducibility](binaries/ied.md#reproducibility).
 - **Luau sandbox mode is enabled** (an actual Luau feature, not an ito
   invention) before your script runs: the standard library and every
   ito module table are read-only, and a top-level assignment like

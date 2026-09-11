@@ -686,20 +686,20 @@ fn the_link_api_is_absent_from_the_rooted_vfs() {
 // The write half, unrooted.
 // ---------------------------------------------------------------------------
 
-/// `fs.mkdir` makes parents and is idempotent; `fs.rmdir` is recursive and
+/// `fs.mkdir` makes parents and is idempotent; `fs.remove_all` is recursive and
 /// treats an absent path as a no-op.
 #[test]
-fn mkdir_and_rmdir_round_trip() {
-    let dir = tmp_dir("mkdir-rmdir");
+fn mkdir_and_remove_all_round_trip() {
+    let dir = tmp_dir("mkdir-remove_all");
     let d = dir.display();
 
     run(&format!(r#"fs.mkdir("{d}/a/b/c") fs.mkdir("{d}/a/b/c")"#));
     assert!(dir.join("a/b/c").is_dir());
 
     run(&format!(
-        r#"fs.write("{d}/a/b/c/x.txt", "x") fs.rmdir("{d}/a") fs.rmdir("{d}/gone")"#
+        r#"fs.write("{d}/a/b/c/x.txt", "x") fs.remove_all("{d}/a") fs.remove_all("{d}/gone")"#
     ));
-    assert!(!dir.join("a").exists(), "rmdir must remove the tree");
+    assert!(!dir.join("a").exists(), "remove_all must remove the tree");
     cleanup(&dir);
 }
 
@@ -1603,5 +1603,107 @@ fn grep_rejects_an_invalid_pattern() {
     );
 
     drop(_cwd);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Review backlog (FS-*): glob prefix, finder strings, missing starts, new fns.
+// ---------------------------------------------------------------------------
+
+/// An absolute or `../` pattern starts at its literal prefix, and a
+/// metacharacter in a directory name stays literal.
+#[test]
+fn glob_starts_at_the_literal_prefix_and_escapes_it() {
+    let dir = tmp_dir("glob-prefix");
+    let meta = tmp_dir("glob-meta[x]");
+    std::fs::write(meta.join("m.txt"), "m").unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/a.txt"), "a").unwrap();
+    std::fs::write(dir.join("b.txt"), "b").unwrap();
+    let d = dir.to_string_lossy().into_owned();
+    let out = eval(&format!(r#"return table.concat(fs.glob("{d}/**/*.txt"), ",")"#)).unwrap();
+    assert_eq!(out, format!("{d}/b.txt,{d}/sub/a.txt"));
+    let _cwd = WorkDir::enter(&dir.join("sub"));
+    let out = eval(r#"return table.concat(fs.glob("../*.txt"), ",")"#).unwrap();
+    assert_eq!(out, "../b.txt");
+    let out = eval(r#"return table.concat(fs.glob("*.txt"), ",")"#).unwrap();
+    assert_eq!(out, "a.txt");
+    drop(_cwd);
+    // A metacharacter in the work directory's own name stays literal.
+    let _cwd = WorkDir::enter(&meta);
+    assert_eq!(eval(r#"return table.concat(fs.glob("*.txt"), ",")"#).unwrap(), "m.txt");
+    drop(_cwd);
+    cleanup(&meta);
+    cleanup(&dir);
+}
+
+/// `:exclude` and `:path` see the same string, including the start prefix.
+#[test]
+fn finder_exclude_and_path_agree_on_the_prefix() {
+    let dir = tmp_dir("finder-prefix");
+    std::fs::create_dir_all(dir.join("src/skip")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "").unwrap();
+    std::fs::write(dir.join("src/skip/b.rs"), "").unwrap();
+    let d = dir.to_string_lossy().into_owned();
+    let out = eval(&format!(
+        r#"return table.concat(fs.finder("{d}/src"):files():exclude("{d}/src/skip/**"):find(), ",")"#
+    ))
+    .unwrap();
+    assert_eq!(out, format!("{d}/src/a.rs"));
+    cleanup(&dir);
+}
+
+#[test]
+fn missing_start_directories_raise() {
+    let dir = tmp_dir("missing-start");
+    let d = dir.to_string_lossy().into_owned();
+    for s in [
+        format!(r#"return #fs.walk("{d}/nope")"#),
+        format!(r#"return fs.finder("{d}/nope"):count()"#),
+        format!(r#"return #fs.list("{d}/nope")"#),
+    ] {
+        assert!(eval(&s).is_err(), "{s}");
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn stat_append_chmod_and_temp() {
+    let dir = tmp_dir("stat-append");
+    let d = dir.to_string_lossy().into_owned();
+    run(&format!(
+        r#"fs.append("{d}/a.txt", "x") fs.append("{d}/a.txt", "y")
+           assert(fs.read("{d}/a.txt") == "xy")
+           local s = fs.stat("{d}/a.txt") assert(s.kind == "file" and s.size == 2)
+           assert(fs.stat("{d}/nope") == nil and fs.stat("{d}").kind == "dir")
+           fs.chmod("{d}/a.txt", 0x1A4) assert(fs.stat("{d}/a.txt").mode == 0x1A4)
+           local t = fs.temp_dir("ito-t") assert(fs.is_dir(t)) fs.remove_all(t)
+           local f = fs.temp_file() assert(fs.is_file(f)) fs.remove(f)"#
+    ));
+    cleanup(&dir);
+}
+
+#[test]
+fn binary_read_write_round_trips() {
+    let dir = tmp_dir("binary");
+    let d = dir.to_string_lossy().into_owned();
+    run(&format!(
+        r#"fs.write("{d}/b", "\xff\xfe\0z") assert(fs.read("{d}/b") == "\xff\xfe\0z")"#
+    ));
+    assert_eq!(std::fs::read(dir.join("b")).unwrap(), [0xff, 0xfe, 0, b'z']);
+    cleanup(&dir);
+}
+
+#[test]
+fn remove_refuses_a_directory_and_copy_onto_itself_raises() {
+    let dir = tmp_dir("remove-dir");
+    std::fs::create_dir_all(dir.join("d")).unwrap();
+    std::fs::write(dir.join("f"), "keep").unwrap();
+    let d = dir.to_string_lossy().into_owned();
+    let e = eval(&format!(r#"fs.remove("{d}/d") return "x""#)).unwrap_err().to_string();
+    assert!(e.contains("is a directory"), "{e}");
+    let e = eval(&format!(r#"fs.copy("{d}/f", "{d}/f") return "x""#)).unwrap_err().to_string();
+    assert!(e.contains("same"), "{e}");
+    assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap(), "keep");
     cleanup(&dir);
 }

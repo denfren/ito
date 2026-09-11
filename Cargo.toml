@@ -3,11 +3,22 @@ members = ["ito", "crates/yamlito"]
 resolver = "3"
 
 [workspace.dependencies]
-aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
-aws-sdk-autoscaling = "1.125.0"
-aws-sdk-ec2 = "1.244.0"
-aws-sdk-s3 = "1.135.0"
+aws-config = { version = "1.10.1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process", "sso"] }
+aws-sdk-autoscaling = { version = "1.125.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-cloudtrail = { version = "1.122.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-cloudwatch = { version = "1.130.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-ec2 = { version = "1.244.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 aws-smithy-types = "1.6.1"
+# `ansible.vault`'s cipher, key derivation and authentication -- the same
+# RustCrypto family as `hash`'s digests, so `sha2` is shared rather than
+# duplicated.
+aes = "0.9"
+ctr = "0.10"
+hmac = "0.13"
+pbkdf2 = "0.13"
+# The vault salt's randomness.
+rand = "0.9"
 clap = { version = "4.6.5", features = ["derive"] }
 clap_complete = "4.6"
 # `tablefmt`'s renderer. Default features (`tty`) bring in `crossterm` for
@@ -16,6 +27,7 @@ clap_complete = "4.6"
 # and wrapping ANSI-aware, needed because cell content may already carry
 # color codes from ito's own `string:red()` etc.
 comfy-table = { version = "8.0.0", features = ["custom_styling"] }
+unicode-width = "0.2"
 # `ui.prompt.*` -- interactive terminal prompts (confirm/input/password/
 # select/multi_select). Blocking terminal I/O with no async form, so calls
 # are run through `spawn_blocking` the way `hash.*_file` runs its blocking
@@ -47,6 +59,7 @@ md-5 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
 hex = "0.4"
+base64 = "0.22"
 humantime = "2.4"
 ignore = "0.4.33"
 # `proc`'s `Child:signal()` and `ito.pid()`. tokio's `Child` exposes only
@@ -57,7 +70,7 @@ libc = "0.2"
 # `time`'s parser/formatter. The tzdb is *bundled* rather than read from the
 # system (`tzdb-zoneinfo`): a named zone must resolve to the same instant on
 # every machine, or `time.format_tz` would be ambient state and could not live
-# in `iq`/`ied`. The cost is ~310KB and rules frozen at build time, which a
+# in `ied`. The cost is ~310KB and rules frozen at build time, which a
 # release refreshes. `tz-system` is separate -- it reports the host's own
 # *offset*, for the ito-only local readers.
 jiff = { version = "0.2", default-features = false, features = [
@@ -66,7 +79,7 @@ jiff = { version = "0.2", default-features = false, features = [
     "tz-system",
     "tzdb-bundle-always",
 ] }
-minijinja = { version = "2", features = ["custom_syntax", "loader"] }
+minijinja = { version = "2", features = ["custom_syntax", "loader", "json", "urlencode", "loop_controls"] }
 # `ito.slug()`'s word generator -- an adjective-noun pair, e.g. "rusty-nail".
 # Random, so host-only like `math.random`/`os.getenv`.
 names = { version = "0.14.0", default-features = false }

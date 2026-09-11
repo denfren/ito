@@ -1,6 +1,6 @@
 ---
 source: ito/tests/hcl_edit.rs
-expression: "eval_str(&format!(\"{DOC}\\\n         h.add(hcl::block(\\\"output\\\").with_label(\\\"id\\\").with_attribute(\\\"value\\\", \\\"x\\\"));\\n\\\n         h.to_string()\"))"
+expression: "eval_str(DOC,\nr#\"local h = hcl.edit(subject)\n           h:add(hcl.block(\"output\"):with_label(\"id\"):with_attribute(\"value\", \"x\"))\n           return h:to_string()\"#)"
 ---
 region = "us-east-1"
 
@@ -12,6 +12,7 @@ resource "aws_instance" "web" {
 resource "aws_instance" "db" {
   ami = "old2"
 }
+
 output "id" {
   value = "x"
 }

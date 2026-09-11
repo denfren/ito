@@ -1,41 +1,48 @@
 # `proc` — running commands
 
-| Builder method | Signature | Effect |
-| --- | --- | --- |
-| `proc.command` | `(<program>)` or `(<list>)` | start a command builder |
-| `:arg` | `(<value>)` | append one argument |
-| `:args` | `(<list>)` | append several arguments |
-| `:env` | `(<name>, <value>)` | set an environment variable |
-| `:env_clear` | `()` | start the child from an empty environment |
-| `:current_dir` | `(<path>)` | working directory for the child |
-| `:stdout` | `(<target>)` | where stdout goes (default `proc.NULL`) |
-| `:stderr` | `(<target>)` | where stderr goes (default `proc.NULL`) |
+| Method | Effect |
+| --- | --- |
+| `proc.command(<program>)` / `proc.command(<list>)` | start a command builder |
+| `:arg(<value>)` | append one argument |
+| `:args(<list>)` | append several arguments |
+| `:env(<name>, <value>)` | set an environment variable |
+| `:envs(<table>)` | set several environment variables |
+| `:env_remove(<name>)` | unset an environment variable in the child |
+| `:env_clear()` | start the child from an empty environment |
+| `:current_dir(<path>)` | working directory for the child |
+| `:stdin(<source>)` | what the child reads (default `proc.NULL`) |
+| `:stdout(<target>)` | where stdout goes (default `proc.NULL`) |
+| `:stderr(<target>)` | where stderr goes (default `proc.NULL`) |
 
-| Finalizer / result method | Signature | Returns |
-| --- | --- | --- |
-| `:run` | `()`, async | the result table, after the command exits |
-| `:spawn` | `()` | a `Child`, to be awaited later |
-| `:exec` | `()` | never returns on success — replaces this process |
-| `:interactive` | `()`, async | the result table, sharing stdin/stdout/stderr with the child |
-| `Child:wait` | `()`, async | the result table, after the child exits |
-| `Child:kill` | `()`, async | the result table, after SIGKILL |
-| `Child:signal` | `(<signal>)` | nothing — the child stays yours to wait for |
-| `Child:id` | `()` | the OS process id |
+| Method | Effect |
+| --- | --- |
+| `:run()`, async | the result table, after the command exits |
+| `:spawn()` | a `Child`, to be awaited later |
+| `:exec()` | never returns on success — replaces this process |
+| `:interactive()`, async | the result table; stdin/stdout/stderr default to this terminal |
+| `Child:wait()`, async | the result table, after the child exits |
+| `Child:try_wait()`, async | `nil` while running, else the result table |
+| `Child:kill()`, async | the result table, after SIGKILL |
+| `Child:signal(<signal>)` | nothing — the child stays yours to wait for |
+| `Child:id()` | the OS process id |
 
-| Function | Signature | Effect |
-| --- | --- | --- |
-| `proc.trap` | `(<signal>, <handler>)` | react to a signal sent to *this* process |
-| `proc.untrap` | `(<signal>)` | stop reacting to a signal |
-| `proc.exit` | `([<code>])` | terminate this process immediately |
+| Function | Effect |
+| --- | --- |
+| `proc.pid()` | the running process's own pid (not in `ied`) |
+| `proc.trap(<signal>, <handler>)` | react to a signal sent to *this* process |
+| `proc.untrap(<signal>)` | stop reacting to a signal |
+| `proc.exit([<code>])` | terminate this process immediately |
 
 | Constant | Value |
 | --- | --- |
-| `proc.SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGUSR1`, `SIGUSR2`, `SIGPIPE`, `SIGALRM`, `SIGTERM`, `SIGCONT`, `SIGSTOP`, `SIGTSTP` | the platform's signal number |
+| `proc.SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGUSR1`, `SIGUSR2`, `SIGPIPE`, `SIGALRM`, `SIGTERM`, `SIGCONT`, `SIGSTOP`, `SIGTSTP`, `SIGCHLD`, `SIGTTIN`, `SIGTTOU`, `SIGWINCH` | the platform's signal number |
 
 Redirect-target constructors (`proc.NULL`, `proc.file()`, `proc.string()`,
 ...) live on the same table, installed by `redirect::install` — see
 below for what `:stdout()`/`:stderr()` accept, and `redirect.md` for the
 targets themselves.
+
+## Example
 
 ```lua
 local r = proc.command({ "git", "rev-parse", "HEAD" })
@@ -51,8 +58,22 @@ end
 
 **The builder pattern.** `proc.command(...)` returns a `CommandBuilder`;
 every builder method mutates it in place and returns the same handle, so
-calls chain. Nothing runs until a finalizer (`:run()` or `:spawn()`) is
-called.
+calls chain. Nothing runs until a finalizer (`:run()`, `:spawn()`,
+`:exec()` or `:interactive()`) is called. The four differ in where the
+child's streams go by default:
+
+| Finalizer | stdin | stdout / stderr | Redirects |
+| --- | --- | --- | --- |
+| `:run()`, `:spawn()` | `proc.NULL` | `proc.NULL` | all accepted |
+| `:interactive()` | `proc.INHERIT` | `proc.INHERIT` | all accepted |
+| `:exec()` | this process's | this process's | only `proc.INHERIT` (or unset) |
+
+An explicit `proc.INHERIT` and leaving a stream unset therefore mean the
+same thing to `:exec()`, while an explicit `proc.NULL` is rejected there:
+there is no child to discard anything for.
+
+Program, arguments, environment and directory are byte strings: they need
+not be valid UTF-8 (a NUL byte is still rejected).
 
 ```lua
 proc.command("ls"):arg("-la")
@@ -83,8 +104,54 @@ use), `proc.buffer()`/`proc.string()` (capture for retrieval in the result
 table, as a `buffer` or a string respectively), and the aliases
 `proc.STDOUT`/`proc.STDERR` (bind to the *other* stream's current target,
 like the shell's `2>&1`/`1>&2` — resolved at the moment of assignment, not
-when the command runs). Passing anything else (a plain string, say) raises
-with `"expected a redirect target"`.
+when the command runs). `proc.STDOUT` is only valid on `:stderr()` and
+`proc.STDERR` only on `:stdout()`; aliasing a stream onto itself raises.
+Passing anything else (a plain string, say) raises with
+`"expected a redirect target"`.
+
+Because aliases bind at assignment, **order matters**, as in the shell:
+
+```lua
+-- 2>&1 after the capture: stderr joins stdout's capture
+proc.command(cmd):stdout(proc.string()):stderr(proc.STDOUT):run()
+-- 2>&1 before it: stderr aliases stdout's target *then* (NULL), and is lost
+proc.command(cmd):stderr(proc.STDOUT):stdout(proc.string()):run()
+```
+
+An alias onto a stream that has not been configured binds to `proc.NULL`;
+an alias onto a plain `proc.INHERIT` binds to the concrete stream it means
+(`:stdout(proc.INHERIT):stderr(proc.STDOUT)` puts stderr on *this*
+program's stdout). To merge two captures, sharing one handle is usually
+clearer than an alias:
+
+```lua
+local both = proc.string()
+proc.command(cmd):stdout(both):stderr(both):run()
+```
+
+**The result shape.** The result table always has `success`, plus `status`
+or `signal`/`signal_name`. It has a `stdout`/`stderr` field **only** for a
+stream whose target was `proc.buffer()`/`proc.string()`; with a merged
+capture both fields hold the same value. Files, `proc.NULL` and the inherit
+targets leave their field absent. (An alias onto a capture shares the
+handle, so it yields both fields.)
+
+**`proc.file(path, [<options>])`.** The path is resolved against this
+process's working directory, *not* `:current_dir()`. The file is opened on
+first use and the handle keeps the descriptor: reusing one handle for
+several commands continues at the same offset (so later commands append)
+until the handle is collected; create a new handle to truncate again.
+`{ append = true }` opens with `O_APPEND` instead of truncating. The
+"same file" check behind the separate-handles error compares device and
+inode once both files exist, so a symlink or `a/../f` is caught too. All
+targets are opened before the child is spawned, but a program that then
+fails to launch has already truncated a file target.
+
+**`:stdin`.** `proc.NULL` (the default), `proc.INHERIT`, `proc.file(path)`
+(opened for reading, never created), or a Luau string or buffer, which is
+written to the child's stdin from its own task and then closed — input
+larger than a pipe buffer is fine. Capture handles and the other redirects
+raise `"expected a stdin source"`.
 
 `proc.OUT`/`proc.ERR` and `proc.STDOUT`/`proc.STDERR` are two different
 questions. The first pair names one of *this* program's streams — a
@@ -166,6 +233,10 @@ Start building a command.
 
 **Returns:** a `CommandBuilder` handle.
 
+**Methods:** `arg` · `args` · `env` · `envs` · `env_remove` · `env_clear` ·
+`current_dir` · `stdin` · `stdout` · `stderr` · `run` · `spawn` · `exec` ·
+`interactive`
+
 **Errors:** raises if `spec` is a table whose first element is missing
 (an empty list) or whose elements aren't strings; raises if the value is
 neither a string nor a table.
@@ -176,7 +247,7 @@ local b = proc.command({ "printf", "%s-%s", "a", "b" })
 -- a and b build the same command
 ```
 
-## `:arg`
+## `CommandBuilder:arg`
 
 Append one argument to the command.
 
@@ -191,7 +262,7 @@ quoting or expansion applies).
 proc.command("git"):arg("commit"):arg("-m"):arg("message"):run()
 ```
 
-## `:args`
+## `CommandBuilder:args`
 
 Append several arguments at once.
 
@@ -206,7 +277,7 @@ any already present.
 proc.command("git"):args({ "commit", "-m", "message" }):run()
 ```
 
-## `:env`
+## `CommandBuilder:env`
 
 Set one environment variable for the child.
 
@@ -224,20 +295,50 @@ earlier value, last call wins.
 proc.command("printenv"):arg("FOO"):env("FOO", "bar"):run()
 ```
 
-## `:env_clear`
+## `CommandBuilder:envs`
+
+Set several environment variables at once.
+
+**Signature:** `builder:envs(vars: {[string]: string}) -> CommandBuilder`
+
+**Parameters:** `vars` — a table of names to values; each pair is an
+`:env()` call (pairs in no particular order).
+
+**Returns:** the same builder, for chaining.
+
+```lua
+proc.command("make"):envs({ CC = "clang", JOBS = "8" }):run()
+```
+
+## `CommandBuilder:env_remove`
+
+Unset one variable in the child, whether inherited or set earlier.
+
+**Signature:** `builder:env_remove(name: string) -> CommandBuilder`
+
+**Returns:** the same builder, for chaining. Applied in call order with
+`:env()`.
+
+```lua
+proc.command("env"):env_remove("AWS_PROFILE"):run()
+```
+
+## `CommandBuilder:env_clear`
 
 Start the child with an empty environment instead of inheriting ito's.
 
 **Signature:** `builder:env_clear() -> CommandBuilder`
 
-**Returns:** the same builder, for chaining. `:env()` calls still apply
-on top of the cleared environment.
+**Returns:** the same builder, for chaining. Like
+`std::process::Command::env_clear`, it also forgets earlier `:env()`/
+`:envs()`/`:env_remove()` calls; ones made afterwards apply on top of the
+cleared environment.
 
 ```lua
 proc.command("printenv"):env_clear():env("ONLY", "this"):run()
 ```
 
-## `:current_dir`
+## `CommandBuilder:current_dir`
 
 Set the child's working directory.
 
@@ -253,7 +354,28 @@ paths follow the same rules `std::process::Command::current_dir` does
 proc.command({ "git", "status" }):current_dir("/some/repo"):run()
 ```
 
-## `:stdout`
+## `CommandBuilder:stdin`
+
+Set what the child reads on standard input.
+
+**Signature:** `builder:stdin(source: Redirect | string | buffer) -> CommandBuilder`
+
+**Parameters:** `source` — `proc.NULL` (default for `:run()`/`:spawn()`),
+`proc.INHERIT` (default for `:interactive()`), `proc.file(path)` to read a
+local file, or a string or buffer whose bytes are fed to the child before
+stdin is closed.
+
+**Returns:** the same builder, for chaining.
+
+**Errors:** raises with `"expected a stdin source"` for anything else
+(capture handles, `proc.OUT`/`proc.ERR`, aliases). Raises at finalize time
+if a `proc.file()` source cannot be opened.
+
+```lua
+local r = proc.command({ "wc", "-l" }):stdin("a\nb\n"):stdout(proc.string()):run()
+```
+
+## `CommandBuilder:stdout`
 
 Set where the child's standard output goes.
 
@@ -262,12 +384,14 @@ Set where the child's standard output goes.
 **Parameters:** `target` — one of `proc.NULL`, `proc.INHERIT`,
 `proc.OUT`, `proc.ERR`, `proc.file(path)`, `proc.buffer()`,
 `proc.string()`, or `proc.STDERR` (alias to whatever stderr's target
-currently is). Default (if never called) is `proc.NULL`.
+currently is). Default (if never called) is `proc.NULL`
+(`proc.INHERIT` under `:interactive()`).
 
 **Returns:** the same builder, for chaining.
 
 **Errors:** raises with `"expected a redirect target"` if `target` is not
-one of the handles above (e.g. a plain string).
+one of the handles above (e.g. a plain string); raises if `target` is
+`proc.STDOUT` (a stream aliased onto itself).
 
 Assigning `proc.STDERR` binds *eagerly*, to stderr's target at the moment
 of the call — like the shell's `1>&2`, a later `:stderr()` call does not
@@ -283,7 +407,7 @@ assert(r.stdout == "hi")
 proc.command({ "sh", "-c", "echo x" }):stdout(proc.ERR):run()
 ```
 
-## `:stderr`
+## `CommandBuilder:stderr`
 
 Set where the child's standard error goes. Same shape as `:stdout`,
 mirrored: `proc.STDOUT` aliases to whatever stdout's target currently is.
@@ -295,13 +419,13 @@ mirrored: `proc.STDOUT` aliases to whatever stdout's target currently is.
 
 **Returns:** the same builder, for chaining.
 
-**Errors:** same as `:stdout`.
+**Errors:** same as `:stdout`, with `proc.STDERR` the self-alias.
 
 ```lua
--- Merge stderr into stdout, shell-style `2>&1`:
+-- Merge stderr into stdout, shell-style `2>&1` (stdout first, see above):
 local r = proc.command("sh"):arg("-c"):arg("echo o; echo e >&2")
-    :stderr(proc.STDOUT)
     :stdout(proc.string())
+    :stderr(proc.STDOUT)
     :run()
 -- r.stdout contains both lines
 ```
@@ -311,7 +435,7 @@ local r = proc.command("sh"):arg("-c"):arg("echo o; echo e >&2")
 proc.command({ "sh", "-c", "echo x >&2" }):stderr(proc.OUT):run()
 ```
 
-## `:run`
+## `CommandBuilder:run`
 
 Start the child and wait for it to exit, in one call.
 
@@ -335,9 +459,17 @@ death apart where a bare `r.status == nil` only said an exit code was
 missing.
 
 **Errors:** raises if the program could not be launched (not found,
-permission denied, ...) or if the same path was targeted by stdout and
+permission denied, ...) or if the same file was targeted by stdout and
 stderr through two separate `proc.file()` handles. Does **not** raise on
 a non-zero exit — that is reported via `success`/`status`.
+
+The capture readers are joined before the exit is awaited, so a
+grandchild that inherited the pipe and outlives the child keeps `:run()`
+(and `:wait()`) waiting until it closes the pipe too. Redirect to a file or
+`proc.NULL` if a daemonizing child should not be waited for.
+
+If the run is abandoned (dropped mid-wait, e.g. by `task.timeout`), its
+child is killed when the run is torn down.
 
 ```lua
 local r = proc.command({ "ls" }):run()
@@ -346,7 +478,7 @@ if not r.success then
 end
 ```
 
-## `:spawn`
+## `CommandBuilder:spawn`
 
 Start the child without waiting for it.
 
@@ -366,7 +498,7 @@ local child = proc.command({ "sleep", "5" }):spawn()
 local r = child:wait()
 ```
 
-## `:exec`
+## `CommandBuilder:exec`
 
 Replace this process with the child, via `execve`, exactly as the shell's
 `exec` builtin does.
@@ -379,15 +511,17 @@ descriptors all become the new program's; stdin/stdout/stderr are
 inherited as-is, unchanged from whatever they already were.
 
 The program is resolved the same way `:run()`/`:spawn()` resolve it: a
-bare name is searched for on `$PATH`, a name containing `/` is used
-as-is.
+bare name is searched for on `$PATH` (the *child's*, so an `:env("PATH", ...)`
+applies), a name containing `/` is used as-is. Output this process has
+printed is flushed first.
 
-**Errors:** raises if `:stdout()`/`:stderr()` were configured to anything
-other than the default (`proc.NULL`): there is no fork to redirect
-within, so a capture or file target has no process left to apply to.
-Raises if the program could not be launched (not found, permission
-denied, ...) — in that case nothing has been replaced and the error
-surfaces normally.
+**Errors:** raises if `:stdin()`/`:stdout()`/`:stderr()` were set to
+anything but `proc.INHERIT`: there is no fork to redirect within, so a
+capture, file or NULL target has no process left to apply to. Raises if the
+program could not be launched (not found, permission denied, ...) — in that
+case nothing has been replaced, the working directory is back where it was,
+and the error surfaces normally. A permission failure on one `$PATH` entry is
+reported in preference to "not found" from the rest.
 
 ```lua
 -- Hand off to another program entirely, e.g. a wrapper script re-execing
@@ -396,41 +530,38 @@ proc.command({ "the-real-program", "--flag" }):exec()
 -- unreached on success
 ```
 
-## `:interactive`
+## `CommandBuilder:interactive`
 
-Start the child sharing this process's stdin/stdout/stderr outright, and
-wait for it to exit.
+Start the child on this process's terminal and wait for it to exit:
+stdin, stdout and stderr default to `proc.INHERIT`.
 
 **Signature:** `builder:interactive() -> table` (async)
 
-**Returns:** the result table:
+**Returns:** the same result table as `:run()`. `stdout`/`stderr` fields
+appear only for a stream explicitly redirected to a capture.
 
-| Field | Type | Present |
-| --- | --- | --- |
-| `success` | boolean | always |
-| `status` | number | unless the child was killed by a signal |
-| `signal` | number | only on a signal death |
-| `signal_name` | string | only on a signal death, and only for a signal `proc` names |
+**Errors:** raises if the program could not be launched or a target cannot
+be opened. Does **not** raise on a non-zero exit.
 
-There is no `stdout`/`stderr` field: nothing was piped, so there is
-nothing to capture.
+While the child runs, this process ignores SIGINT and SIGQUIT (the child
+gets the default disposition back), so ^C reaches the child — an editor
+deciding what it means — rather than killing the script. The previous
+disposition, a `proc.trap` handler included, is restored afterwards.
 
-**Errors:** raises if `:stdout()`/`:stderr()` were configured to anything
-other than the default (`proc.NULL`) — both streams are shared with the
-child unconditionally, so a redirect would silently be ignored rather than
-honored. Raises if the program could not be launched. Does **not** raise
-on a non-zero exit.
-
-Neither `:run()`/`:spawn()` (stdin is always closed, stdout/stderr default
-to `proc.NULL`) nor `:exec()` (never returns to Luau) can give a child the
-real terminal; `:interactive()` is for a child that needs one — a pager,
-an editor, anything prompting for input:
+Neither `:run()`/`:spawn()` (NULL by default) nor `:exec()` (never returns
+to Luau) gives a child the real terminal; `:interactive()` is for a child
+that needs one — a pager, an editor, anything prompting for input. Any
+stream can still be redirected explicitly, which is the `fzf`/`gum` case:
+the UI stays on the terminal while the selection is captured.
 
 ```lua
 local r = proc.command("vim"):arg("notes.txt"):interactive()
 if not r.success then
     log.warn("vim exited with status " .. tostring(r.status))
 end
+
+local pick = proc.command({ "fzf" }):stdin(list_text):stdout(proc.string()):interactive()
+print("picked", pick.stdout)
 ```
 
 ## `Child:wait`
@@ -452,6 +583,29 @@ local r = child:wait()
 assert(r.success)
 ```
 
+## `Child:try_wait`
+
+Check whether a spawned child has exited, without waiting.
+
+**Signature:** `child:try_wait() -> table | nil` (async)
+
+**Returns:** `nil` while the child is still running; once it has exited,
+the same result table `:wait()` returns (and the child is consumed, like
+`:wait()`). The grace-period pattern can stop as soon as the child is gone:
+
+```lua
+child:signal("TERM")
+local r
+for _ = 1, 50 do
+    r = child:try_wait()
+    if r then break end
+    task.wait("100ms")
+end
+r = r or child:kill()
+```
+
+**Errors:** raises if the child has already been waited for or killed.
+
 ## `Child:kill`
 
 Send SIGKILL to a spawned child, then reap it.
@@ -466,13 +620,17 @@ any output the child managed to write before dying. `status` is absent
 **Errors:** raises if the child has already been waited for or killed, or
 if the kill signal itself could not be sent.
 
+`:kill()` signals and then reaps; it does not check whether the child was
+still alive. If the child had already exited on its own (but was not yet
+waited for), the result is its real exit status, not a `SIGKILL` death — test
+`r.signal` rather than assuming.
+
 Killing reaps the child itself, so `:kill()` followed by `:wait()` on the
 same handle raises just like calling `:wait()` twice — there is no way to
-leave a zombie behind by forgetting to wait. A killed-but-otherwise-
-abandoned child (never `:kill()`ed or `:wait()`ed at all — e.g. dropped
-after a `task.timeout`) is still reaped eventually by tokio's SIGCHLD
-handling, but keeps running until then: `:kill()` is what actually stops
-it.
+leave a zombie behind by forgetting to wait. A `:spawn()`ed child that is
+abandoned (its handle dropped without `:kill()`/`:wait()`) keeps running and
+is reaped by tokio's SIGCHLD handling once it ends: `:kill()` is what
+actually stops it.
 
 ```lua
 local child = proc.command({ "sleep", "30" }):spawn()
@@ -504,7 +662,8 @@ escalation expressible.
 **Errors:** raises with `"unknown signal '<x>'; expected one of ..., or a
 number"` for a name it does not recognise (a typo must not silently send
 nothing, which would look like a process ignoring the signal); raises for
-a number that is not an integer, and for any other type of value; raises
+a number that is not an integer or does not fit a 32-bit integer, and for
+any other type of value; raises
 with the `"already been waited for"` error if the child has already been
 waited for or killed; raises if `kill(2)` itself fails.
 
@@ -542,6 +701,30 @@ local child = proc.command({ "long-job" }):spawn()
 local pid = child:id()
 ```
 
+## `proc.pid`
+
+The running process's own pid (`std::process::id()`).
+
+**Signature:** `proc.pid() -> number`
+
+**Returns:** the pid, as an integer.
+
+**Errors:** none.
+
+Not available in `ied` — a pid is ambient state that
+differs between two runs of one script, exactly what a reproducible run
+must not read. It is absent rather than stubbed, so `if proc.pid then` is
+a usable feature test.
+
+It is a *pid*, not a lock — pair it with `proc.command` or a file under
+`/tmp` if you need one, and remember a `deploy.<pid>.lock` file only names
+the holder; it does not stop a second run.
+
+```lua
+log.info("running as pid " .. proc.pid())
+local tmp = path.join("/tmp", "deploy." .. proc.pid() .. ".json")
+```
+
 ## `proc.trap`
 
 React to a signal sent to this process.
@@ -558,8 +741,10 @@ React to a signal sent to this process.
 **Returns:** nothing.
 
 **Errors:** raises for `proc.SIGKILL`/`proc.SIGSTOP` (or their numbers) —
-the kernel never offers either to a handler, so trapping one would silently
-never fire; raises for an unrecognised signal name, matching `Child:signal`.
+the kernel never offers either to a handler; raises with `"cannot trap
+signal <n>"` for `SIGILL`/`SIGFPE`/`SIGSEGV`/`SIGBUS` and for numbers that
+are no signal, because the OS registration is attempted synchronously, at
+the call; raises for an unrecognised signal name, matching `Child:signal`.
 
 The **first** `proc.trap` call for a given signal is what takes it off its
 default disposition; a signal never trapped behaves exactly as if this
@@ -635,7 +820,7 @@ Terminate this process immediately.
 **Parameters:** `code` — the process exit code. Defaults to `0`.
 
 **Returns:** never — this is a direct `std::process::exit`, not a Luau-level
-unwind. No `Drop`, no pending `task`, no VFS flush, nothing queued in
+unwind. No `Drop`, no pending `task`, no buffered-write flush, nothing queued in
 `proc`/`ssh` runs between the call and the process ending. That is
 deliberate: a `proc.trap` handler that has decided the process must end
 right now should not itself be at the mercy of something else being stuck
@@ -680,10 +865,10 @@ if r == task.TIMEOUT then
 end
 ```
 
-`task.timeout` bounds how long the script **waits**, not how long the
-command runs. The script stops waiting, but the **child is abandoned, not
-killed** — it keeps running and is left unreaped until tokio's SIGCHLD
-handling eventually collects it.
+`task.timeout` bounds how long the script **waits**. A timed-out `:run()`
+owns its child, so the child is killed when the abandoned run is dropped. A
+`:spawn()`ed child is **not** killed by an abandoned wait: it keeps running
+until you signal it, and tokio's SIGCHLD handling collects it once it ends.
 
 Worse, a timed-out `:wait()` **leaves the handle unusable for the rest of
 the run**: the abandoned wait took the child out, and `task.timeout`
@@ -705,15 +890,15 @@ local r = child:wait()
 ```
 
 or, to bound the process while another task does the waiting, race it
-against a watchdog that kills by pid:
+against a watchdog that signals the handle (not a pid: a pid read earlier
+can be reused by an unrelated process once the child is gone):
 
 ```lua
 local child = proc.command({ "long-job" }):spawn()
-local pid = child:id()
 
 local watchdog = task.spawn(function()
     task.wait("30s")
-    proc.command({ "kill", "-9", tostring(pid) }):run()
+    child:signal("KILL")
 end)
 
 local r = child:wait()      -- returns normally once the watchdog fires

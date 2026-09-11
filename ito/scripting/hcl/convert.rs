@@ -4,7 +4,6 @@
 //! (`var.x`, function calls, conditionals, …) are rejected.
 
 use super::types::HclError;
-use hcl::edit::Ident;
 use hcl::edit::expr::{Array, Expression, Object, ObjectKey};
 use mlua::{Lua, LuaSerdeExt, Value};
 
@@ -86,43 +85,40 @@ pub fn lua_to_hcl(lua: &Lua, value: Value) -> Result<Expression, HclError> {
         return Ok(Expression::from(expr));
     }
 
-    let json: serde_json::Value = lua
-        .from_value(value)
+    let data = crate::scripting::codec::to_data(lua, &value, "hcl write error")
         .map_err(|e| HclError::UnsupportedLuaType(e.to_string()))?;
-    json_to_hcl(&json)
+    data_to_hcl(&data)
 }
 
-fn json_to_hcl(value: &serde_json::Value) -> Result<Expression, HclError> {
+/// The shared data model as an edit-CST expression. Object keys that are not
+/// identifiers are emitted quoted, never rewritten.
+pub fn data_to_hcl(value: &yamlito::Yaml) -> Result<Expression, HclError> {
     use hcl::edit::expr::Null;
-    use serde_json::Value as J;
+    use yamlito::Yaml as Y;
 
     match value {
-        J::Null => Ok(Expression::Null(Null.into())),
-        J::Bool(b) => Ok(Expression::from(*b)),
-        J::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Expression::from(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(Expression::from(f))
+        Y::Null => Ok(Expression::Null(Null.into())),
+        Y::Bool(b) => Ok(Expression::from(*b)),
+        Y::Int(i) => Ok(Expression::from(*i)),
+        Y::Float(f) => {
+            if f.is_finite() {
+                Ok(Expression::from(*f))
             } else {
-                Err(HclError::UnsupportedLuaType(
-                    "number (out of range)".to_string(),
-                ))
+                Err(HclError::UnsupportedLuaType(format!("number {f}")))
             }
         }
-        J::String(s) => Ok(Expression::from(s.as_str())),
-        J::Array(arr) => {
+        Y::Str(s) => Ok(Expression::from(s.as_str())),
+        Y::Seq(arr) => {
             let mut hcl_arr = Array::new();
             for item in arr {
-                hcl_arr.push(json_to_hcl(item)?);
+                hcl_arr.push(data_to_hcl(item)?);
             }
             Ok(Expression::from(hcl_arr))
         }
-        J::Object(map) => {
+        Y::Map(map) => {
             let mut hcl_obj = Object::new();
             for (key, val) in map {
-                let obj_key = ObjectKey::Ident(Ident::new_sanitized(key.as_str()).into());
-                hcl_obj.insert(obj_key, json_to_hcl(val)?);
+                hcl_obj.insert(super::types::new_object_key(key), data_to_hcl(val)?);
             }
             Ok(Expression::from(hcl_obj))
         }

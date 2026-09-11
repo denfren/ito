@@ -233,36 +233,143 @@ fn finder_never_escapes_the_root() {
     cleanup(&base);
 }
 
-/// The rooted finder takes no start directory, so an argument — absolute, `..`,
-/// or an outside path — cannot redirect the walk. Extra arguments are ignored
-/// rather than honoured, which is what makes the root the only possible start.
+/// The rooted finder's start directory must be inside the root: an absolute,
+/// `..` or outward-link argument raises instead of redirecting the walk, and an
+/// in-root one narrows it.
 #[cfg(unix)]
 #[test]
-fn finder_start_directory_cannot_be_redirected() {
+fn finder_start_directory_is_confined_to_the_root() {
     let (base, root, outside) = escape_fixture("finder-start-arg");
     let vfs = Vfs::new(&root).unwrap();
 
-    let expected = eval(&vfs, r#"return table.concat(fs.finder():find(), ",")"#);
     for arg in [
         "\"/\"".to_string(),
         "\"/etc\"".to_string(),
         "\"..\"".to_string(),
         "\"../outside\"".to_string(),
+        "\"link_out\"".to_string(),
         format!("{:?}", outside.to_str().unwrap()),
     ] {
-        let out = eval(
-            &vfs,
-            &format!(r#"return table.concat(fs.finder({arg}):find(), ",")"#),
-        );
-        assert_eq!(
-            out, expected,
-            "fs.finder({arg}) must still walk the root and nothing else"
-        );
+        let lua = Lua::new();
+        ito::scripting::vfs::register(&lua, &vfs).unwrap();
+        let r = lua
+            .load(format!(r#"return fs.finder({arg}):count()"#))
+            .eval::<usize>();
+        assert!(r.is_err(), "fs.finder({arg}) must be refused");
     }
+    let out = eval(&vfs, r#"return table.concat(fs.finder("sub"):find(), ",")"#);
+    assert_eq!(out, "sub/b.txt");
+    // A missing start raises, like fs.list.
+    let lua = Lua::new();
+    ito::scripting::vfs::register(&lua, &vfs).unwrap();
+    assert!(lua.load(r#"return fs.finder("nope"):count()"#).eval::<usize>().is_err());
+    assert!(lua.load(r#"return #fs.walk("nope")"#).eval::<usize>().is_err());
     cleanup(&base);
 }
 
-/// `iq`/`ied` are not symlink-aware: a link is the thing it points at, so an
+/// A link to `/` must be pruned before it is descended into, and `fs.list`
+/// drops out-of-root links like every other traversal.
+#[cfg(unix)]
+#[test]
+fn outward_links_are_pruned_and_unlisted() {
+    let (base, root, _outside) = escape_fixture("prune-list");
+    let vfs = Vfs::new(&root).unwrap();
+    let out = eval(&vfs, r#"return table.concat(fs.list(), ",")"#);
+    assert_eq!(out, "a.txt,sub");
+    cleanup(&base);
+}
+
+fn err_of(vfs: &Vfs, script: &str) -> String {
+    let lua = Lua::new();
+    ito::scripting::vfs::register(&lua, vfs).unwrap();
+    lua.load(script).exec().expect_err("must raise").to_string()
+}
+
+/// A leading `/` is rejected, so a path means the same file as under `ito`.
+#[test]
+fn leading_slash_is_rejected() {
+    let dir = tmp_dir("leading-slash");
+    let vfs = Vfs::new(&dir).unwrap();
+    for s in [r#"fs.read("/a")"#, r#"fs.glob("/*.txt")"#, r#"fs.write("/a", "x")"#] {
+        assert!(err_of(&vfs, s).contains("absolute"), "{s}");
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn remove_of_absent_file_shows_nothing_and_existing_empty_file_is_deleted() {
+    let dir = tmp_dir("remove-diff");
+    std::fs::write(dir.join("empty.txt"), "").unwrap();
+    let vfs = Vfs::new(&dir).unwrap();
+    run(&vfs, r#"fs.remove("absent.txt") fs.remove("empty.txt")"#);
+    assert_eq!(vfs.changed().unwrap(), vec!["empty.txt".to_string()]);
+    let d = vfs.diff().unwrap();
+    assert!(!d.contains("absent"), "{d}");
+    assert!(d.contains("a/empty.txt") && d.contains("/dev/null"), "{d}");
+    cleanup(&dir);
+}
+
+#[test]
+fn write_or_remove_of_a_directory_raises_at_queue_time() {
+    let dir = tmp_dir("dir-target");
+    std::fs::create_dir_all(dir.join("d")).unwrap();
+    std::fs::write(dir.join("f"), "x").unwrap();
+    let vfs = Vfs::new(&dir).unwrap();
+    assert!(err_of(&vfs, r#"fs.write("d", "x")"#).contains("is a directory"));
+    assert!(err_of(&vfs, r#"fs.remove("d")"#).contains("is a directory"));
+    assert!(err_of(&vfs, r#"fs.write("f/g", "x")"#).contains("parent is not a directory"));
+    // Nothing was queued, so the host's preview and flush still work.
+    assert!(vfs.changed().unwrap().is_empty());
+    vfs.flush().unwrap();
+    cleanup(&dir);
+}
+
+/// Content is bytes: a non-UTF-8 file reads, writes, diffs and compares.
+#[test]
+fn binary_content_round_trips() {
+    let dir = tmp_dir("binary");
+    std::fs::write(dir.join("b.bin"), [0xff, 0xfe, 0x00]).unwrap();
+    let vfs = Vfs::new(&dir).unwrap();
+    assert_eq!(eval(&vfs, r#"return tostring(#fs.read("b.bin"))"#), "3");
+    run(&vfs, r#"fs.write("b.bin", fs.read("b.bin"))"#);
+    assert!(vfs.changed().unwrap().is_empty());
+    run(&vfs, r#"fs.write("b.bin", "\xff\x01")"#);
+    assert_eq!(vfs.changed().unwrap().len(), 1);
+    assert!(vfs.diff().unwrap().contains("Binary files"));
+    vfs.flush().unwrap();
+    assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), [0xff, 0x01]);
+    cleanup(&dir);
+}
+
+#[test]
+fn glob_root_with_metacharacters_and_stat_and_walk_root() {
+    let dir = tmp_dir("meta[x]{y}");
+    std::fs::write(dir.join("a.txt"), "hello").unwrap();
+    let vfs = Vfs::new(&dir).unwrap();
+    assert_eq!(eval(&vfs, r#"return table.concat(fs.glob("*.txt"), ",")"#), "a.txt");
+    assert_eq!(
+        eval(&vfs, r#"local s = fs.stat("a.txt") return s.kind .. s.size"#),
+        "file5"
+    );
+    assert_eq!(eval(&vfs, r#"return tostring(fs.stat("nope"))"#), "nil");
+    assert_eq!(eval(&vfs, r#"return fs.walk()[1].path"#), ".");
+    cleanup(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_aliases_share_one_write_slot() {
+    let dir = tmp_dir("alias-slot");
+    std::fs::write(dir.join("a.txt"), "old").unwrap();
+    symlink(Path::new("a.txt"), &dir.join("link.txt"));
+    let vfs = Vfs::new(&dir).unwrap();
+    run(&vfs, r#"fs.write("a.txt", "one") fs.write("link.txt", "two")"#);
+    vfs.flush().unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two");
+    cleanup(&dir);
+}
+
+/// `ied` are not symlink-aware: a link is the thing it points at, so an
 /// in-root directory link is descended into. The boundary is unaffected, since
 /// containment is tested on the resolved location.
 #[cfg(unix)]

@@ -1,5 +1,5 @@
 //! Integration tests for the `yaml.edit` sequence structural edits
-//! (`append` / `insert_at` / `remove_at`) exposed on a sequence cursor.
+//! (`add` / `add_at` / `remove_at`) exposed on a sequence cursor.
 
 use mlua::Lua;
 
@@ -30,7 +30,7 @@ fn eval_err(subject: &str, script: &str) -> String {
 fn block_push_keeps_indent() {
     insta::assert_snapshot!(eval(
         "items:\n  - a\n  - b\n",
-        r#"local s = yaml.edit(subject) s:doc()["items"]:append("c") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc()["items"]:add("c") return s:to_string()"#
     ));
 }
 
@@ -38,7 +38,7 @@ fn block_push_keeps_indent() {
 fn block_insert_at_index() {
     insta::assert_snapshot!(eval(
         "- a\n- c\n",
-        r#"local s = yaml.edit(subject) s:doc():insert_at(2, "b") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add_at(2, "b") return s:to_string()"#
     ));
 }
 
@@ -54,7 +54,7 @@ fn block_remove() {
 fn flow_push_tight_preserves_spacing() {
     insta::assert_snapshot!(eval(
         "[a,b]\n",
-        r#"local s = yaml.edit(subject) s:doc():append("c") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add("c") return s:to_string()"#
     ));
 }
 
@@ -62,7 +62,7 @@ fn flow_push_tight_preserves_spacing() {
 fn flow_push_spaced_preserves_spacing() {
     insta::assert_snapshot!(eval(
         "[a, b]\n",
-        r#"local s = yaml.edit(subject) s:doc():append("c") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add("c") return s:to_string()"#
     ));
 }
 
@@ -70,7 +70,7 @@ fn flow_push_spaced_preserves_spacing() {
 fn flow_multiline_layout_continues() {
     insta::assert_snapshot!(eval(
         "[\n  a,\n  b,\n]\n",
-        r#"local s = yaml.edit(subject) s:doc():append("c") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add("c") return s:to_string()"#
     ));
 }
 
@@ -79,7 +79,7 @@ fn nested_collection_value() {
     // A block item serializes its nested collection as canonical block YAML, indented under the dash.
     insta::assert_snapshot!(eval(
         "- a\n",
-        r#"local s = yaml.edit(subject) s:doc():append({k = 1, nested = {1, 2}}) return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add({k = 1, nested = {1, 2}}) return s:to_string()"#
     ));
 }
 
@@ -87,7 +87,7 @@ fn nested_collection_value() {
 fn string_that_looks_scalar_is_quoted() {
     insta::assert_snapshot!(eval(
         "- a\n",
-        r#"local s = yaml.edit(subject) s:doc():append("true") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add("true") return s:to_string()"#
     ));
 }
 
@@ -101,9 +101,9 @@ fn chained_edits_through_one_cursor() {
         r#"
         local s = yaml.edit(subject)
         local seq = s:doc()["items"]
-        seq:append("c")
-        seq:append("d")
-        seq:insert_at(1, "z")
+        seq:add("c")
+        seq:add("d")
+        seq:add_at(1, "z")
         seq:remove_at(2)
         return s:to_string()
         "#
@@ -111,7 +111,7 @@ fn chained_edits_through_one_cursor() {
 }
 
 /// Removing the only block item collapses to a flow `[]`; the same
-/// cursor then points at that flow node and `append` grows it.
+/// cursor then points at that flow node and `add` grows it.
 #[test]
 fn collapse_to_empty_then_grow_through_same_cursor() {
     insta::assert_snapshot!(eval(
@@ -120,33 +120,33 @@ fn collapse_to_empty_then_grow_through_same_cursor() {
         local s = yaml.edit(subject)
         local seq = s:doc()["items"]
         seq:remove_at(1)
-        seq:append("b")
-        seq:append("c")
+        seq:add("b")
+        seq:add("c")
         return s:to_string()
         "#
     ));
 }
 
 #[test]
-fn out_of_range_remove_is_noop() {
-    insta::assert_snapshot!(eval(
-        "- a\n- b\n",
-        r#"local s = yaml.edit(subject) s:doc():remove_at(9) return s:to_string()"#
-    ));
+fn out_of_range_remove_errors() {
+    assert!(
+        eval_err("- a\n- b\n", r#"yaml.edit(subject):doc():remove_at(9)"#)
+            .contains("index out of range: 9")
+    );
 }
 
 #[test]
 fn out_of_range_insert_appends() {
     insta::assert_snapshot!(eval(
         "- a\n",
-        r#"local s = yaml.edit(subject) s:doc():insert_at(99, "b") return s:to_string()"#
+        r#"local s = yaml.edit(subject) s:doc():add_at(99, "b") return s:to_string()"#
     ));
 }
 
 #[test]
 fn negative_index_errors() {
     assert!(
-        eval_err("[a]\n", r#"yaml.edit(subject):doc():insert_at(-1, "x")"#)
+        eval_err("[a]\n", r#"yaml.edit(subject):doc():add_at(-1, "x")"#)
             .contains("index must be >= 1")
     );
     assert!(
@@ -158,7 +158,7 @@ fn negative_index_errors() {
 #[test]
 fn zero_index_errors() {
     assert!(
-        eval_err("[a]\n", r#"yaml.edit(subject):doc():insert_at(0, "x")"#)
+        eval_err("[a]\n", r#"yaml.edit(subject):doc():add_at(0, "x")"#)
             .contains("index must be >= 1")
     );
     assert!(

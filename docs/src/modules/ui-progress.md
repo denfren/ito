@@ -1,77 +1,66 @@
 # `ui.progress` — progress bars and spinners
 
-**Host-only (`ito`/`irun`).** `ui` names ambient terminal state — a
-progress bar draws to stderr — that a query's return value or an edit
-preview must not depend on, so it is absent rather than stubbed under
-`iq`/`ied`: `if ui then` is a usable feature test.
+| Function | Effect |
+| --- | --- |
+| `ui.progress.bar(len[, msg])` | a bar handle |
+| `ui.progress.spinner([msg])` | a self-animating spinner handle |
+| `ui.progress.style()` | a style builder |
+| `ui.progress.clear()` | erase every bar from the display |
+| `ui.progress.suspend(fn)` | hide the bars while `fn` runs |
 
-`ui.progress.bar(len[, msg])` and `ui.progress.spinner([msg])` return a
-**handle**, not a one-shot call — a progress indicator is inherently
-updated over time, across loop iterations or from several `task`s sharing
-one bar. A handle can safely be shared across tasks. Both draw to
-**stderr** by default, which keeps a bar from interleaving with a script's
-own `print` (stdout) or a piped `iq`-style return value.
+Not available in `ied`: a progress bar draws to the terminal, ambient state an
+`ied` run must not depend on ([reproducibility](../binaries/ied.md#reproducibility)).
+`ui` is absent rather than stubbed, so `if ui then` is a usable feature test.
 
-Every bar and spinner transparently joins one shared multi-bar display,
-created on first use — several concurrent indicators (e.g. one per
-`task.pool` worker) stack as separate terminal lines instead of
-overwriting each other. A single bar draws exactly as it always did; the
-difference only shows once a second one is live at the same time. A
-finisher (`finish`/`finish_and_clear`/`abandon`) leaves that shared state;
-`ui.progress.clear()` drops it outright for a clean slate between
-unrelated phases, and `ui.progress.suspend(fn)` hides every live bar, runs
-`fn`, then redraws them — for output (a prompt, a printed block) that must
-not interleave with the bars.
+## Example
 
 ```lua
 local bar = ui.progress.bar(#hosts, "deploying")
 for _, h in ipairs(hosts) do
     deploy(h)
-    bar:inc(1)
+    bar:inc()
 end
 bar:finish("done")
 ```
 
-| Call | Effect |
-| --- | --- |
-| `ui.progress.bar(len[, msg])` | a bar handle with a default template |
-| `ui.progress.spinner([msg])` | a spinner handle, self-animating |
-| `ui.progress.style()` | a style builder, see [below](#uiprogressstyle) |
-| `ui.progress.clear()` | drop the shared multi-bar state, for a fresh start |
-| `ui.progress.suspend(fn)` | hide every bar, run `fn`, redraw |
+## Conventions
 
-## Handle methods
+- **Handles.** `bar`/`spinner` return a handle, updated over time; it can be
+  shared across `task`s. Bars and spinners redraw on their own every 100 ms
+  (see `enable_steady_tick`).
+- **Stderr, and no terminal.** Bars draw to stderr, so they never mix with
+  `print` output. Without a terminal nothing is drawn;
+  `h:println(s)` and the message of `h:finish(msg)`/`h:abandon(msg)` are
+  then written to stderr as plain lines so they are not lost.
+- **Shared display.** Every bar joins one multi-bar display, so concurrent
+  bars (one per `task.pool` worker) stack on separate lines. A finished bar
+  keeps its last frame on screen; it is dropped from the display once every
+  bar above it has finished as well.
+- **Other output stays tidy.** `print`, `io.*`, log records and prompts pause
+  the bars while they write, so they do not garble them.
+- **Colour.** Default layouts are coloured only while `fmt.colors()` is on (auto detects against stderr, where bars draw).
+- **Errors.** When the script ends — or fails — still-running bars are
+  abandoned, so nothing keeps animating after an error.
+- **Panics become errors.** Invalid styles and intervals raise.
 
-| Method | Effect |
-| --- | --- |
-| `h:style(style)` | apply a [`ui.progress.style()`](#uiprogressstyle) builder |
-| `h:inc(n)` / `h:dec(n)` | advance / move back the position by `n` |
-| `h:set(n)` | set the position to `n` |
-| `h:set_length(n)` | change the total |
-| `h:inc_length(n)` / `h:dec_length(n)` | grow / shrink the total in place |
-| `h:set_message(s)` | replace the trailing status text |
-| `h:set_prefix(s)` | replace the leading `{prefix}` text |
-| `h:tick()` | advance a spinner's animation frame by hand |
-| `h:enable_steady_tick(secs)` | animate automatically every `secs` |
-| `h:disable_steady_tick()` | stop that animation |
-| `h:position()` / `h:length()` | current position / total (`length` may be `nil`) |
-| `h:elapsed()` / `h:eta()` | seconds elapsed / estimated seconds remaining |
-| `h:per_sec()` | current rate, items per second |
-| `h:is_finished()` | whether a terminal state (`finish`/`abandon`) was reached |
-| `h:println(s)` | print a line above the bar without disturbing it |
-| `h:reset()` | clear position, elapsed time and ETA |
-| `h:finish([msg])` | stop, keep the bar on screen, optionally set `msg` first |
-| `h:finish_and_clear()` | stop and erase the line |
-| `h:abandon([msg])` | stop, keep on screen, marked incomplete rather than done |
+## `ui.progress.bar`
+
+**Signature:** `ui.progress.bar(len: integer[, msg: string]) -> handle`
+
+**Parameters:**
+- `len` — the total (a non-negative integer).
+- `msg` — text for the `{msg}` slot; default empty.
+
+**Returns:** a handle with the default layout
+`{msg} [{bar}] {pos}/{len} ({eta})`.
+
+## `ui.progress.spinner`
+
+**Signature:** `ui.progress.spinner([msg: string]) -> handle`
+
+**Returns:** a handle with the layout `{spinner} {msg}`. It has no length.
 
 ```lua
-local bar = ui.progress.bar(#hosts, "checking hosts")
-for _, h in ipairs(hosts) do
-    probe(h)
-    bar:inc(1)
-end
-bar:finish("done")
-
 local spin = ui.progress.spinner("waiting for lock")
 while not acquired() do
     task.wait("200ms")
@@ -79,14 +68,102 @@ end
 spin:finish_and_clear()
 ```
 
-**A spinner keeps animating on its own** even while the script is doing
-something else — a `task.wait` loop between manual `:tick()` calls would
-otherwise freeze its frame for the whole wait; `enable_steady_tick` (on by
-default for `ui.progress.spinner`) avoids that.
+## `ui.progress.clear`
 
-## Multiple bars and suspending the display
+Erase every bar (finished ones too) from the display. Live bars draw
+themselves again on their next update.
 
-Concurrent bars stack automatically:
+**Signature:** `ui.progress.clear()`
+
+## `ui.progress.suspend`
+
+Run `fn` with the display hidden, then redraw. For output that must not
+interleave with the bars (a prompt, a printed block).
+
+**Signature:** `ui.progress.suspend(fn: function)`
+
+**Parameters:**
+- `fn` — called with no arguments; it may `await` (`task.wait`, prompts, …),
+  touch bars, and call `suspend` again. The bars are redrawn afterwards, also
+  if `fn` raises. `fn`'s error propagates.
+
+```lua
+ui.progress.suspend(function()
+    if not ui.prompt.confirm("Continue?") then
+        error("aborted")
+    end
+end)
+```
+
+## Handle methods
+
+| Method | Effect |
+| --- | --- |
+| `h:style(style)` | apply a [style](#uiprogressstyle) |
+| `h:inc([n])` / `h:dec([n])` | advance / move back the position by `n` (default 1) |
+| `h:set(n)` | set the position |
+| `h:set_length(n)` | change the total |
+| `h:inc_length(n)` / `h:dec_length(n)` | grow / shrink the total |
+| `h:set_message(s)` | replace `{msg}` |
+| `h:set_prefix(s)` | replace `{prefix}` |
+| `h:tick()` | advance the animation one frame |
+| `h:enable_steady_tick(every)` | redraw automatically every `every` (on by default, 100 ms) |
+| `h:disable_steady_tick()` | stop that |
+| `h:position()` / `h:length()` | current position / total (`nil` for a spinner) |
+| `h:elapsed()` / `h:eta()` | seconds elapsed / estimated seconds left |
+| `h:per_sec()` | current rate, items per second |
+| `h:is_finished()` | whether `finish`/`abandon`/`finish_and_clear` ran |
+| `h:println(s)` | print a line above the bar |
+| `h:reset()` | clear position, elapsed time and ETA |
+| `h:finish([msg])` | stop, keep the bar, optionally setting `msg` first |
+| `h:finish_and_clear()` | stop and erase the line |
+| `h:abandon([msg])` | stop, keep the bar, marked incomplete |
+
+Counts (`n`, `len`) are non-negative integers. `every` takes the delta
+grammar of [`time`](time.md): seconds as a number, or a string such as
+`"250ms"` or `"2s"`; it must be greater than zero, otherwise the call raises.
+
+```lua
+local bar = ui.progress.bar(100, "copy")
+bar:enable_steady_tick("50ms")
+bar:set(40)
+bar:println("halfway soon")
+bar:abandon("stopped at 40")
+```
+
+## `ui.progress.style`
+
+A builder for the layout of a bar or spinner; apply it with `h:style(...)`.
+It is a set of overrides over the handle's own default layout, so
+`:progress_chars()` alone keeps `{msg}` and a spinner stays a spinner. Each
+method returns the builder.
+
+| Method | Effect |
+| --- | --- |
+| `s:template(str)` | the layout: `{bar}`, `{wide_bar}`, `{msg}`, `{prefix}`, `{pos}`, `{len}`, `{percent}`, `{elapsed}`, `{eta}`, `{spinner}`, … |
+| `s:tick_chars(str)` | spinner frames, one character each (at least 2) |
+| `s:tick_strings(list)` | spinner frames as separate strings (at least 2) |
+| `s:progress_chars(str)` | the filled, current and unfilled characters (at least 2, equal width) |
+
+**Errors.** A malformed template (a stray or unterminated brace) raises when
+`:template()` is called, as do too few tick frames or progress characters. An
+unrecognised placeholder does not raise: it renders empty, so a typo such as
+`{elapsd}` silently vanishes.
+
+```lua
+local style = ui.progress.style()
+    :template("{spinner} {msg} [{wide_bar}] {percent}%")
+    :tick_strings({ "◐", "◓", "◑", "◒", "" })
+    :progress_chars("=> ")
+local bar = ui.progress.bar(100)
+bar:style(style)
+```
+
+Custom computed template keys (`with_key`) are not available: they would call
+back into Luau from the drawing thread. Update text with `set_message`/
+`set_prefix` instead.
+
+## Concurrent bars
 
 ```lua
 local pool = task.pool(4)
@@ -97,47 +174,7 @@ for _, h in ipairs(hosts) do
         bar:finish_and_clear()
     end)
 end
-pool:await_all()
-```
-
-To show a prompt or print output without it interleaving with active bars,
-wrap it in `ui.progress.suspend`:
-
-```lua
-ui.progress.suspend(function()
-    print("pausing for input")
-    ui.prompt.confirm("Continue?")
-end)
-```
-
-`suspend` clears every live bar's lines, runs the function, then redraws
-them — safe to nest, and the redraw still happens even if the function
-raises. If no bar/spinner exists yet, the function just runs directly.
-
-## `ui.progress.style`
-
-A builder for a bar or spinner's layout, applied to a handle with
-`h:style(...)`.
-
-| Method | Effect |
-| --- | --- |
-| `s:template(str)` | the layout — placeholders like `{bar}`, `{wide_bar}`, `{msg}`, `{prefix}`, `{pos}`, `{len}`, `{percent}`, `{elapsed}`, `{eta}`, `{spinner}`, … |
-| `s:tick_chars(str)` | one string, one character per spinner frame plus a final frame |
-| `s:tick_strings(list)` | the same, as separate strings — for multi-byte glyphs |
-| `s:progress_chars(str)` | three characters: filled, current, unfilled |
-
-A **malformed** template (a stray `{`/`}`, an unterminated brace) raises,
-naming the syntax problem. An **unrecognized placeholder** does not error —
-it renders empty rather than being checked against the known set, so a
-typo'd `{elapsd}` silently vanishes rather than failing loudly; check the
-rendered output.
-
-```lua
-local style = ui.progress.style()
-    :template("{spinner} {msg} [{wide_bar}] {percent}%")
-    :tick_strings({ "◐", "◓", "◑", "◒", "" })
-    :progress_chars("=> ")
-
-local bar = ui.progress.bar(100)
-bar:style(style)
+while not pool:done() do
+    pool:await()
+end
 ```

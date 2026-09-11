@@ -5,6 +5,7 @@
 | `task.spawn(f, ...)` | start `f(...)` on its own task now; returns a handle |
 | `task.await(...)` | wait for one or more handles; return their results |
 | `task.poll(<handle>)` | check a handle without blocking |
+| `task.status(<handle>)` | `"pending"`, `"done"`, `"failed"` or `"cancelled"` |
 | `task.cancel(<handle>)` | stop a pending task |
 | `task.wait(<duration>)` | non-blocking sleep |
 | `task.timeout(<duration>, f, ...)` | run `f(...)` under a deadline |
@@ -18,7 +19,10 @@
 | `pool:poll()` | check the pool without blocking |
 | `pool:count()` | tasks spawned but not yet collected |
 | `pool:done()` | `true` once `count()` is `0` |
-| `pool:cancel()` | stop every uncollected task; return how many it stopped |
+| `pool:concurrency()` | the `n` the pool was created with |
+| `pool:cancel()` | stop every uncollected task; return how many were still pending |
+
+`tostring(pool)` reads `"task.pool(8) (3 outstanding)"`.
 
 ## Example
 
@@ -41,7 +45,7 @@ Eight connections are open at any moment; the ninth starts as soon as one
 finishes. Results arrive in the order they complete, not the order they
 were spawned, so one slow host never holds up the others.
 
-## General rules
+## Conventions
 
 Tasks share one thread and interleave only where they *await* — at a
 `task.wait`, or inside a `proc`/`ssh`/`aws.ec2` call. Pure computation
@@ -83,39 +87,43 @@ deadlock with no error and no deadline to break it. The check is scoped
 to the task body actually running: a pooled task parked on `task.wait` is
 not "inside pooled work" for this purpose, only a task body currently
 being resumed is, so the main script's own top-level `pool:await` is
-never mistaken for reentrant pooled work. Plain `task.spawn`/`task.await`
-nested inside pooled work is unaffected and is the documented escape for
-work that needs to compose.
+never mistaken for reentrant pooled work. A task spawned (`task.spawn`,
+`task.timeout`) from inside pooled work inherits the restriction — awaiting
+a pool from there would deadlock just the same. Plain `task.spawn`/
+`task.await` for work that does not touch a pool is unaffected.
 
 **Failure and the drain.** Every task — spawned directly, pooled, or
 started by `task.timeout` — is registered and *drained* after the script
 (and `main`, if defined) returns, before buffered `fs` writes are
 flushed, so a task kept purely for its side effects still lands its
 writes even if nobody awaited it. A task that fails without ever being
-collected is logged and fails the run; a failure the script collected
+collected is logged and fails the run — including one that failed long
+before the script ended; a failure the script collected
 with `pcall` (via `task.await`, `task.poll`, `pool:await` or
 `pool:poll`) does not. `pool:cancel()` (and `task.cancel` for a plain
 handle) is the only way to abandon work without failing the run —
-cancellation is exempt from drain reporting.
+cancellation is exempt from drain reporting, and `pool:cancel()` also
+claims the failures of tasks it discards. The registry releases a task as
+soon as it finishes successfully, so a long sweep does not accumulate.
 
 **Durations.** Anywhere a duration is taken (`task.wait`, `task.timeout`)
-it uses the same grammar as `time.delta` — a number of seconds
-(fractional allowed) or a humantime string (`"30s"`, `"5min"`,
-`"1h 30min"`). See [`time`](time.md) for the full grammar; there is no
-separate parser here.
+it is read by `time.parse_delta` — a number of seconds (fractional
+allowed) or a string (`"30s"`, `"5min"`, `"1h 30min"`; a day is a fixed
+24h). See [`time`](time.md) for the full grammar; there is no separate
+parser here. Negative, non-finite or absurdly long values raise.
 
 **`require` from a task is safe.** Luau resolves an import synchronously
 within one resume, so no other task can run between the requirer
 resetting and the `loader` call that ends the sequence — a concurrent
 `require` cannot interleave mid-navigation.
 
-## `task.spawn(f, ...)`
+## `task.spawn`
 
 Starts `f(...)` on its own task and returns a handle immediately.
 
 **Signature:** `task.spawn(f: function, ...: any) -> handle`
 
-**Parameters**
+**Parameters:**
 
 - `f` — the function to run. Required; a non-function raises.
 - `...` — extra arguments, passed to `f` unchanged.
@@ -137,29 +145,35 @@ local h = task.spawn(function(x, y) return x + y end, 2, 3)
 print(task.await(h))  --> 5
 ```
 
-## `task.await(...)`
+## `task.await`
 
 Waits for one or more tasks and returns their results.
 
 **Signature:** `task.await(handle, ...) -> ...` or `task.await(list) -> ...`
 
-**Parameters**
+**Parameters:**
 
 - Either one or more task handles as separate arguments (`task.await(a, b)`),
   or a single table of handles (`task.await(handles)`) — the form a loop
-  that accumulates handles into a table wants.
+  that accumulates handles into a table wants. At least one handle is
+  required: `task.await({})` and `task.await()` raise. A hole (`nil`) in the
+  list is a wrong-typed element and raises; it does not end the list.
 
-**Returns**
+**Returns:**
 
 - With **one** handle: that task's return values, unchanged (so a
   multi-value return survives intact and a single `await` reads like a
   plain call).
 - With **several** handles: one value per handle, positionally — a
   multi-value task result is *not* flattened, since that would make the
-  positions stop lining up with the handles.
+  positions stop lining up with the handles. Note the shape therefore
+  depends on the number of handles: `task.await({h})` returns all of `h`'s
+  values, `task.await({h, g})` only the first of each.
 
 **Errors:** if any awaited task failed, `await` still waits for *every*
-handle to settle first, then raises the first failure in list order.
+handle to settle first, then raises the first failure in list order. With
+several handles the message names the failing one (`task.await: handle 2
+(task#7) failed: ...`).
 Waiting for all of them (rather than returning at the first failure)
 is what makes wrapping the call in `pcall` catch the whole batch: an
 un-awaited failure is what the drain fails the run with, and bailing
@@ -176,13 +190,13 @@ end
 local a, b, c, d = task.await(hs)
 ```
 
-## `task.poll(<handle>)`
+## `task.poll`
 
 Checks a task without blocking.
 
 **Signature:** `task.poll(handle) -> ready: boolean, ...`
 
-**Parameters**
+**Parameters:**
 
 - `handle` — a task handle. A non-handle value raises.
 
@@ -201,13 +215,33 @@ task.wait(0.4)
 local ready, value = task.poll(h)  -- ready == true, value == "v"
 ```
 
-## `task.cancel(<handle>)`
+## `task.status`
+
+Reports where a task is, without touching its result.
+
+**Signature:** `task.status(handle) -> string`
+
+**Parameters:**
+
+- `handle` — a task handle. A non-handle value raises.
+
+**Returns:** `"pending"`, `"done"`, `"failed"` or `"cancelled"`. Unlike
+`task.poll` it never raises the task's error, and it tells a cancelled task
+from a failed one.
+
+```lua
+local h = task.spawn(function() task.wait(30) end)
+task.cancel(h)
+assert(task.status(h) == "cancelled")
+```
+
+## `task.cancel`
 
 Stops a task that has not finished yet.
 
 **Signature:** `task.cancel(handle) -> boolean`
 
-**Parameters**
+**Parameters:**
 
 - `handle` — a task handle. A non-handle value raises.
 
@@ -232,35 +266,36 @@ assert(task.cancel(h) == true)
 assert(task.cancel(h) == false)  -- already settled
 ```
 
-## `task.wait(<duration>)`
+## `task.wait`
 
 Sleeps without blocking the runtime, so other tasks progress meanwhile.
 
 **Signature:** `task.wait(duration) -> ()`
 
-**Parameters**
+**Parameters:**
 
 - `duration` — seconds as a number (fractional allowed, non-negative),
-  or a humantime string (`"30s"`, `"5min"`, `"1h 30min"`). See
-  [`time`](time.md) for the shared delta grammar.
+  or a string (`"30s"`, `"5min"`, `"1h 30min"`), read by `time.parse_delta`.
+  See [`time`](time.md) for the shared delta grammar.
 
 **Returns:** nothing.
 
-**Errors:** raises if `duration` is negative, non-finite, an unparseable
-string, or a value of the wrong type.
+**Errors:** raises if `duration` is negative, non-finite, too long to
+represent (`1e20`), an unparseable string (including a bare `"30"` or a
+month/year unit), or a value of the wrong type.
 
 ```lua
 task.wait(0.5)
 task.wait("500ms")
 ```
 
-## `task.timeout(<duration>, f, ...)`
+## `task.timeout`
 
 Runs `f(...)` under a deadline.
 
 **Signature:** `task.timeout(duration, f: function, ...: any) -> ...`
 
-**Parameters**
+**Parameters:**
 
 - `duration` — same grammar as `task.wait`.
 - `f` — the function to run under the deadline.
@@ -309,30 +344,34 @@ local r = task.timeout("50ms", function() task.wait(30) return "never" end)
 assert(r == task.TIMEOUT)
 ```
 
-## `task.pool(<concurrency>)`
+## `task.pool`
 
 Creates a pool that runs at most `concurrency` task bodies at once.
 
 **Signature:** `task.pool(concurrency: number) -> pool`
 
-**Parameters**
+**Parameters:**
 
-- `concurrency` — an integer of at least `1`. `0`, negative, or
-  non-integer values raise.
+- `concurrency` — a whole number of at least `1` (and no larger than the
+  semaphore limit, about 2.3e18). `0`, negative, fractional (`2.5`), huge or
+  non-number values raise.
 
 **Returns:** a pool object (see the `pool:*` methods below).
+
+**Methods:** `spawn` · `await` · `poll` · `count` · `done` · `concurrency` ·
+`cancel`
 
 ```lua
 local pool = task.pool(8)
 ```
 
-## `pool:spawn(f, ...)`
+## `pool:spawn`
 
 Queues `f(...)` on the pool.
 
 **Signature:** `pool:spawn(f: function, ...: any) -> ()`
 
-**Parameters**
+**Parameters:**
 
 - `f` — the function to run. Required; a non-function raises.
 - `...` — extra arguments, passed to `f` unchanged.
@@ -351,7 +390,7 @@ local pool = task.pool(2)
 pool:spawn(function() return "host-a", probe("host-a") end)
 ```
 
-## `pool:await()`
+## `pool:await`
 
 Blocks until the pool has a result ready, and returns it.
 
@@ -384,7 +423,7 @@ end
 -- got == { 0.05, 0.1, 0.2, 0.3 }: completion order, not spawn order.
 ```
 
-## `pool:poll()`
+## `pool:poll`
 
 Checks the pool without blocking.
 
@@ -410,7 +449,7 @@ task.wait(0.4)
 local ready, value = pool:poll()  -- true, "v"
 ```
 
-## `pool:count()`
+## `pool:count`
 
 **What is it:** how many spawned tasks have not yet been collected —
 queued, running, and finished-but-uncollected all count.
@@ -428,7 +467,7 @@ pool:await()
 assert(pool:count() == 2)  -- collecting decrements it
 ```
 
-## `pool:done()`
+## `pool:done`
 
 **What is it:** whether every spawned task has been collected.
 
@@ -446,23 +485,35 @@ pool:await()
 assert(pool:done() == true)
 ```
 
-## `pool:cancel()`
+## `pool:concurrency`
+
+**Signature:** `pool:concurrency() -> number`
+
+**Returns:** the concurrency the pool was created with.
+
+```lua
+assert(task.pool(3):concurrency() == 3)
+```
+
+## `pool:cancel`
 
 Stops every task the pool has not yet collected — queued, running, and
 finished-but-uncollected.
 
 **Signature:** `pool:cancel() -> number`
 
-**Returns:** how many tasks it actually stopped (a finished, uncollected
-task result is discarded, not stopped in the same sense as a still-running
-one, but is also cleared from the pool).
+**Returns:** how many tasks were still pending and got stopped. A task that
+had already finished (collected or not) is not counted: its result is
+discarded, and a failure it carried is claimed so it cannot fail the run.
 
 **Errors:** none.
 
 Cancellation is exempt from drain reporting, so `pool:cancel()` is the
 only way to abandon a sweep of pooled work without failing the run —
-including tasks that would otherwise have failed. After it, `pool:done()`
-is `true` and `pool:count()` is `0`.
+including tasks that would otherwise have failed, even ones that had
+already failed. After it, `pool:done()` is `true` and `pool:count()` is
+`0`. A `pool:await()` parked on the pool at that moment wakes and raises
+"on a drained pool" instead of hanging.
 
 ```lua
 local pool = task.pool(2)

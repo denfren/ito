@@ -2,9 +2,8 @@
 //! to a mutable `Target`. Ported from the `hrs` crate, adapted to a single
 //! root body (no multi-document loop).
 
-use super::types::{HclError, Segment, Target, labels_match};
-use hcl::edit::Ident;
-use hcl::edit::expr::{Expression, ObjectKey};
+use super::types::{HclError, Segment, Target, find_object_key, labels_match};
+use hcl::edit::expr::Expression;
 use hcl::edit::structure::{Block, Body};
 
 pub(crate) struct VisitPath {
@@ -33,15 +32,13 @@ impl VisitPath {
         self.path.len() == self.visited
     }
 
+    /// `seg` is the segment just consumed (`visited` already counts it), so
+    /// the path *above* it is one shorter.
     fn not_found(&self, seg: Segment) -> HclError {
         HclError::NotFound {
-            path: self.path_traversed(),
+            path: self.path[..self.visited.saturating_sub(1)].to_vec(),
             segment: seg,
         }
-    }
-
-    fn path_traversed(&self) -> Vec<Segment> {
-        self.path[..self.visited].to_vec()
     }
 
     fn visit_body<'a>(&mut self, node: &'a mut Body) -> Result<Target<'a>, HclError> {
@@ -93,8 +90,8 @@ impl VisitPath {
                 self.visit_block_segment(node, ident, labels, *nth, seg.clone())
             }
             Segment::Index { .. } => Err(HclError::InvalidType {
-                expected: "Text, Attr, or Block segment",
-                actual: "Index segment",
+                expected: "a key, attribute or block",
+                actual: "index",
             }),
         }
     }
@@ -168,20 +165,21 @@ impl VisitPath {
             Segment::Attr { key } => key.as_str(),
             Segment::Index { .. } => {
                 return Err(HclError::InvalidType {
-                    expected: "Text segment",
-                    actual: "Index segment",
+                    expected: "key",
+                    actual: "index",
                 });
             }
             Segment::Block { .. } => {
                 return Err(HclError::InvalidType {
-                    expected: "Text segment",
-                    actual: "Block segment",
+                    expected: "key",
+                    actual: "block",
                 });
             }
         };
 
-        let obj_key = ObjectKey::from(Ident::new(key));
-        if let Some(value) = node.get_mut(&obj_key) {
+        if let Some(obj_key) = find_object_key(node, key)
+            && let Some(value) = node.get_mut(&obj_key)
+        {
             return self.visit_expr(value.expr_mut());
         }
 
@@ -201,20 +199,20 @@ impl VisitPath {
             Segment::Index { index } => *index,
             Segment::Text { .. } => {
                 return Err(HclError::InvalidType {
-                    expected: "Index segment",
-                    actual: "Text segment",
+                    expected: "index",
+                    actual: "key",
                 });
             }
             Segment::Block { .. } => {
                 return Err(HclError::InvalidType {
-                    expected: "Index segment",
-                    actual: "Block segment",
+                    expected: "index",
+                    actual: "block",
                 });
             }
             Segment::Attr { .. } => {
                 return Err(HclError::InvalidType {
-                    expected: "Index segment",
-                    actual: "Attr segment",
+                    expected: "index",
+                    actual: "attribute",
                 });
             }
         };
@@ -238,7 +236,11 @@ impl VisitPath {
         }
 
         if let Some(seg) = self.next() {
-            return Err(self.not_found(seg));
+            // not consumed yet: `visited` is the path above it
+            return Err(HclError::NotFound {
+                path: self.path[..self.visited].to_vec(),
+                segment: seg,
+            });
         }
 
         Ok(Target::Expr(node))

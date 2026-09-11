@@ -1,29 +1,37 @@
-//! The `cli` module across all four binaries.
+//! The `cli` module across both binaries.
 //!
 //! The unit tests in `scripting/cli.rs` cover the grammar. What needs a real
-//! process is the part that made widening `cli` past `ito`/`irun` safe: what
+//! process is the part that made widening `cli` past `ito` safe: what
 //! `cli.parse()` prints is *terminal*, so a run that prints it never reaches
-//! `emit_returned` (`iq`) or `emit_reports` (`ied`) and cannot interleave with
-//! either. That is a claim about whole-process stream contents and exit codes,
-//! which is only observable from outside.
+//! `emit_reports` (`ied`) and cannot interleave with it. That is a claim about
+//! whole-process stream contents and exit codes, which is only observable from
+//! outside.
 
 use assert_cmd::Command;
+use assert_cmd::assert::Assert;
 use predicates::prelude::*;
 
 fn ito() -> Command {
     Command::cargo_bin("ito").unwrap()
 }
 
-fn iq() -> Command {
-    Command::cargo_bin("iq").unwrap()
-}
-
 fn ied() -> Command {
     Command::cargo_bin("ied").unwrap()
 }
 
-fn irun() -> Command {
-    Command::cargo_bin("irun").unwrap()
+/// Runs a script given as source, followed by `args`. A script is always a
+/// path, so the source is written to a temporary file first.
+trait RunScript {
+    fn run_script(&mut self, src: &str, args: &[&str]) -> Assert;
+}
+
+impl RunScript for Command {
+    fn run_script(&mut self, src: &str, args: &[&str]) -> Assert {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("s.luau");
+        std::fs::write(&script, src).unwrap();
+        self.arg(&script).args(args).assert()
+    }
 }
 
 /// A script declaring one option and one positional, echoing both.
@@ -44,31 +52,13 @@ end
 
 #[test]
 fn every_binary_has_cli() {
-    // Each reports through the channel it actually has: `iq` has no `print`
-    // (its return value is the output), and `irun` has no flags to pass `-s`.
     ito()
-        .args(["-s", "print(type(cli))"])
-        .assert()
+        .run_script("print(type(cli))", &[])
         .success()
         .stdout(predicate::str::contains("table"));
 
     ied()
-        .args(["-s", "print(type(cli))"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("table"));
-
-    iq().args(["-s", "return type(cli)"])
-        .assert()
-        .success()
-        .stdout(predicate::eq("table"));
-
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("s.luau");
-    std::fs::write(&script, "print(type(cli))").unwrap();
-    irun()
-        .arg(&script)
-        .assert()
+        .run_script("print(type(cli))", &[])
         .success()
         .stdout(predicate::str::contains("table"));
 }
@@ -76,54 +66,9 @@ fn every_binary_has_cli() {
 #[test]
 fn parses_options_and_positionals() {
     ito()
-        .args(["-s", ECHO, "::", "--upper", "hello"])
-        .assert()
+        .run_script(ECHO, &["--upper", "hello"])
         .success()
         .stdout(predicate::str::contains("HELLO"));
-}
-
-// ---------------------------------------------------------------------------
-// `iq`: the return value owns stdout
-// ---------------------------------------------------------------------------
-
-/// A filter whose answer is its return value, as `iq` requires.
-const FILTER: &str = r#"
-local word = cli.arg("word", "what to return")
-function main()
-    cli.parse()
-    return word()
-end
-"#;
-
-#[test]
-fn iq_writes_only_the_answer() {
-    // Verbatim: no trailing newline, nothing from `cli` alongside it.
-    iq().args(["-s", FILTER, "::", "hi"])
-        .assert()
-        .success()
-        .stdout(predicate::eq("hi"));
-}
-
-#[test]
-fn iq_help_does_not_reach_the_answer() {
-    // Terminal: `emit_returned` never runs, so stdout is the help alone and
-    // stderr stays empty -- a `--help` is an answer, not a complaint.
-    iq().args(["-s", FILTER, "::", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Arguments:"))
-        .stderr(predicate::str::is_empty());
-}
-
-#[test]
-fn iq_usage_error_leaves_stdout_clean() {
-    // The pipe-purity guarantee: a bad command line must not put a partial or
-    // spurious answer where `$(iq ...)` would capture it.
-    iq().args(["-s", FILTER, "::", "--nope"])
-        .assert()
-        .code(2)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("unknown option \"--nope\""));
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +98,8 @@ fn fixture() -> (tempfile::TempDir, String) {
 fn ied_diff_reports_the_change() {
     let (dir, path) = fixture();
     ied()
-        .args(["-s", EDIT, "-C", &path, "--diff", "::", "-s", "?", "f.txt"])
-        .assert()
+        .args(["-C", &path, "--diff"])
+        .run_script(EDIT, &["-s", "?", "f.txt"])
         .success()
         .stdout(predicate::str::contains("+hello?"));
     // A bare run drops the change set: nothing reached disk.
@@ -168,11 +113,11 @@ fn ied_help_replaces_the_report() {
     // print the help alone, because `emit_reports` is downstream of `eval`.
     let (dir, path) = fixture();
     ied()
-        .args(["-s", EDIT, "-C", &path, "--diff", "::", "--help"])
-        .assert()
+        .args(["-C", &path, "--diff"])
+        .run_script(EDIT, &["--help"])
         .success()
         .stdout(
-            predicate::str::contains("Arguments:").and(predicate::str::contains("+hello?").not()),
+            predicate::str::contains("Usage:").and(predicate::str::contains("+hello?").not()),
         );
     let on_disk = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
     assert_eq!(on_disk, "hello");
@@ -182,8 +127,8 @@ fn ied_help_replaces_the_report() {
 fn ied_usage_error_writes_no_report() {
     let (_dir, path) = fixture();
     ied()
-        .args(["-s", EDIT, "-C", &path, "--diff", "::", "--nope"])
-        .assert()
+        .args(["-C", &path, "--diff"])
+        .run_script(EDIT, &["--nope"])
         .code(2)
         .stdout(predicate::str::is_empty());
 }
@@ -194,8 +139,8 @@ fn ied_help_does_not_write_even_under_w() {
     // script body has run at all, so there is nothing to commit.
     let (dir, path) = fixture();
     ied()
-        .args(["-s", EDIT, "-C", &path, "--write", "::", "--help"])
-        .assert()
+        .args(["-C", &path, "--write"])
+        .run_script(EDIT, &["--help"])
         .success();
     let on_disk = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
     assert_eq!(on_disk, "hello");
@@ -208,8 +153,7 @@ fn ied_help_does_not_write_even_under_w() {
 #[test]
 fn help_goes_to_stdout_and_exits_zero() {
     ito()
-        .args(["-s", ECHO, "::", "--help"])
-        .assert()
+        .run_script(ECHO, &["--help"])
         .success()
         .stdout(predicate::str::contains("-u, --upper"))
         .stderr(predicate::str::is_empty());
@@ -218,8 +162,7 @@ fn help_goes_to_stdout_and_exits_zero() {
 #[test]
 fn usage_errors_go_to_stderr_and_exit_two() {
     ito()
-        .args(["-s", ECHO, "::", "--bogus"])
-        .assert()
+        .run_script(ECHO, &["--bogus"])
         .code(2)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("unknown option \"--bogus\""));
@@ -228,8 +171,7 @@ fn usage_errors_go_to_stderr_and_exit_two() {
 #[test]
 fn a_missing_required_argument_is_a_usage_error() {
     ito()
-        .args(["-s", ECHO])
-        .assert()
+        .run_script(ECHO, &[])
         .code(2)
         .stderr(predicate::str::contains("missing required argument <word>"));
 }
@@ -238,18 +180,16 @@ fn a_missing_required_argument_is_a_usage_error() {
 fn help_beats_a_missing_required_argument() {
     // The script whose help you need is the one you cannot yet invoke.
     ito()
-        .args(["-s", ECHO, "::", "--help"])
-        .assert()
+        .run_script(ECHO, &["--help"])
         .success()
-        .stdout(predicate::str::contains("Arguments:"));
+        .stdout(predicate::str::contains("Usage:"));
 }
 
 #[test]
 fn a_script_error_is_still_exit_three() {
     // The exit sentinel must not swallow ordinary failures.
     ito()
-        .args(["-s", r#"cli.parse() error("boom")"#])
-        .assert()
+        .run_script(r#"cli.parse() error("boom")"#, &[])
         .code(3);
 }
 
@@ -258,8 +198,7 @@ fn a_bad_spec_is_a_script_error_not_a_usage_error() {
     // A malformed spec is the script's bug, so it raises as an ordinary Luau
     // error (exit 3) rather than printing usage.
     ito()
-        .args(["-s", r#"cli.opt("ab/cd=x")"#])
-        .assert()
+        .run_script(r#"cli.opt("ab/cd=x")"#, &[])
         .code(3)
         .stderr(predicate::str::contains("bad option spec"));
 }
@@ -269,37 +208,35 @@ fn usage_line_names_no_program() {
     // Under a shebang the binary's argv[0] is the interpreter, not the script,
     // so no name is printed at all.
     ito()
-        .args(["-s", ECHO, "::", "--help"])
-        .assert()
+        .run_script(ECHO, &["--help"])
         .success()
         .stdout(predicate::str::contains("ito").not());
 }
 
 // ---------------------------------------------------------------------------
-// `irun`: no separator
+// After SCRIPT, every argument is the script's
 // ---------------------------------------------------------------------------
 
 #[test]
-fn irun_needs_no_separator() {
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("s.luau");
-    std::fs::write(&script, ECHO).unwrap();
-    irun()
-        .args([script.to_str().unwrap(), "--upper", "hey"])
-        .assert()
+fn help_after_the_script_is_the_scripts_own() {
+    // `ito --help` is clap's; `ito s.luau --help` never reaches clap.
+    ito()
+        .run_script(ECHO, &["--help"])
         .success()
-        .stdout(predicate::str::contains("HEY"));
+        .stdout(predicate::str::contains("what to say"))
+        .stdout(predicate::str::contains("full ito standard library").not());
 }
 
 #[test]
-fn irun_help_is_the_scripts_own() {
-    // `irun` has no flags, so `--help` can only ever be the script's.
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("s.luau");
-    std::fs::write(&script, ECHO).unwrap();
-    irun()
-        .args([script.to_str().unwrap(), "--help"])
-        .assert()
+fn binary_flag_spellings_reach_cli_parse() {
+    // `-v` is the binary's verbosity flag before SCRIPT; after it, `cli.parse`
+    // sees it like any other argument.
+    ito()
+        .run_script(
+            r#"local v = cli.opt("v/verbose", "chatty")
+               function main() cli.parse() print("v=" .. tostring(v())) end"#,
+            &["-v"],
+        )
         .success()
-        .stdout(predicate::str::contains("what to say"));
+        .stdout(predicate::str::contains("v=true"));
 }

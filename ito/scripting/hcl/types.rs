@@ -2,7 +2,7 @@
 //! cursor API. Ported from the `hrs` crate, adapted to a single-`Body`
 //! root (no multi-document `Bodies` target).
 
-use hcl::edit::expr::{Array, Expression, Object};
+use hcl::edit::expr::{Array, Expression, Object, ObjectKey};
 use hcl::edit::structure::{Block, Body};
 use std::fmt::{Debug, Formatter};
 
@@ -71,10 +71,10 @@ impl Segment {
     /// Human-readable variant name for `InvalidType` error messages.
     pub fn kind_name(&self) -> &'static str {
         match self {
-            Segment::Text { .. } => "Text segment",
-            Segment::Index { .. } => "Index segment",
-            Segment::Block { .. } => "Block segment",
-            Segment::Attr { .. } => "Attr segment",
+            Segment::Text { .. } => "key",
+            Segment::Index { .. } => "index",
+            Segment::Block { .. } => "block",
+            Segment::Attr { .. } => "attribute",
         }
     }
 }
@@ -114,24 +114,98 @@ impl Debug for Segment {
     }
 }
 
+impl std::fmt::Display for Segment {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Segment::Text { text } => f.write_str(text),
+            Segment::Attr { key } => write!(f, "attr {key:?}"),
+            // 1-based on the way out: the path is spelled as the script did.
+            Segment::Index { index } => write!(f, "[{}]", index + 1),
+            Segment::Block { ident, labels, nth } => {
+                write!(f, "block {ident:?}")?;
+                for l in labels {
+                    write!(f, " {l:?}")?;
+                }
+                if let Some(n) = nth {
+                    write!(f, " #{}", n + 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Render a path for an error message: `block "a" > attr "x" > [2]`.
+pub fn render_path(path: &[Segment]) -> String {
+    if path.is_empty() {
+        return "the document root".to_string();
+    }
+    path.iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+/// The key of `object` spelled `key`, as written in the source: a bare
+/// identifier or a quoted string.
+pub fn find_object_key(object: &Object, key: &str) -> Option<ObjectKey> {
+    object
+        .iter()
+        .map(|(k, _)| k)
+        .find(|k| object_key_str(k).as_deref() == Some(key))
+        .cloned()
+}
+
+fn object_key_str(k: &ObjectKey) -> Option<String> {
+    match k {
+        ObjectKey::Ident(i) => Some(i.as_str().to_string()),
+        ObjectKey::Expression(Expression::String(s)) => Some(s.value().to_string()),
+        _ => None,
+    }
+}
+
+/// A new object key for `key`: a bare identifier when it is one, else a
+/// quoted string (never a rewritten spelling).
+pub fn new_object_key(key: &str) -> ObjectKey {
+    match hcl::edit::Ident::try_new(key) {
+        Ok(i) => ObjectKey::Ident(i.into()),
+        Err(_) => ObjectKey::Expression(Expression::from(key)),
+    }
+}
+
+/// Wraps an error raised by a script's own callback so `try_*` methods
+/// can tell it from a path/structure failure and let it through.
+#[derive(Debug)]
+pub struct CallbackFailed(pub mlua::Error);
+
+impl std::fmt::Display for CallbackFailed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for CallbackFailed {}
+
 #[derive(thiserror::Error, Debug)]
 pub enum HclError {
-    #[error("Operation can not be applied to root")]
+    #[error("operation cannot be applied to the document root")]
     NotOnRoot,
-    #[error("Segment {segment:?} not found in path")]
+    #[error("not found: {segment} (at {})", render_path(path))]
     NotFound {
+        /// The path *above* `segment`.
         path: Vec<Segment>,
         segment: Segment,
     },
-    #[error("Index {index} out of bounds for array of length {len}")]
+    /// `index` is 1-based, as the script wrote it.
+    #[error("index {index} out of range for an array of length {len}")]
     IndexOutOfBounds { index: i64, len: usize },
-    #[error("Invalid type: expected {expected}, got {actual}")]
+    #[error("expected {expected}, but this is a {actual}")]
     InvalidType {
         expected: &'static str,
         actual: &'static str,
     },
     #[error(
-        "Ambiguous block: found {count} blocks matching '{ident}' with labels {labels:?}, use nth index to select"
+        "ambiguous block: {count} blocks match {ident:?} with labels {labels:?}; select one with an index (block(ident, labels, n))"
     )]
     AmbiguousBlock {
         ident: String,
@@ -139,14 +213,14 @@ pub enum HclError {
         count: usize,
     },
     #[error(
-        "Ambiguous key '{key}': matches both attribute and block, use attr() or block() to disambiguate"
+        "ambiguous key {key:?}: it names both an attribute and a block; use attr() or block() to pick"
     )]
     AmbiguousKey { key: String },
-    #[error("HCL expression type '{0}' cannot be converted to a Lua value")]
+    #[error("a computed `{0}` expression has no Luau value (use raw() to get it verbatim)")]
     UnsupportedHclType(&'static str),
-    #[error("Lua type '{0}' cannot be converted to HCL")]
+    #[error("a {0} cannot be converted to HCL")]
     UnsupportedLuaType(String),
-    #[error("HCL value cannot be converted to a Lua value: {0}")]
+    #[error("HCL value cannot be converted to a Luau value: {0}")]
     LuaConversion(String),
 }
 
@@ -168,11 +242,11 @@ pub enum Target<'a> {
 impl Target<'_> {
     pub fn type_name(&self) -> &'static str {
         match self {
-            Target::Body(_) => "Body",
-            Target::Block(_) => "Block",
-            Target::Object(_) => "Object",
-            Target::Array(_) => "Array",
-            Target::Expr(_) => "Expr",
+            Target::Body(_) => "body",
+            Target::Block(_) => "block",
+            Target::Object(_) => "object",
+            Target::Array(_) => "array",
+            Target::Expr(_) => "expression",
         }
     }
 }

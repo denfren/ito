@@ -5,10 +5,37 @@
 //! feed straight back into the disk-touching `fs.` functions
 //! (`fs.read(path.join(dir, name))`). Mirrors the `std::fs` /
 //! `std::path` split: `fs.` is I/O, `path.` is string math.
+//!
+//! Arguments are strings exactly (no coercion) and must be valid UTF-8; every
+//! error is prefixed with the function (`path.join: …`). The batch forms take an
+//! array of paths and return one result per input — `false` marks "no result"
+//! (no match / not under the base), so the array has no holes and `#out == #in`.
 
+use std::collections::HashSet;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, Table, Value, Variadic};
+
+type R<T> = mlua::Result<T>;
+
+fn err(func: &str, msg: impl Display) -> mlua::Error {
+    mlua::Error::runtime(format!("path.{func}: {msg}"))
+}
+
+/// A string argument, exactly: no coercion, UTF-8 only.
+fn str_arg(func: &str, what: &str, v: &Value) -> R<String> {
+    match v {
+        Value::String(s) => s
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|_| err(func, format!("{what} must be valid UTF-8"))),
+        other => Err(err(
+            func,
+            format!("{what} must be a string, got {}", other.type_name()),
+        )),
+    }
+}
 
 /// One element of a parsed `capture` pattern.
 enum Elem {
@@ -25,76 +52,92 @@ enum Elem {
 }
 
 impl Elem {
-    /// `true` for the variable-width captures (`*` / `*?`), which need a
-    /// following literal (or end-of-pattern) to bound their greed.
+    /// `true` for the variable-width captures (`*` / `*?`).
     fn is_variable_width(&self) -> bool {
         matches!(self, Elem::Many(_) | Elem::OptMany(_))
     }
+
+    fn name(&self) -> Option<&str> {
+        match self {
+            Elem::Literal(_) => None,
+            Elem::One(n) | Elem::OptOne(n) | Elem::Many(n) | Elem::OptMany(n) => Some(n),
+        }
+    }
 }
 
-/// Split a path/pattern into its non-empty segments. Leading/trailing
-/// slashes and empty segments are ignored, so `/a/b/` == `a/b`.
+/// Split a path/pattern into its meaningful segments. Leading/trailing
+/// slashes, empty segments and `.` are ignored, so `/a/b/` == `a/./b`.
 fn segments(s: &str) -> Vec<&str> {
-    s.split('/').filter(|seg| !seg.is_empty()).collect()
+    s.split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect()
 }
 
-/// Parse a capture pattern into elements, rejecting ambiguous shapes:
-/// a variable-width capture (`{x*}` / `{x*?}`) must be followed by a
-/// literal segment or be the last element, otherwise there is no
-/// boundary to split on.
-fn parse_pattern(pattern: &str) -> mlua::Result<Vec<Elem>> {
+/// Parse a capture pattern into elements. Rejected: empty or duplicate capture
+/// names, a segment mixing literal text with braces, and two variable-width
+/// captures (`{x*}` / `{x*?}`) directly adjacent, which have no boundary to
+/// split on. Any other order is well defined: a variable-width capture is
+/// greedy and backs off until the rest of the pattern matches.
+fn parse_pattern(func: &str, pattern: &str) -> R<Vec<Elem>> {
     let mut elems = Vec::new();
     for seg in segments(pattern) {
         let elem = if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            if inner.is_empty() {
-                return Err(mlua::Error::runtime(format!(
-                    "empty capture name in pattern: {pattern}"
-                )));
+            let (name, make): (&str, fn(String) -> Elem) = if let Some(n) = inner.strip_suffix("*?")
+            {
+                (n, Elem::OptMany)
+            } else if let Some(n) = inner.strip_suffix('*') {
+                (n, Elem::Many)
+            } else if let Some(n) = inner.strip_suffix('?') {
+                (n, Elem::OptOne)
+            } else {
+                (inner, Elem::One)
+            };
+            if name.is_empty() {
+                return Err(err(func, format!("empty capture name in pattern: {pattern}")));
             }
-            match inner.strip_suffix("*?") {
-                Some(name) => Elem::OptMany(name.to_string()),
-                None => match inner.strip_suffix('*') {
-                    Some(name) => Elem::Many(name.to_string()),
-                    None => match inner.strip_suffix('?') {
-                        Some(name) => Elem::OptOne(name.to_string()),
-                        None => Elem::One(inner.to_string()),
-                    },
-                },
-            }
+            make(name.to_string())
         } else if seg.contains('{') || seg.contains('}') {
-            return Err(mlua::Error::runtime(format!(
-                "malformed capture segment '{seg}' in pattern: {pattern}"
-            )));
+            return Err(err(
+                func,
+                format!("malformed capture segment '{seg}' in pattern: {pattern}"),
+            ));
         } else {
             Elem::Literal(seg.to_string())
         };
         elems.push(elem);
     }
 
-    // A variable-width capture must be bounded by a following literal
-    // (or be last) — never followed by another capture.
-    for i in 0..elems.len() {
-        if elems[i].is_variable_width() {
-            match elems.get(i + 1) {
-                None | Some(Elem::Literal(_)) => {}
-                Some(_) => {
-                    return Err(mlua::Error::runtime(format!(
-                        "ambiguous pattern: a multi-segment capture must be \
-                         followed by a literal segment or end of pattern: {pattern}"
-                    )));
-                }
-            }
+    let mut seen = HashSet::new();
+    for e in &elems {
+        if let Some(n) = e.name()
+            && !seen.insert(n)
+        {
+            return Err(err(
+                func,
+                format!("duplicate capture name '{n}' in pattern: {pattern}"),
+            ));
+        }
+    }
+    for pair in elems.windows(2) {
+        if pair[0].is_variable_width() && pair[1].is_variable_width() {
+            return Err(err(
+                func,
+                format!(
+                    "ambiguous pattern: two multi-segment captures must be separated \
+                     by a literal or a single-segment capture: {pattern}"
+                ),
+            ));
         }
     }
     Ok(elems)
 }
 
 /// Match `path_segs` against `elems`, recording captures into `out`.
-/// Returns `true` on a full match. Variable-width captures are greedy
-/// but bounded by the next literal (or end of input).
+/// Returns `true` on a full match. Variable-width captures are greedy and
+/// back off until the remainder matches. A capture that matched nothing is
+/// absent from `out` (optional captures never map to `""`).
 fn match_segments(elems: &[Elem], path_segs: &[&str], out: &mut Vec<(String, String)>) -> bool {
     match elems.split_first() {
-        // No pattern left: match iff no path left.
         None => path_segs.is_empty(),
         Some((head, rest)) => match head {
             Elem::Literal(lit) => match path_segs.split_first() {
@@ -122,14 +165,11 @@ fn match_segments(elems: &[Elem], path_segs: &[&str], out: &mut Vec<(String, Str
             }
             Elem::Many(name) | Elem::OptMany(name) => {
                 let min = if matches!(head, Elem::Many(_)) { 1 } else { 0 };
-                // Greedy: take as many as possible, back off until the
-                // remainder matches. The parser guarantees `rest` starts
-                // with a literal or is empty, so this is unambiguous.
-                let max = path_segs.len();
-                for take in (min..=max).rev() {
-                    let captured = path_segs[..take].join("/");
+                for take in (min..=path_segs.len()).rev() {
                     let mark = out.len();
-                    out.push((name.clone(), captured));
+                    if take > 0 {
+                        out.push((name.clone(), path_segs[..take].join("/")));
+                    }
                     if match_segments(rest, &path_segs[take..], out) {
                         return true;
                     }
@@ -142,7 +182,8 @@ fn match_segments(elems: &[Elem], path_segs: &[&str], out: &mut Vec<(String, Str
 }
 
 // Scalar path-component extractors, shared by the string and the
-// element-wise array overloads.
+// element-wise array overloads. They follow `std::path`: see the doc chapter
+// for the dotfile / trailing-dot / root cases.
 fn parent_of(p: &str) -> String {
     Path::new(p)
         .parent()
@@ -168,204 +209,225 @@ fn stem_of(p: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Coerce a `join`/`product` argument into a flat list of string
-/// segments: a string is a single segment, an array (table) must be all
-/// strings. Rejects nested arrays and non-string elements.
-fn as_segments(arg: &Value) -> mlua::Result<Vec<String>> {
-    match arg {
-        Value::String(s) => Ok(vec![s.to_str()?.to_owned()]),
-        Value::Table(arr) => {
-            let mut out = Vec::with_capacity(arr.raw_len());
-            for pair in arr.clone().sequence_values::<Value>() {
-                let elem = pair?;
-                match elem {
-                    Value::String(s) => out.push(s.to_str()?.to_owned()),
-                    other => {
-                        return Err(mlua::Error::runtime(format!(
-                            "path: array elements must be strings, got {}",
-                            other.type_name()
-                        )));
-                    }
+/// Lexically clean a path: drop `.` and empty segments, resolve `..` against
+/// the segment before it. A leading `..` of a relative path is kept; one at the
+/// root of an absolute path is dropped. The empty result is `"."`.
+fn normalize_of(p: &str) -> String {
+    let abs = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if out.last().is_some_and(|l| *l != "..") {
+                    out.pop();
+                } else if !abs {
+                    out.push("..");
                 }
             }
-            Ok(out)
+            s => out.push(s),
         }
-        other => Err(mlua::Error::runtime(format!(
-            "path: expected string or array, got {}",
-            other.type_name()
-        ))),
+    }
+    let body = out.join("/");
+    if abs {
+        format!("/{body}")
+    } else if body.is_empty() {
+        ".".to_string()
+    } else {
+        body
     }
 }
 
-/// Join an ordered list of segments into one path string.
+/// Coerce a `join`/`product` argument into a flat list of string
+/// segments: a string is a single segment, an array (table) must be all
+/// strings. Rejects nested arrays and non-string elements.
+fn as_segments(func: &str, what: &str, arg: &Value) -> R<Vec<String>> {
+    match arg {
+        Value::String(_) => Ok(vec![str_arg(func, what, arg)?]),
+        Value::Table(arr) => string_elems(func, what, arr),
+        other => Err(err(
+            func,
+            format!(
+                "{what} must be a string or array, got {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// Join an ordered list of segments into one path string. An empty segment is
+/// skipped (it would add a trailing slash); an absolute segment replaces
+/// everything before it, as `std::path::PathBuf::push` does.
 fn join_segments(segs: &[String]) -> String {
     let mut p = PathBuf::new();
-    for seg in segs {
+    for seg in segs.iter().filter(|s| !s.is_empty()) {
         p.push(seg);
     }
     p.to_string_lossy().into_owned()
 }
 
-/// `join` over any number of arguments (each a string or string array):
-/// flatten all in order, then join into a single path.
-fn join_args(args: &[Value]) -> mlua::Result<String> {
-    let mut segs = Vec::new();
-    for arg in args {
-        segs.extend(as_segments(arg)?);
-    }
-    Ok(join_segments(&segs))
-}
-
-/// Borrow each element of an array (table) as a string, rejecting
-/// non-strings. Backing for the element-wise array overloads (flat
-/// arrays only).
-fn string_elems(arr: &Table) -> mlua::Result<Vec<String>> {
+/// Each element of a flat array as a string, rejecting non-strings.
+fn string_elems(func: &str, what: &str, arr: &Table) -> R<Vec<String>> {
     let mut out = Vec::with_capacity(arr.raw_len());
-    for pair in arr.clone().sequence_values::<Value>() {
-        match pair? {
-            Value::String(s) => out.push(s.to_str()?.to_owned()),
+    for elem in arr.clone().sequence_values::<Value>() {
+        let elem = elem?;
+        match &elem {
+            Value::String(_) => out.push(str_arg(func, what, &elem)?),
             other => {
-                return Err(mlua::Error::runtime(format!(
-                    "path: array elements must be strings, got {}",
-                    other.type_name()
-                )));
+                return Err(err(
+                    func,
+                    format!(
+                        "{what}: array elements must be strings, got {}",
+                        other.type_name()
+                    ),
+                ));
             }
         }
     }
     Ok(out)
 }
 
-/// Match one path against pre-parsed pattern `elems`, returning a table of
-/// captures or `nil` on no match. Shared by the scalar and array `capture`.
-fn capture_one(lua: &Lua, elems: &[Elem], path: &str) -> mlua::Result<Value> {
-    let path_segs = segments(path);
-    let mut captured = Vec::new();
-    if match_segments(elems, &path_segs, &mut captured) {
-        let map = lua.create_table()?;
-        for (k, v) in captured {
-            map.set(k, v)?;
+/// Apply `one` to a string subject, or element-wise to an array of them. In the
+/// array form `nil` results become `false`, so the result array has no holes.
+fn map_subject(
+    lua: &Lua,
+    func: &str,
+    subject: &Value,
+    one: impl Fn(&str) -> R<Value>,
+) -> R<Value> {
+    match subject {
+        Value::String(_) => one(&str_arg(func, "path", subject)?),
+        Value::Table(arr) => {
+            let paths = string_elems(func, "paths", arr)?;
+            let mut out = Vec::with_capacity(paths.len());
+            for p in &paths {
+                out.push(match one(p)? {
+                    Value::Nil => Value::Boolean(false),
+                    v => v,
+                });
+            }
+            Ok(Value::Table(lua.create_sequence_from(out)?))
         }
-        Ok(Value::Table(map))
-    } else {
-        Ok(Value::Nil)
+        other => Err(err(
+            func,
+            format!(
+                "path must be a string or array, got {}",
+                other.type_name()
+            ),
+        )),
     }
 }
 
-/// `path` expressed relative to `base_segs`, or `nil` when it does not lie
-/// under it.
+/// `path` expressed relative to `base_segs`, or `None` when it does not lie
+/// under it (unless `up`, which reaches it through `..` segments).
 ///
 /// The comparison is whole-segment, which is the whole point of having this
 /// here rather than as a `string.sub` at each call site: a lexical prefix test
 /// calls `/repo-old` a child of `/repo`, and a trailing slash on either side
 /// shifts every offset by one.
-fn relative_one(lua: &Lua, base: &str, base_segs: &[&str], path: &str) -> mlua::Result<Value> {
+fn relative_one(base: &str, base_segs: &[&str], path: &str, up: bool) -> Option<String> {
     // An absolute path is not under a relative base, nor the reverse:
     // `segments` drops the leading slash, so without this `"a/b"` would
-    // report as `"b"` under `"/a"` -- two paths that name the same file
-    // only by coincidence of the cwd.
+    // report as `"b"` under `"/a"`.
     if path.starts_with('/') != base.starts_with('/') {
-        return Ok(Value::Nil);
+        return None;
     }
     let segs = segments(path);
-    if segs.len() < base_segs.len() || &segs[..base_segs.len()] != base_segs {
-        return Ok(Value::Nil);
+    let common = segs
+        .iter()
+        .zip(base_segs)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common < base_segs.len() && !up {
+        return None;
     }
-    let rest = &segs[base_segs.len()..];
-    let out = match rest.is_empty() {
-        true => ".".to_string(),
-        false => rest.join("/"),
-    };
-    Ok(Value::String(lua.create_string(out)?))
+    let mut parts: Vec<&str> = vec![".."; base_segs.len() - common];
+    parts.extend(&segs[common..]);
+    Some(if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    })
+}
+
+fn opt(v: Option<String>, lua: &Lua) -> R<Value> {
+    Ok(match v {
+        Some(s) => Value::String(lua.create_string(s)?),
+        None => Value::Nil,
+    })
 }
 
 /// Register the `path` module on `lua`.
-pub fn register(lua: &Lua) -> mlua::Result<()> {
+pub fn register(lua: &Lua) -> R<()> {
     let module = lua.create_table()?;
 
     // path.join(parts)  -> String  (one array of string segments)
     // path.join(a, b)   -> String  (each of a/b a string or string array)
-    // Flatten all arguments in order and join into a single path.
     module.set(
         "join",
-        lua.create_function(|_, args: mlua::Variadic<Value>| join_args(&args))?,
-    )?;
-
-    // path.product(a, b) -> [String]  (each of a/b a string or string array)
-    // Cartesian product of the two axes, each combination joined into a
-    // path. An empty axis yields an empty result.
-    module.set(
-        "product",
-        lua.create_function(|_, (a, b): (Value, Value)| {
-            let left = as_segments(&a)?;
-            let right = as_segments(&b)?;
-            let mut out = Vec::with_capacity(left.len() * right.len());
-            for l in &left {
-                for r in &right {
-                    out.push(join_segments(&[l.clone(), r.clone()]));
-                }
+        lua.create_function(|_, args: Variadic<Value>| {
+            let mut segs = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                segs.extend(as_segments("join", &format!("argument {}", i + 1), arg)?);
             }
-            Ok(out)
+            Ok(join_segments(&segs))
         })?,
     )?;
 
-    // path.relative_to(path, base) -> String | nil
-    // path.relative_to(paths, base) -> [String | nil]   (element-wise)
-    // `path` expressed relative to `base`, or nil when it does not lie
-    // under it. Purely lexical, like everything here: segments are
-    // compared whole, so `/repo-old` is not under `/repo` and a trailing
-    // slash changes nothing. `path == base` gives "." -- the one form
-    // that is still usable as a path, matching what the traversals report
-    // for the directory they started in.
+    // path.product(a, b, ...) -> [String]
+    // Cartesian product of the axes (each a string or string array), each
+    // combination joined into a path, left-major. An empty axis yields an
+    // empty result.
+    module.set(
+        "product",
+        lua.create_function(|_, args: Variadic<Value>| {
+            if args.len() < 2 {
+                return Err(err("product", "needs at least two axes"));
+            }
+            let mut acc: Vec<String> = vec![String::new()];
+            for (i, arg) in args.iter().enumerate() {
+                let axis = as_segments("product", &format!("argument {}", i + 1), arg)?;
+                acc = acc
+                    .iter()
+                    .flat_map(|l| axis.iter().map(move |r| join_segments(&[l.clone(), r.clone()])))
+                    .collect();
+            }
+            Ok(acc)
+        })?,
+    )?;
+
+    // path.relative_to(path, base[, opts]) -> String | nil
+    // path.relative_to(paths, base[, opts]) -> [String | false]   (element-wise)
+    // `opts.up = true` also reaches paths outside `base`, through `..`.
     module.set(
         "relative_to",
-        lua.create_function(|lua, (subject, base): (Value, String)| {
+        lua.create_function(|lua, (subject, base, opts): (Value, Value, Option<Table>)| {
+            let base = str_arg("relative_to", "base", &base)?;
+            let up = match &opts {
+                Some(t) => match t.get::<Value>("up")? {
+                    Value::Nil => false,
+                    Value::Boolean(b) => b,
+                    _ => return Err(err("relative_to", "opts.up must be a boolean")),
+                },
+                None => false,
+            };
             let base_segs = segments(&base);
-            match subject {
-                Value::String(s) => relative_one(lua, &base, &base_segs, s.to_str()?.as_ref()),
-                Value::Table(ref arr) => {
-                    let paths = string_elems(arr)?;
-                    let mut out = Vec::with_capacity(paths.len());
-                    for p in &paths {
-                        out.push(relative_one(lua, &base, &base_segs, p)?);
-                    }
-                    Ok(Value::Table(lua.create_sequence_from(out)?))
-                }
-                other => Err(mlua::Error::runtime(format!(
-                    "path: expected string or array, got {}",
-                    other.type_name()
-                ))),
-            }
+            map_subject(lua, "relative_to", &subject, |p| {
+                opt(relative_one(&base, &base_segs, p, up), lua)
+            })
         })?,
     )?;
 
     // The single-path component extractors, each with an element-wise
-    // array overload (array of paths -> array of results) so consumers
-    // can map a whole list without looping in Lua.
-    //   path.parent     parent directory ("" when none)
-    //   path.file_name  final component ("" if none)
-    //   path.extension  extension without the dot ("" if none)
-    //   path.stem       file name without its extension
-    // A single function takes a Value: a string returns a string, a
-    // table (array) returns a table of results.
+    // array overload (array of paths -> array of results).
     macro_rules! component_fn {
         ($name:literal, $f:expr) => {
             module.set(
                 $name,
-                lua.create_function(|lua, arg: Value| -> mlua::Result<Value> {
-                    match arg {
-                        Value::String(s) => {
-                            Ok(Value::String(lua.create_string($f(s.to_str()?.as_ref()))?))
-                        }
-                        Value::Table(ref arr) => {
-                            let out: Vec<String> =
-                                string_elems(arr)?.iter().map(|p| $f(p.as_str())).collect();
-                            Ok(Value::Table(lua.create_sequence_from(out)?))
-                        }
-                        other => Err(mlua::Error::runtime(format!(
-                            "path: expected string or array, got {}",
-                            other.type_name()
-                        ))),
-                    }
+                lua.create_function(|lua, arg: Value| -> R<Value> {
+                    map_subject(lua, $name, &arg, |p| {
+                        Ok(Value::String(lua.create_string($f(p))?))
+                    })
                 })?,
             )?;
         };
@@ -374,39 +436,79 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
     component_fn!("file_name", file_name_of);
     component_fn!("extension", extension_of);
     component_fn!("stem", stem_of);
+    component_fn!("normalize", normalize_of);
+
+    // path.is_absolute(path) -> bool
+    module.set(
+        "is_absolute",
+        lua.create_function(|_, p: Value| {
+            Ok(Path::new(&str_arg("is_absolute", "path", &p)?).is_absolute())
+        })?,
+    )?;
+
+    // path.split(path) -> parent, file_name
+    module.set(
+        "split",
+        lua.create_function(|_, p: Value| {
+            let p = str_arg("split", "path", &p)?;
+            Ok((parent_of(&p), file_name_of(&p)))
+        })?,
+    )?;
+
+    // path.with_extension(path, ext) -> String   ("" removes it)
+    module.set(
+        "with_extension",
+        lua.create_function(|_, (p, ext): (Value, Value)| {
+            let p = str_arg("with_extension", "path", &p)?;
+            let ext = str_arg("with_extension", "ext", &ext)?;
+            Ok(Path::new(&p)
+                .with_extension(ext.trim_start_matches('.'))
+                .to_string_lossy()
+                .into_owned())
+        })?,
+    )?;
+
+    // path.with_file_name(path, name) -> String
+    module.set(
+        "with_file_name",
+        lua.create_function(|_, (p, name): (Value, Value)| {
+            let p = str_arg("with_file_name", "path", &p)?;
+            let name = str_arg("with_file_name", "name", &name)?;
+            Ok(Path::new(&p)
+                .with_file_name(name)
+                .to_string_lossy()
+                .into_owned())
+        })?,
+    )?;
 
     // path.capture(path, pattern) -> table | nil
-    // path.capture(paths, pattern) -> [table | nil]   (element-wise)
+    // path.capture(paths, pattern) -> [table | false]   (element-wise)
     // Match `path` against a segment pattern with named captures and
     // return a table of the captures, or `nil` on no match. Placeholders:
     //   {name}    one segment (required)
     //   {name?}   zero or one segment
     //   {name*}   one-or-more segments, joined with "/"
     //   {name*?}  zero-or-more segments, joined with "/"
-    // Optionals that match nothing are simply absent from the table. A
-    // variable-width capture must be followed by a literal or end the
-    // pattern (e.g. "/AWS/{account}/{rest*}/resources/{tail*}"). When the
-    // first argument is an array of paths, the pattern is parsed once and
-    // matched against each path, returning one result per input.
+    // An optional capture that matches nothing is absent from the table. The
+    // pattern is parsed once for an array of paths.
     module.set(
         "capture",
-        lua.create_function(|lua, (subject, pattern): (Value, String)| {
-            let elems = parse_pattern(&pattern)?;
-            match subject {
-                Value::String(s) => capture_one(lua, &elems, s.to_str()?.as_ref()),
-                Value::Table(ref arr) => {
-                    let paths = string_elems(arr)?;
-                    let mut out = Vec::with_capacity(paths.len());
-                    for p in &paths {
-                        out.push(capture_one(lua, &elems, p)?);
+        lua.create_function(|lua, (subject, pattern): (Value, Value)| {
+            let pattern = str_arg("capture", "pattern", &pattern)?;
+            let elems = parse_pattern("capture", &pattern)?;
+            map_subject(lua, "capture", &subject, |p| {
+                let path_segs = segments(p);
+                let mut captured = Vec::new();
+                if match_segments(&elems, &path_segs, &mut captured) {
+                    let map = lua.create_table()?;
+                    for (k, v) in captured {
+                        map.set(k, v)?;
                     }
-                    Ok(Value::Table(lua.create_sequence_from(out)?))
+                    Ok(Value::Table(map))
+                } else {
+                    Ok(Value::Nil)
                 }
-                other => Err(mlua::Error::runtime(format!(
-                    "path: expected string or array, got {}",
-                    other.type_name()
-                ))),
-            }
+            })
         })?,
     )?;
 
@@ -420,7 +522,7 @@ mod tests {
     use mlua::Value;
 
     fn capture(path: &str, pattern: &str) -> Option<Vec<(String, String)>> {
-        let elems = parse_pattern(pattern).expect("pattern parses");
+        let elems = parse_pattern("capture", pattern).expect("pattern parses");
         let segs = segments(path);
         let mut out = Vec::new();
         if match_segments(&elems, &segs, &mut out) {
@@ -437,13 +539,7 @@ mod tests {
     }
 
     fn relative_to(path: &str, base: &str) -> Option<String> {
-        let lua = Lua::new();
-        let segs = segments(base);
-        match relative_one(&lua, base, &segs, path).expect("relative_to succeeds") {
-            Value::String(s) => Some(s.to_str().expect("utf-8").to_owned()),
-            Value::Nil => None,
-            other => panic!("unexpected {}", other.type_name()),
-        }
+        relative_one(base, &segments(base), path, false)
     }
 
     #[test]
@@ -461,8 +557,6 @@ mod tests {
 
     #[test]
     fn relative_to_matches_whole_segments_only() {
-        // The bug a hand-rolled `string.sub` prefix strip has: `/repo-old`
-        // shares a string prefix with `/repo` but is not under it.
         assert_eq!(relative_to("/repo-old/src", "/repo"), None);
     }
 
@@ -482,6 +576,16 @@ mod tests {
         assert_eq!(relative_to("repo/src", "/repo"), None);
         assert_eq!(relative_to("/repo/src", "repo"), None);
         assert_eq!(relative_to("repo/src", "repo"), Some("src".to_string()));
+    }
+
+    #[test]
+    fn relative_to_handles_dot_segments_and_up() {
+        assert_eq!(relative_to("a/b", "."), Some("a/b".to_string()));
+        assert_eq!(relative_to("./a/./b", "a"), Some("b".to_string()));
+        let up = |p, b| relative_one(b, &segments(b), p, true);
+        assert_eq!(up("/a/x/y", "/a/b/c"), Some("../../x/y".to_string()));
+        assert_eq!(up("/a/b", "/a/b/c"), Some("..".to_string()));
+        assert_eq!(up("/a/b/c", "/a/b/c"), Some(".".to_string()));
     }
 
     #[test]
@@ -528,7 +632,6 @@ mod tests {
 
     #[test]
     fn many_requires_at_least_one() {
-        // {rest*} needs >=1 segment before the literal `resources`.
         assert_eq!(
             capture("/AWS/resources/x", "/AWS/{rest*}/resources/{tail*}"),
             None
@@ -536,10 +639,10 @@ mod tests {
     }
 
     #[test]
-    fn opt_many_allows_zero() {
+    fn opt_many_zero_is_absent_like_opt_one() {
         assert_eq!(
             capture("/AWS/resources/x", "/AWS/{rest*?}/resources/{tail*}"),
-            Some(pairs(&[("rest", ""), ("tail", "x")]))
+            Some(pairs(&[("tail", "x")]))
         );
     }
 
@@ -549,7 +652,6 @@ mod tests {
             capture("/a/b/c", "/a/{mid?}/c"),
             Some(pairs(&[("mid", "b")]))
         );
-        // absent optional => key omitted
         assert_eq!(capture("/a/c", "/a/{mid?}/c"), Some(pairs(&[])));
     }
 
@@ -567,12 +669,22 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_adjacent_variable_width_rejected() {
-        assert!(parse_pattern("/x/{a*}/{b*}").is_err());
-        assert!(parse_pattern("/x/{a*}/{b?}").is_err());
-        assert!(parse_pattern("/x/{a*}/{b}").is_err());
-        assert!(parse_pattern("/x/{a*}/lit/{b*}").is_ok());
-        assert!(parse_pattern("/x/{a}/{b*}").is_ok());
+    fn multi_then_single_is_allowed_adjacent_multis_are_not() {
+        assert_eq!(
+            capture("/a/b/c/d", "/{dirs*}/{file}"),
+            Some(pairs(&[("dirs", "a/b/c"), ("file", "d")]))
+        );
+        assert!(parse_pattern("capture", "/x/{a*}/{b?}").is_ok());
+        assert!(parse_pattern("capture", "/x/{a*}/lit/{b*}").is_ok());
+        assert!(parse_pattern("capture", "/x/{a*}/{b*}").is_err());
+        assert!(parse_pattern("capture", "/x/{a*}/{b*?}").is_err());
+    }
+
+    #[test]
+    fn empty_and_duplicate_names_are_rejected() {
+        for p in ["/{}", "/{*}", "/{?}", "/{*?}", "/{a}/{a?}", "/{a}/x/{a*}"] {
+            assert!(parse_pattern("capture", p).is_err(), "{p}");
+        }
     }
 
     fn lua() -> Lua {
@@ -589,6 +701,10 @@ mod tests {
         lua().load(src).eval::<Vec<String>>().expect("eval array")
     }
 
+    fn eval_err(src: &str) -> String {
+        lua().load(src).eval::<Value>().expect_err("must raise").to_string()
+    }
+
     #[test]
     fn join_variants() {
         assert_eq!(eval_string(r#"return path.join({"/a","b","c"})"#), "/a/b/c");
@@ -602,6 +718,13 @@ mod tests {
     }
 
     #[test]
+    fn join_absolute_replaces_and_empty_is_skipped() {
+        assert_eq!(eval_string(r#"return path.join("a", "/b", "c")"#), "/b/c");
+        assert_eq!(eval_string(r#"return path.join("a", "")"#), "a");
+        assert_eq!(eval_string(r#"return path.join("", "a")"#), "a");
+    }
+
+    #[test]
     fn product_variants() {
         assert_eq!(
             eval_strings(r#"return path.product({"/a","/b"},{"x","y"})"#),
@@ -612,6 +735,10 @@ mod tests {
             ["/a/x", "/a/y"]
         );
         assert!(eval_strings(r#"return path.product({},{"x"})"#).is_empty());
+        assert_eq!(
+            eval_strings(r#"return path.product({"/a"},{"x","y"},{"1"})"#),
+            ["/a/x/1", "/a/y/1"]
+        );
     }
 
     #[test]
@@ -632,32 +759,55 @@ mod tests {
     }
 
     #[test]
-    fn capture_elementwise() {
-        // One entry per input; nil for the non-matching path.
-        let lua = lua();
-        let out = lua
-            .load(r#"return path.capture({"/AWS/1/web","/x/y"}, "/AWS/{acct}/{proj}")"#)
-            .eval::<Table>()
-            .expect("eval");
-        // A sequence with a trailing nil: length is 1 by Lua semantics, so
-        // fetch positionally.
-        assert!(matches!(out.get::<Value>(1).unwrap(), Value::Table(_)));
-        assert!(matches!(out.get::<Value>(2).unwrap(), Value::Nil));
+    fn component_edge_cases() {
+        assert_eq!(eval_string(r#"return path.extension(".bashrc")"#), "");
+        assert_eq!(eval_string(r#"return path.stem(".bashrc")"#), ".bashrc");
+        assert_eq!(eval_string(r#"return path.extension("a.tar.gz")"#), "gz");
+        assert_eq!(eval_string(r#"return path.stem("a.tar.gz")"#), "a.tar");
+        assert_eq!(eval_string(r#"return path.extension("foo.")"#), "");
+        assert_eq!(eval_string(r#"return path.stem("foo.")"#), "foo");
+        assert_eq!(eval_string(r#"return path.file_name("..")"#), "");
+        assert_eq!(eval_string(r#"return path.parent("/")"#), "");
+        assert_eq!(eval_string(r#"return path.parent("a")"#), "");
+        assert_eq!(eval_string(r#"return path.parent("/a")"#), "/");
     }
 
     #[test]
-    fn array_elements_must_be_strings() {
-        assert!(
-            lua()
-                .load(r#"return path.parent({{"x"}})"#)
-                .eval::<Table>()
-                .is_err()
+    fn new_functions() {
+        assert_eq!(eval_string(r#"local d, n = path.split("/a/b.txt") return d .. "|" .. n"#), "/a|b.txt");
+        assert_eq!(eval_string(r#"return path.with_extension("/a/b.txt", "md")"#), "/a/b.md");
+        assert_eq!(eval_string(r#"return path.with_extension("/a/b.txt", "")"#), "/a/b");
+        assert_eq!(eval_string(r#"return path.with_file_name("/a/b.txt", "c")"#), "/a/c");
+        assert_eq!(eval_string(r#"return tostring(path.is_absolute("/a")) .. tostring(path.is_absolute("a"))"#), "truefalse");
+        assert_eq!(eval_string(r#"return path.normalize("a/./b/../c//d/")"#), "a/c/d");
+        assert_eq!(eval_string(r#"return path.normalize("../a")"#), "../a");
+        assert_eq!(eval_string(r#"return path.normalize("/../a")"#), "/a");
+        assert_eq!(eval_string(r#"return path.normalize("a/..")"#), ".");
+    }
+
+    #[test]
+    fn batch_results_have_no_holes() {
+        let lua = lua();
+        let out = lua
+            .load(r#"return path.capture({"/AWS/1/web","/x/y","/AWS/2/db"}, "/AWS/{acct}/{proj}")"#)
+            .eval::<Table>()
+            .expect("eval");
+        assert_eq!(out.raw_len(), 3);
+        assert!(matches!(out.get::<Value>(1).unwrap(), Value::Table(_)));
+        assert!(matches!(out.get::<Value>(2).unwrap(), Value::Boolean(false)));
+        assert_eq!(
+            eval_string(r#"local r = path.relative_to({"/a/b", "/x"}, "/a") return #r .. tostring(r[2])"#),
+            "2false"
         );
-        assert!(
-            lua()
-                .load(r#"return path.join({1,2})"#)
-                .eval::<String>()
-                .is_err()
-        );
+    }
+
+    #[test]
+    fn errors_name_the_function_and_argument() {
+        assert!(eval_err(r#"return path.parent({{"x"}})"#).contains("path.parent: paths: array elements must be strings"));
+        assert!(eval_err(r#"return path.join({1,2})"#).contains("path.join: argument 1"));
+        assert!(eval_err(r#"return path.capture("a", 5)"#).contains("path.capture: pattern must be a string"));
+        assert!(eval_err(r#"return path.relative_to("a", 5)"#).contains("path.relative_to: base must be a string"));
+        assert!(eval_err(r#"return path.capture("a", "{}")"#).contains("path.capture: empty capture name"));
+        assert!(eval_err(r#"return path.product("a")"#).contains("path.product"));
     }
 }

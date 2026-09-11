@@ -1,0 +1,15 @@
+---
+source: ito/tests/hcl_edit.rs
+assertion_line: 431
+expression: "eval_str(DOC,\nr#\"local h = hcl.edit(subject)\n           h:block(\"resource\",\"aws_instance\",\"web\"):attr(\"ami\"):update(function(v) return v .. \"!\" end)\n           return h:to_string()\"#)"
+---
+region = "us-east-1"
+
+resource "aws_instance" "web" {
+  ami = "old!" # keep
+  count = 2
+}
+
+resource "aws_instance" "db" {
+  ami = "old2"
+}

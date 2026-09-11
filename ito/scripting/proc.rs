@@ -27,14 +27,19 @@
 //! local result = child:wait()
 //! ```
 //!
+//! `:stdin(source)` takes `proc.NULL` (the default), `proc.INHERIT`, a
+//! `proc.file(path)` (read, not created), or a Luau string or buffer that is
+//! written to the child and then closed.
+//!
 //! `:exec()` is a third finalizer, and a different kind: it `execve`s this
 //! process into the child, exactly as the shell's `exec` builtin does. There
 //! is no fork, so it never returns to Luau on success — the calling
 //! process's image, pid and open fds all become the new program's, with
 //! stdin/stdout/stderr inherited unchanged. Because there is no child left
-//! afterward, `:stdout()`/`:stderr()` must be left at their default
-//! (`proc.NULL`); a capture or file redirect has no process to apply to and
-//! `:exec()` rejects it.
+//! afterward, `:stdin()`/`:stdout()`/`:stderr()` must be left at their default
+//! or set to `proc.INHERIT`; anything else has no process to apply to and
+//! `:exec()` rejects it. A failed exec leaves this process as it was (working
+//! directory included), and the program is looked up on the *child's* `PATH`.
 //!
 //! ```lua
 //! proc.command({ "the-real-program", "--flag" }):exec()
@@ -45,12 +50,13 @@
 //! there is a fork) but shares this process's stdin/stdout/stderr with it
 //! outright and waits for it, for a child that needs the actual terminal --
 //! a pager, an editor, anything prompting for input. `:run()`/`:spawn()`
-//! never forward stdin and default stdout/stderr to NULL, so neither gives a
-//! child a terminal to interact with; `:interactive()` fills that gap
-//! without giving up the process the way `:exec()` does. As with `:exec()`,
-//! a configured `:stdout()`/`:stderr()` is rejected rather than silently
-//! ignored, and there is nothing to capture -- the result table carries only
-//! `success`/`status`/`signal`/`signal_name`.
+//! default stdin and both output streams to NULL, so neither gives a child a
+//! terminal to interact with; `:interactive()` defaults all three to INHERIT
+//! without giving up the process the way `:exec()` does. Unlike `:exec()`,
+//! any stream may still be redirected explicitly: `:stdout(proc.string())`
+//! captures what an `fzf`-style program prints while its UI stays on the
+//! terminal. ito ignores SIGINT/SIGQUIT while the child runs (the child gets
+//! the default disposition back), so ^C reaches the child, not us.
 //!
 //! ```lua
 //! local result = proc.command("vim"):arg("notes.txt"):interactive()
@@ -79,10 +85,17 @@
 //! exited normally has both fields absent, so a bare `if result.signal then`
 //! distinguishes the two.
 //!
-//! A killed-but-unwaited child is still reaped by tokio's SIGCHLD handler, so
-//! abandoning one (a `task.timeout` expiring mid-command, say) leaves no zombie
-//! behind. It does not stop the child: an abandoned command keeps running, and
-//! bounding the process itself takes a watchdog that kills by pid.
+//! `:try_wait()` is the non-blocking `:wait()`: `nil` while the child is still
+//! running, the result table (consuming the child) once it has exited. It makes
+//! the grace-period pattern (`TERM`, poll, then `KILL`) stop waiting as soon as
+//! the child is gone.
+//!
+//! An abandoned `:run()`/`:interactive()` (a `task.timeout` expiring mid-command,
+//! say) kills its child when the run is torn down: those children are spawned
+//! with `kill_on_drop`. A `:spawn()`ed child is *not*: dropping its handle leaves
+//! it running (a killed-but-unwaited one is still reaped by tokio's SIGCHLD
+//! handler, so there is no zombie). Bound a spawned command with a watchdog that
+//! `:signal()`s or `:kill()`s the handle, never a pid (a pid can be reused).
 //!
 //! An **abandoned `:wait()`** hands the child back rather than swallowing it:
 //! the borrow is scoped and a `WaitGuard` restores the child and its readers
@@ -120,8 +133,9 @@
 //! back should have its handler act like it, e.g. `proc.exit`).
 //!
 //! `SIGKILL` and `SIGSTOP` cannot be trapped — the kernel never offers them to
-//! a handler — and `proc.trap` rejects them outright rather than registering
-//! something that would silently never fire.
+//! a handler — and neither can `SIGILL`/`SIGFPE`/`SIGSEGV`/`SIGBUS` or a
+//! number that is no signal: `proc.trap` raises for each, at the call, rather
+//! than registering something that would silently never fire.
 //!
 //! The handler runs detached from the script's own control flow: there is no
 //! `task` handle to `await`, so an error it raises is logged and the trap
@@ -133,18 +147,17 @@
 //! deciding "stop now" is not itself blocked by whatever else might be stuck.
 
 use crate::scripting::redirect::{
-    self, CaptureKind, Redirect, bind_alias, capture_to_value, conflicting_files, merged_capture,
-    redirect_from_value,
+    self, CaptureKind, InheritTarget, Reader, Redirect, Slot, Stdin, bind_alias, capture_to_value,
+    conflicting_files, join_reader, merged_capture, read_to_end, redirect_from_value,
+    stdin_from_value,
 };
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
-use std::os::fd::OwnedFd;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
 // Signals
@@ -179,6 +192,10 @@ fn named_signals() -> impl Iterator<Item = (&'static str, i32)> {
         ("CONT", libc::SIGCONT),
         ("STOP", libc::SIGSTOP),
         ("TSTP", libc::SIGTSTP),
+        ("CHLD", libc::SIGCHLD),
+        ("TTIN", libc::SIGTTIN),
+        ("TTOU", libc::SIGTTOU),
+        ("WINCH", libc::SIGWINCH),
     ]
     .into_iter()
 }
@@ -191,10 +208,10 @@ fn named_signals() -> impl Iterator<Item = (&'static str, i32)> {
 /// ignoring the signal.
 fn signal_number(value: &Value) -> LuaResult<i32> {
     match value {
-        Value::Integer(n) => Ok(*n as i32),
+        Value::Integer(n) => signal_range(i64::from(*n)),
         // A Luau number is a float; accept one only if it names an integer, so
         // `:signal(15.5)` is a mistake rather than a truncation.
-        Value::Number(n) if n.fract() == 0.0 => Ok(*n as i32),
+        Value::Number(n) if n.fract() == 0.0 => signal_range(*n as i64),
         Value::String(s) => {
             let raw = s.to_str()?.to_string();
             let bare = raw.to_ascii_uppercase();
@@ -217,6 +234,11 @@ fn signal_number(value: &Value) -> LuaResult<i32> {
             other.type_name()
         ))),
     }
+}
+
+/// A raw signal number must fit an `i32`, not wrap into some other signal.
+fn signal_range(n: i64) -> LuaResult<i32> {
+    i32::try_from(n).map_err(|_| mlua::Error::runtime(format!("signal number {n} is out of range")))
 }
 
 /// The `SIG`-prefixed name of a signal number, for the result table.
@@ -291,14 +313,9 @@ fn trappable(signal: i32) -> bool {
     signal != libc::SIGKILL && signal != libc::SIGSTOP
 }
 
-/// One signal's trap: the Luau callback currently registered, and how many
-/// deliveries this process has observed for it.
-///
-/// The count is a *delivery* count, not an *occurrence* count -- see
-/// [`spawn_trap_worker`] for why those can differ.
+/// One signal's trap: the Luau callback currently registered.
 struct Trap {
     handler: mlua::Function,
-    count: u64,
 }
 
 /// Every signal a script has trapped, keyed by number.
@@ -330,17 +347,19 @@ struct Traps {
 /// or cancel, and outlives every individual `proc.trap` call that touches its
 /// number.
 ///
-/// # The count can under-count real deliveries
+/// # Deliveries can coalesce
 ///
 /// POSIX signal delivery does not queue: if the same signal arrives twice
 /// before this worker is next polled -- which, on ito's single-threaded
 /// runtime, means before the script yields at some other await point -- the
-/// two deliveries collapse into a single wakeup here. So `count` answers "how
-/// many times we observed this signal," which is a lower bound on "how many
-/// times the kernel actually sent it," not an exact count of the latter. A
-/// script that must not miss a coalesced pair needs a mechanism other than
-/// signals (a file, a socket, a second signal number) to make the second
-/// delivery distinguishable in the first place.
+/// two deliveries collapse into a single handler call. A script that must not
+/// miss a coalesced pair needs a mechanism other than signals (a file, a
+/// socket, a second signal number) to make the second delivery
+/// distinguishable in the first place.
+///
+/// The stream is registered by the caller, synchronously inside `proc.trap`,
+/// so a signal the OS refuses (SIGILL, SIGSEGV, a bogus number) raises there
+/// instead of being logged from a detached task.
 ///
 /// # Handler failures are logged, not propagated
 ///
@@ -350,21 +369,13 @@ struct Traps {
 /// next delivery, rather than failing the run the way an un-awaited
 /// `task.spawn` does; a signal handler that means to stop the run calls
 /// `proc.exit` itself.
-fn spawn_trap_worker(traps: &std::rc::Rc<std::cell::RefCell<Traps>>, signal: i32) {
+fn spawn_trap_worker(
+    traps: &std::rc::Rc<std::cell::RefCell<Traps>>,
+    signal: i32,
+    mut stream: tokio::signal::unix::Signal,
+) {
     let traps = std::rc::Rc::clone(traps);
     tokio::task::spawn_local(async move {
-        let mut stream =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(signal)) {
-                Ok(stream) => stream,
-                // Registration failure here (as opposed to `trappable`'s
-                // up-front check) would mean the OS rejected a signal we thought
-                // catchable -- nothing left to do but say so and give up on this
-                // one number; every other trap is unaffected.
-                Err(e) => {
-                    tracing::error!("proc.trap: could not listen for signal {signal}: {e}");
-                    return;
-                }
-            };
         while stream.recv().await.is_some() {
             // Look the handler up fresh on every delivery rather than
             // capturing one at spawn time, so a later `proc.trap` call
@@ -373,15 +384,14 @@ fn spawn_trap_worker(traps: &std::rc::Rc<std::cell::RefCell<Traps>>, signal: i32
             // across an await is a hazard the moment anything else on this
             // thread might touch `traps`.
             let handler = {
-                let mut traps = traps.borrow_mut();
-                let Some(trap) = traps.handlers.get_mut(&signal) else {
+                let traps = traps.borrow();
+                let Some(trap) = traps.handlers.get(&signal) else {
                     // Untrapped since the worker started (see `proc.untrap`):
                     // keep listening in case a later call re-traps it, rather
                     // than tearing the worker down and losing the signal
                     // number's place in the map.
                     continue;
                 };
-                trap.count += 1;
                 trap.handler.clone()
             };
             if let Err(e) = handler.call_async::<()>(signal).await {
@@ -391,15 +401,28 @@ fn spawn_trap_worker(traps: &std::rc::Rc<std::cell::RefCell<Traps>>, signal: i32
     });
 }
 
+/// One `:env()`/`:env_remove()` step, applied in call order.
+#[derive(Clone)]
+enum EnvOp {
+    Set(OsString, OsString),
+    Remove(OsString),
+}
+
 #[derive(Clone)]
 struct CommandState {
-    program: String,
-    args: Vec<String>,
-    envs: Vec<(String, String)>,
+    // Program, arguments, environment and directory are `OsString`s: Luau
+    // strings are bytes and so are Unix arguments, so nothing need be UTF-8.
+    program: OsString,
+    args: Vec<OsString>,
+    env_ops: Vec<EnvOp>,
     env_clear: bool,
     current_dir: Option<PathBuf>,
-    stdout: Redirect,
-    stderr: Redirect,
+    // `None` is "never configured", which is what `:exec()`/`:interactive()`
+    // need to tell apart from an explicit target: the default for `:run()` is
+    // NULL, for `:interactive()` it is INHERIT.
+    stdin: Option<Stdin>,
+    stdout: Option<Redirect>,
+    stderr: Option<Redirect>,
 }
 
 /// Builder for a child process, finalized with `:run()` or `:spawn()`.
@@ -408,17 +431,17 @@ struct CommandBuilder {
 }
 
 impl CommandBuilder {
-    fn new(program: String) -> Self {
+    fn new(program: OsString) -> Self {
         Self {
             state: Arc::new(Mutex::new(CommandState {
                 program,
                 args: Vec::new(),
-                envs: Vec::new(),
+                env_ops: Vec::new(),
                 env_clear: false,
                 current_dir: None,
-                // Neither stream leaks to the terminal by default.
-                stdout: Redirect::Null,
-                stderr: Redirect::Null,
+                stdin: None,
+                stdout: None,
+                stderr: None,
             })),
         }
     }
@@ -433,21 +456,25 @@ fn to_stdio(redirect: &Redirect) -> LuaResult<Stdio> {
         Redirect::Null => Ok(Stdio::null()),
         Redirect::Inherit(target) => target.to_stdio(),
         Redirect::Capture { .. } => Ok(Stdio::piped()),
-        Redirect::File { path, file } => Ok(Stdio::from(redirect::open_shared_file(path, file)?)),
+        Redirect::File { path, file, append } => Ok(Stdio::from(redirect::open_shared_file(
+            path, file, *append,
+        )?)),
         // Resolved before this point.
-        Redirect::SameAsOther => Err(mlua::Error::runtime("internal: unresolved stream alias")),
+        Redirect::AliasStdout | Redirect::AliasStderr => {
+            Err(mlua::Error::runtime("internal: unresolved stream alias"))
+        }
     }
 }
 
 /// Split a `command` argument into a program and its arguments, accepting either
 /// a bare program name or a list of `{program, args...}`.
-pub(crate) fn parse_command_spec(spec: Value) -> LuaResult<(String, Vec<String>)> {
+pub(crate) fn parse_command_spec(spec: Value) -> LuaResult<(OsString, Vec<OsString>)> {
     match spec {
-        Value::String(program) => Ok((program.to_str()?.to_string(), Vec::new())),
+        Value::String(program) => Ok((redirect::os_string(&program), Vec::new())),
         Value::Table(list) => {
             let mut parts = Vec::new();
-            for item in list.sequence_values::<String>() {
-                parts.push(item?);
+            for item in list.sequence_values::<mlua::LuaString>() {
+                parts.push(redirect::os_string(&item?));
             }
             let mut parts = parts.into_iter();
             let program = parts.next().ok_or_else(|| {
@@ -466,36 +493,78 @@ pub(crate) fn parse_command_spec(spec: Value) -> LuaResult<(String, Vec<String>)
 
 impl UserData for CommandBuilder {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_function("arg", |_, (ud, arg): (AnyUserData, String)| {
+        methods.add_function("arg", |_, (ud, arg): (AnyUserData, mlua::LuaString)| {
+            let arg = redirect::os_string(&arg);
             ud.borrow::<Self>()?.state.lock().unwrap().args.push(arg);
             Ok(ud)
         });
 
-        methods.add_function("args", |_, (ud, args): (AnyUserData, Vec<String>)| {
+        methods.add_function("args", |_, (ud, args): (AnyUserData, Vec<mlua::LuaString>)| {
+            let args = args.iter().map(redirect::os_string);
             ud.borrow::<Self>()?.state.lock().unwrap().args.extend(args);
             Ok(ud)
         });
 
         methods.add_function(
             "env",
-            |_, (ud, key, value): (AnyUserData, String, String)| {
-                ud.borrow::<Self>()?
-                    .state
-                    .lock()
-                    .unwrap()
-                    .envs
-                    .push((key, value));
+            |_, (ud, key, value): (AnyUserData, mlua::LuaString, mlua::LuaString)| {
+                let op = EnvOp::Set(redirect::os_string(&key), redirect::os_string(&value));
+                ud.borrow::<Self>()?.state.lock().unwrap().env_ops.push(op);
                 Ok(ud)
             },
         );
 
-        methods.add_function("env_clear", |_, ud: AnyUserData| {
-            ud.borrow::<Self>()?.state.lock().unwrap().env_clear = true;
+        // `:envs{ A = "1", B = "2" }` is `:env` per pair (in no particular order).
+        methods.add_function("envs", |_, (ud, vars): (AnyUserData, Table)| {
+            let mut ops = Vec::new();
+            for pair in vars.pairs::<mlua::LuaString, mlua::LuaString>() {
+                let (k, v) = pair?;
+                ops.push(EnvOp::Set(redirect::os_string(&k), redirect::os_string(&v)));
+            }
+            ud.borrow::<Self>()?
+                .state
+                .lock()
+                .unwrap()
+                .env_ops
+                .extend(ops);
             Ok(ud)
         });
 
-        methods.add_function("current_dir", |_, (ud, dir): (AnyUserData, String)| {
-            ud.borrow::<Self>()?.state.lock().unwrap().current_dir = Some(PathBuf::from(dir));
+        // Unset one variable in the child, whether inherited or set earlier.
+        methods.add_function(
+            "env_remove",
+            |_, (ud, key): (AnyUserData, mlua::LuaString)| {
+                let op = EnvOp::Remove(redirect::os_string(&key));
+                ud.borrow::<Self>()?.state.lock().unwrap().env_ops.push(op);
+                Ok(ud)
+            },
+        );
+
+        // As in `std::process::Command`, this also forgets earlier `:env()` calls.
+        methods.add_function("env_clear", |_, ud: AnyUserData| {
+            {
+                let this = ud.borrow::<Self>()?;
+                let mut state = this.state.lock().unwrap();
+                state.env_clear = true;
+                state.env_ops.clear();
+            }
+            Ok(ud)
+        });
+
+        methods.add_function(
+            "current_dir",
+            |_, (ud, dir): (AnyUserData, mlua::LuaString)| {
+                let dir = PathBuf::from(redirect::os_string(&dir));
+                ud.borrow::<Self>()?.state.lock().unwrap().current_dir = Some(dir);
+                Ok(ud)
+            },
+        );
+
+        // NULL (the default), INHERIT, `proc.file(path)` (read), or a string or
+        // buffer fed to the child and then closed.
+        methods.add_function("stdin", |_, (ud, source): (AnyUserData, Value)| {
+            let source = stdin_from_value(&source)?;
+            ud.borrow::<Self>()?.state.lock().unwrap().stdin = Some(source);
             Ok(ud)
         });
 
@@ -505,7 +574,7 @@ impl UserData for CommandBuilder {
             let mut state = builder.state.lock().unwrap();
             // Bind the alias now, like the shell's `1>&2` duplicates whatever
             // fd 2 currently is; reassigning stderr later must not follow.
-            state.stdout = bind_alias(redirect, &state.stderr);
+            state.stdout = Some(bind_alias(redirect, state.stderr.as_ref(), Slot::Stdout)?);
             drop(state);
             drop(builder);
             Ok(ud)
@@ -516,7 +585,7 @@ impl UserData for CommandBuilder {
             let builder = ud.borrow::<Self>()?;
             let mut state = builder.state.lock().unwrap();
             // Same eager binding as `:stdout()` -- `2>&1` snapshots stdout.
-            state.stderr = bind_alias(redirect, &state.stdout);
+            state.stderr = Some(bind_alias(redirect, state.stdout.as_ref(), Slot::Stderr)?);
             drop(state);
             drop(builder);
             Ok(ud)
@@ -527,24 +596,13 @@ impl UserData for CommandBuilder {
         // Start the child without waiting for it.
         methods.add_function("spawn", |_, ud: AnyUserData| {
             let state = ud.borrow::<Self>()?.state.lock().unwrap().clone();
-            Child::spawn(state)
+            Child::spawn(state, false, false)
         });
 
         // Start the child and wait for it, returning its result.
         methods.add_async_function("run", |lua, ud: AnyUserData| async move {
             let state = ud.borrow::<Self>()?.state.lock().unwrap().clone();
-            // This `Child` never reaches Luau, so there is no borrow to scope --
-            // it is owned here and consumed by the wait.
-            let mut child = Child::spawn(state)?;
-            let (mut inner, mut readers) = child.take_for_wait()?;
-            Child::wait_on(
-                &lua,
-                &child.program,
-                &child.captured,
-                &mut inner,
-                &mut readers,
-            )
-            .await
+            run_to_end(&lua, state, false).await
         });
 
         // Replace this process with the child via `execve`, exactly as the
@@ -557,44 +615,131 @@ impl UserData for CommandBuilder {
             do_exec(state)
         });
 
-        // Start the child sharing this process's stdin/stdout/stderr
-        // outright, and wait for it -- for a child that needs the real
-        // terminal (a pager, an editor, a password prompt), which neither
-        // `:run()`/`:spawn()` (stdin is always closed, stdout/stderr default
-        // to NULL) nor `:exec()` (never returns to Luau) can give it.
+        // Start the child on the real terminal -- stdin/stdout/stderr default
+        // to INHERIT, unlike `:run()`'s NULL -- and wait for it, for a child
+        // that needs one (a pager, an editor, a password prompt). Any stream
+        // can still be redirected explicitly (`fzf`'s selection on stdout).
         methods.add_async_function("interactive", |lua, ud: AnyUserData| async move {
             let state = ud.borrow::<Self>()?.state.lock().unwrap().clone();
-            do_interactive(&lua, state).await
+            run_to_end(&lua, state, true).await
         });
     }
 }
 
+/// Spawn, wait, and build the result: `:run()` and `:interactive()`.
+///
+/// This `Child` never reaches Luau, so there is no borrow to scope -- it is
+/// owned here. It is spawned with `kill_on_drop`, so a run abandoned mid-wait
+/// (a `task.timeout` expiring) takes its child with it instead of orphaning it.
+async fn run_to_end(lua: &Lua, state: CommandState, interactive: bool) -> LuaResult<Table> {
+    // The child has the terminal to itself for the duration, so ^C must not
+    // take ito down while the child (an editor, say) is deciding what it means.
+    let _guard = interactive.then(IgnoreInterrupts::new);
+    let mut child = Child::spawn(state, interactive, true)?;
+    let (mut inner, mut readers) = child.take_for_wait()?;
+    Child::wait_on(
+        lua,
+        &child.program,
+        &child.captured,
+        &mut inner,
+        &mut readers,
+    )
+    .await
+}
+
+/// Ignores SIGINT/SIGQUIT in this process while alive, restoring whatever
+/// disposition was there before (a `proc.trap` handler included) on drop.
+/// Children spawned with `Child::spawn(.., interactive = true)` reset both to
+/// default in `pre_exec`, since an ignored signal stays ignored across `exec`.
+pub(crate) struct IgnoreInterrupts {
+    saved: [(i32, libc::sigaction); 2],
+}
+
+impl IgnoreInterrupts {
+    pub(crate) fn new() -> Self {
+        let swap = |sig: i32| {
+            // SAFETY: `sigaction` with valid, zero-initialized structs.
+            unsafe {
+                let mut ignore: libc::sigaction = std::mem::zeroed();
+                ignore.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut ignore.sa_mask);
+                let mut old: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, &ignore, &mut old);
+                (sig, old)
+            }
+        };
+        Self {
+            saved: [swap(libc::SIGINT), swap(libc::SIGQUIT)],
+        }
+    }
+}
+
+impl Drop for IgnoreInterrupts {
+    fn drop(&mut self) {
+        for (sig, old) in &self.saved {
+            // SAFETY: restoring a disposition `sigaction` itself handed back.
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// The child's environment: ours (unless cleared) with the ops applied in order.
+fn build_env(state: &CommandState) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = if state.env_clear {
+        Vec::new()
+    } else {
+        std::env::vars_os().collect()
+    };
+    for op in &state.env_ops {
+        match op {
+            EnvOp::Set(k, v) => match env.iter_mut().find(|(ek, _)| ek == k) {
+                Some(entry) => entry.1 = v.clone(),
+                None => env.push((k.clone(), v.clone())),
+            },
+            EnvOp::Remove(k) => env.retain(|(ek, _)| ek != k),
+        }
+    }
+    env
+}
+
 /// `execve` the current process into `state`'s program, inheriting our own
 /// stdin/stdout/stderr -- there is no fork, so a `:stdout()`/`:stderr()`
-/// redirect configured on the builder has no process left to apply to.
+/// redirect configured on the builder has no process left to apply to. Only
+/// INHERIT (spelled out or left as the default) is accepted.
 fn do_exec(state: CommandState) -> LuaResult<()> {
-    if !matches!(state.stdout, Redirect::Null) || !matches!(state.stderr, Redirect::Null) {
+    let inherit = |r: &Option<Redirect>| matches!(r, None | Some(Redirect::Inherit(InheritTarget::Same)));
+    if !inherit(&state.stdout)
+        || !inherit(&state.stderr)
+        || !matches!(state.stdin, None | Some(Stdin::Inherit))
+    {
         return Err(mlua::Error::runtime(
-            ":exec() replaces this process and inherits its stdout/stderr as-is; \
-             it does not support :stdout()/:stderr() redirects",
+            ":exec() replaces this process and inherits its stdin/stdout/stderr as-is; \
+             it does not support :stdin()/:stdout()/:stderr() other than proc.INHERIT",
         ));
     }
 
     use std::ffi::CString;
+    use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
 
-    let to_cstring = |s: &str| {
-        CString::new(s.as_bytes())
-            .map_err(|_| mlua::Error::runtime(format!("argument contains a NUL byte: {s:?}")))
+    let to_cstring = |s: &OsStr| {
+        CString::new(s.as_bytes()).map_err(|_| {
+            mlua::Error::runtime(format!("argument contains a NUL byte: {:?}", s))
+        })
     };
+
+    // The environment is computed, not applied to this process: a failed exec
+    // must leave us as it found us.
+    let env = build_env(&state);
 
     // `:run()`/`:spawn()` resolve the program through `$PATH` via
     // `std::process::Command`; a bare `execve` would not, which would make
     // `:exec()` the one finalizer that requires an absolute path for the
     // same `spec`. There is no portable `execvpe` (glibc/musl have one, but
-    // macOS does not), so the search is done by hand and `execve` used with
-    // each candidate.
-    let candidates = resolve_program(&state.program);
+    // macOS does not), so the search is done by hand over the *child's* PATH
+    // and `execve` used with each candidate.
+    let path = env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_os_str());
+    let candidates = resolve_program(&state.program, path);
 
     let mut argv: Vec<CString> = Vec::with_capacity(state.args.len() + 1);
     argv.push(to_cstring(&state.program)?);
@@ -602,22 +747,8 @@ fn do_exec(state: CommandState) -> LuaResult<()> {
         argv.push(to_cstring(arg)?);
     }
 
-    if let Some(dir) = &state.current_dir {
-        std::env::set_current_dir(dir).map_err(|e| {
-            mlua::Error::runtime(format!("failed to chdir to '{}': {e}", dir.display()))
-        })?;
-    }
-
-    if state.env_clear {
-        for (key, _) in std::env::vars_os() {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-    for (key, value) in &state.envs {
-        unsafe { std::env::set_var(key, value) };
-    }
-
-    let envp: Vec<CString> = std::env::vars_os()
+    let envp: Vec<CString> = env
+        .iter()
         .map(|(k, v)| {
             let mut bytes = k.as_bytes().to_vec();
             bytes.push(b'=');
@@ -638,7 +769,26 @@ fn do_exec(state: CommandState) -> LuaResult<()> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    let mut last_err = std::io::Error::from_raw_os_error(libc::ENOENT);
+    // Anything we printed must land before the new program's output.
+    let _ = std::io::stdout().flush();
+
+    // The one piece of process state we must change; put back on failure.
+    let previous_dir = match &state.current_dir {
+        Some(dir) => {
+            let previous = std::env::current_dir().ok();
+            std::env::set_current_dir(dir).map_err(|e| {
+                mlua::Error::runtime(format!("failed to chdir to '{}': {e}", dir.display()))
+            })?;
+            previous
+        }
+        None => None,
+    };
+
+    // Like `execvp`: a missing or non-directory candidate moves on to the next
+    // `$PATH` entry, a permission failure is remembered (and reported in
+    // preference to "not found", which would hide it), anything else is final.
+    let mut denied = false;
+    let mut failure = None;
     for candidate in candidates {
         // SAFETY: `candidate`/`argv`/`envp` are NUL-terminated C strings kept
         // alive until after the call, and both pointer vectors are
@@ -652,59 +802,26 @@ fn do_exec(state: CommandState) -> LuaResult<()> {
                 envp_ptrs.as_mut_ptr(),
             );
         }
-        last_err = std::io::Error::last_os_error();
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => {}
+            Some(libc::EACCES) => denied = true,
+            _ => {
+                failure = Some(err);
+                break;
+            }
+        }
     }
+    if let Some(previous) = previous_dir {
+        let _ = std::env::set_current_dir(previous);
+    }
+    let failure = failure.unwrap_or_else(|| {
+        std::io::Error::from_raw_os_error(if denied { libc::EACCES } else { libc::ENOENT })
+    });
     Err(mlua::Error::runtime(format!(
-        "failed to exec '{}': {last_err}",
-        state.program
+        "failed to exec '{}': {failure}",
+        state.program.to_string_lossy()
     )))
-}
-
-/// Spawn `state`'s program with stdin/stdout/stderr all inherited from this
-/// process, and wait for it -- the shell-job-control shape, for a child that
-/// needs the real terminal rather than a pipe or `/dev/null`. Rejects a
-/// configured `:stdout()`/`:stderr()` for the same reason `:exec()` does:
-/// both streams are inherited unconditionally, so a redirect set on the
-/// builder would silently be ignored rather than honored.
-async fn do_interactive(lua: &Lua, state: CommandState) -> LuaResult<Table> {
-    if !matches!(state.stdout, Redirect::Null) || !matches!(state.stderr, Redirect::Null) {
-        return Err(mlua::Error::runtime(
-            ":interactive() shares this process's stdin/stdout/stderr with the \
-             child as-is; it does not support :stdout()/:stderr() redirects",
-        ));
-    }
-
-    let mut cmd = Command::new(&state.program);
-    cmd.args(&state.args);
-    if state.env_clear {
-        cmd.env_clear();
-    }
-    for (key, value) in &state.envs {
-        cmd.env(key, value);
-    }
-    if let Some(dir) = &state.current_dir {
-        cmd.current_dir(dir);
-    }
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| mlua::Error::runtime(format!("failed to run '{}': {e}", state.program)))?;
-
-    let status = child.wait().await.map_err(|e| {
-        mlua::Error::runtime(format!("failed waiting for '{}': {e}", state.program))
-    })?;
-
-    let result = lua.create_table()?;
-    result.raw_set("success", status.success())?;
-    match status.code() {
-        Some(code) => result.raw_set("status", code)?,
-        None => result.raw_set("status", Value::Nil)?,
-    }
-    set_signal_fields(&result, status.signal())?;
-    Ok(result)
 }
 
 /// The candidate paths to try `execve`ing, in order.
@@ -713,15 +830,16 @@ async fn do_interactive(lua: &Lua, state: CommandState) -> LuaResult<Table> {
 /// (and `std::process::Command`'s) -- `$PATH` is only consulted for a bare
 /// name. Otherwise each `$PATH` entry is tried in turn, an empty entry
 /// meaning the current directory, same as the shell and `execvp` treat it.
-fn resolve_program(program: &str) -> Vec<std::ffi::CString> {
+fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> Vec<std::ffi::CString> {
     use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
 
-    if program.contains('/') {
+    if program.as_bytes().contains(&b'/') {
         return CString::new(program.as_bytes()).into_iter().collect();
     }
 
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
+    let path = path.unwrap_or_else(|| OsStr::new("/usr/bin:/bin"));
+    std::env::split_paths(path)
         .map(|dir| {
             if dir.as_os_str().is_empty() {
                 PathBuf::from(program)
@@ -733,50 +851,44 @@ fn resolve_program(program: &str) -> Vec<std::ffi::CString> {
         .collect()
 }
 
-/// A task draining one captured stream into a byte buffer.
-///
-/// Local rather than `tokio::spawn`ed: the runtime is single-threaded and a
-/// child's pipes are `!Send`.
-type Reader = JoinHandle<Vec<u8>>;
-
-/// Drain a stream into a buffer on its own task, starting immediately.
-///
-/// Reading has to begin at spawn time, not at `wait()`: a child that outruns a
-/// pipe's buffer would otherwise block against a reader that has not started.
-fn read_to_end<R>(mut stream: R) -> Reader
-where
-    R: AsyncReadExt + Unpin + 'static,
-{
-    tokio::task::spawn_local(async move {
-        let mut buf = Vec::new();
-        // A read error leaves whatever arrived before it; the child's exit
-        // status is the authority on whether the run succeeded.
-        let _ = stream.read_to_end(&mut buf).await;
-        buf
-    })
-}
-
-/// Await a reader task; `which` only names the stream in the error message.
-async fn join_reader(reader: Option<Reader>, which: &str) -> LuaResult<Vec<u8>> {
-    let Some(handle) = reader else {
-        return Ok(Vec::new());
-    };
-    handle
-        .await
-        .map_err(|e| mlua::Error::runtime(format!("{which} reader task failed: {e}")))
-}
-
 /// Which stream a captured byte stream belongs to once collected.
 ///
 /// `Clone` so `:wait()` can copy it out under a scoped borrow rather than
 /// holding one across the await; it is three `Option<CaptureKind>`s, so the
 /// copy is free.
 #[derive(Clone)]
-struct Captured {
+pub(crate) struct Captured {
     stdout: Option<CaptureKind>,
     stderr: Option<CaptureKind>,
     /// Set when one handle serves both streams, so both report one value.
     merged: Option<CaptureKind>,
+}
+
+impl Captured {
+    /// What the two (concrete) targets capture. Shared with `ssh`.
+    pub(crate) fn of(stdout: &Redirect, stderr: &Redirect) -> Self {
+        let kind = |r: &Redirect| match r {
+            Redirect::Capture { kind, .. } => Some(*kind),
+            _ => None,
+        };
+        Self {
+            stdout: kind(stdout),
+            stderr: kind(stderr),
+            merged: merged_capture(stdout, stderr),
+        }
+    }
+}
+
+/// The result table (`success`/`status`/`signal`/captures) for a reaped
+/// child, built here so `ssh`'s cannot drift from `proc`'s.
+pub(crate) fn result_table(
+    lua: &Lua,
+    captured: &Captured,
+    status: std::process::ExitStatus,
+    stdout_bytes: &[u8],
+    stderr_bytes: &[u8],
+) -> LuaResult<Table> {
+    Child::result(lua, captured, status, stdout_bytes, stderr_bytes)
 }
 
 /// A spawned child process, awaited with `:wait()`.
@@ -792,10 +904,20 @@ struct Child {
 }
 
 impl Child {
-    fn spawn(state: CommandState) -> LuaResult<Self> {
+    /// `interactive` flips the defaults to the terminal (stdin/stdout/stderr
+    /// all INHERIT) and resets SIGINT/SIGQUIT in the child; `kill_on_drop`
+    /// makes dropping the handle kill the child, which only a run that owns
+    /// its child wants (a `:spawn()`ed handle going out of scope must not).
+    fn spawn(state: CommandState, interactive: bool, kill_on_drop: bool) -> LuaResult<Self> {
         // Aliases were already bound by `:stdout()`/`:stderr()`, so both
         // targets are concrete by now.
-        let (stdout_target, stderr_target) = (state.stdout.clone(), state.stderr.clone());
+        let default_out = if interactive {
+            Redirect::Inherit(InheritTarget::Same)
+        } else {
+            Redirect::Null
+        };
+        let stdout_target = state.stdout.clone().unwrap_or_else(|| default_out.clone());
+        let stderr_target = state.stderr.clone().unwrap_or(default_out);
 
         if let Some(path) = conflicting_files(&stdout_target, &stderr_target) {
             return Err(mlua::Error::runtime(format!(
@@ -811,13 +933,43 @@ impl Child {
         if state.env_clear {
             cmd.env_clear();
         }
-        for (key, value) in &state.envs {
-            cmd.env(key, value);
+        for op in &state.env_ops {
+            match op {
+                EnvOp::Set(k, v) => cmd.env(k, v),
+                EnvOp::Remove(k) => cmd.env_remove(k),
+            };
         }
         if let Some(dir) = &state.current_dir {
             cmd.current_dir(dir);
         }
-        cmd.stdin(Stdio::null());
+        cmd.kill_on_drop(kill_on_drop);
+        if interactive {
+            // SAFETY: only async-signal-safe `signal(2)` calls between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                    Ok(())
+                });
+            }
+        }
+
+        // Open every target before spawning, so a target that cannot be opened
+        // fails the call before a child exists.
+        let mut input = None;
+        let stdin = state
+            .stdin
+            .clone()
+            .unwrap_or(if interactive { Stdin::Inherit } else { Stdin::Null });
+        match &stdin {
+            Stdin::Null => cmd.stdin(Stdio::null()),
+            Stdin::Inherit => cmd.stdin(Stdio::inherit()),
+            Stdin::File(_) => cmd.stdin(Stdio::from(stdin.open_file()?.expect("a file source"))),
+            Stdin::Bytes(bytes) => {
+                input = Some(bytes.clone());
+                cmd.stdin(Stdio::piped())
+            }
+        };
 
         // A capture handle shared by both streams has to become one pipe that
         // both write into; `Stdio::piped()` twice would create two independent
@@ -826,39 +978,35 @@ impl Child {
 
         let mut merged_reader = None;
         if merged.is_some() {
-            let (reader, writer) = std::io::pipe()
-                .map_err(|e| mlua::Error::runtime(format!("failed to create pipe: {e}")))?;
-            let writer2 = writer
-                .try_clone()
-                .map_err(|e| mlua::Error::runtime(format!("failed to duplicate pipe: {e}")))?;
-            cmd.stdout(Stdio::from(writer));
-            cmd.stderr(Stdio::from(writer2));
+            let (out, err, reader) = redirect::merged_pipe()?;
+            cmd.stdout(Stdio::from(out));
+            cmd.stderr(Stdio::from(err));
             merged_reader = Some(reader);
         } else {
             cmd.stdout(to_stdio(&stdout_target)?);
             cmd.stderr(to_stdio(&stderr_target)?);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| mlua::Error::runtime(format!("failed to run '{}': {e}", state.program)))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            mlua::Error::runtime(format!(
+                "failed to run '{}': {e}",
+                state.program.to_string_lossy()
+            ))
+        })?;
 
         // Dropping `cmd` closes this process's copies of the pipe writers, so
         // the readers below see EOF when the child exits rather than hanging.
         drop(cmd);
 
+        if let (Some(bytes), Some(pipe)) = (input, child.stdin.take()) {
+            redirect::feed(pipe, bytes);
+        }
+
         // Drain each capture on its own task, from here rather than from
         // `wait()`: reading both inline would deadlock once one pipe's buffer
         // filled, and reading lazily would block the child before then.
         let readers = if let Some(reader) = merged_reader {
-            // The shared pipe is not one of the child's own handles, so it has
-            // to be registered with the reactor by hand to become readable
-            // asynchronously.
-            let fd = OwnedFd::from(reader);
-            let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(fd).map_err(|e| {
-                mlua::Error::runtime(format!("failed to watch the merged pipe: {e}"))
-            })?;
-            (Some(read_to_end(rx)), None)
+            (Some(reader), None)
         } else {
             (
                 child.stdout.take().map(read_to_end),
@@ -867,19 +1015,9 @@ impl Child {
         };
 
         Ok(Self {
-            program: state.program,
+            program: state.program.to_string_lossy().into_owned(),
             child: Some(child),
-            captured: Captured {
-                stdout: match &stdout_target {
-                    Redirect::Capture { kind, .. } => Some(*kind),
-                    _ => None,
-                },
-                stderr: match &stderr_target {
-                    Redirect::Capture { kind, .. } => Some(*kind),
-                    _ => None,
-                },
-                merged,
-            },
+            captured: Captured::of(&stdout_target, &stderr_target),
             readers,
         })
     }
@@ -898,11 +1036,7 @@ impl Child {
     fn take_for_wait(
         &mut self,
     ) -> LuaResult<(tokio::process::Child, (Option<Reader>, Option<Reader>))> {
-        let child = self.child.take().ok_or_else(|| {
-            mlua::Error::runtime(
-                "this child has already been waited for (:wait() and :kill() both consume it)",
-            )
-        })?;
+        let child = self.child.take().ok_or_else(consumed)?;
         Ok((child, (self.readers.0.take(), self.readers.1.take())))
     }
 
@@ -914,6 +1048,10 @@ impl Child {
     /// Every await here is a real yield point, so a child running under
     /// `task.spawn` never pins the runtime's only thread -- concurrency in
     /// `task` is only as real as the awaits underneath it.
+    ///
+    /// The capture readers are joined *before* the child is awaited, so a
+    /// grandchild that inherited the pipe and outlives the child keeps this
+    /// waiting until it closes it too.
     async fn wait_on(
         lua: &Lua,
         program: &str,
@@ -928,7 +1066,17 @@ impl Child {
             .wait()
             .await
             .map_err(|e| mlua::Error::runtime(format!("failed waiting for '{program}': {e}")))?;
+        Self::result(lua, captured, status, &stdout_bytes, &stderr_bytes)
+    }
 
+    /// The result table for a reaped child.
+    fn result(
+        lua: &Lua,
+        captured: &Captured,
+        status: std::process::ExitStatus,
+        stdout_bytes: &[u8],
+        stderr_bytes: &[u8],
+    ) -> LuaResult<Table> {
         let result = lua.create_table()?;
         result.raw_set("success", status.success())?;
         match status.code() {
@@ -942,20 +1090,26 @@ impl Child {
             // One handle for both streams: everything arrived on the shared
             // pipe, so both fields expose the same interleaved value rather
             // than leaving one silently empty.
-            let value = capture_to_value(lua, kind, &stdout_bytes)?;
+            let value = capture_to_value(lua, kind, stdout_bytes)?;
             result.raw_set("stdout", value.clone())?;
             result.raw_set("stderr", value)?;
         } else {
             if let Some(kind) = captured.stdout {
-                result.raw_set("stdout", capture_to_value(lua, kind, &stdout_bytes)?)?;
+                result.raw_set("stdout", capture_to_value(lua, kind, stdout_bytes)?)?;
             }
             if let Some(kind) = captured.stderr {
-                result.raw_set("stderr", capture_to_value(lua, kind, &stderr_bytes)?)?;
+                result.raw_set("stderr", capture_to_value(lua, kind, stderr_bytes)?)?;
             }
         }
 
         Ok(result)
     }
+}
+
+fn consumed() -> mlua::Error {
+    mlua::Error::runtime(
+        "this child has already been waited for (:wait() and :kill() both consume it)",
+    )
 }
 
 /// Holds a child's moved-out pieces for the duration of a wait, and puts them
@@ -1030,6 +1184,29 @@ impl UserData for Child {
             let result = guard.run(&lua, &program, &captured).await?;
             guard.disarm();
             Ok(result)
+        });
+
+        // Non-blocking `:wait()`: `nil` while running; once exited, the result
+        // table, consuming the child like `:wait()`. The borrow is scoped for
+        // the same reason as there (the reader joins below are awaits).
+        methods.add_async_function("try_wait", |lua, ud: AnyUserData| async move {
+            let (captured, status, mut readers) = {
+                let mut this = ud.borrow_mut::<Self>()?;
+                let program = this.program.clone();
+                let child = this.child.as_mut().ok_or_else(consumed)?;
+                let status = child.try_wait().map_err(|e| {
+                    mlua::Error::runtime(format!("failed waiting for '{program}': {e}"))
+                })?;
+                let Some(status) = status else {
+                    return Ok(Value::Nil);
+                };
+                this.child = None;
+                let readers = (this.readers.0.take(), this.readers.1.take());
+                (this.captured.clone(), status, readers)
+            };
+            let out = join_reader(readers.0.take(), "stdout").await?;
+            let err = join_reader(readers.1.take(), "stderr").await?;
+            Ok(Value::Table(Self::result(&lua, &captured, status, &out, &err)?))
         });
 
         // `Child::id` also goes to None once the child has been reaped, which
@@ -1148,30 +1325,24 @@ pub fn module(lua: &Lua) -> LuaResult<Table> {
                     signal_name(signal).unwrap_or_else(|| signal.to_string())
                 )));
             }
-            let needs_worker = {
-                let mut traps = traps.borrow_mut();
-                match traps.handlers.get_mut(&signal) {
-                    Some(trap) => trap.handler = handler.clone(),
-                    None => {
-                        traps.handlers.insert(
-                            signal,
-                            Trap {
-                                handler: handler.clone(),
-                                count: 0,
-                            },
-                        );
-                    }
-                }
-                // Whether a worker exists is `workers`' question, not
-                // `handlers`': `proc.untrap` empties `handlers` for this
-                // signal without touching `workers`, so a re-`trap` after an
-                // `untrap` must not spawn a second one. `insert` returning
-                // `true` means this is the first time this number has been
-                // seen at all.
-                traps.workers.insert(signal)
+            // Register with the OS *before* touching any state, synchronously,
+            // so a signal the OS rejects (SIGILL/SIGFPE/SIGSEGV/SIGBUS, a bogus
+            // number) raises here. Whether a worker exists is `workers`'
+            // question, not `handlers`': `proc.untrap` empties `handlers` for
+            // this signal without touching `workers`, so a re-`trap` after an
+            // `untrap` must not spawn a second one.
+            let new_stream = if traps.borrow().workers.contains(&signal) {
+                None
+            } else {
+                let kind = tokio::signal::unix::SignalKind::from_raw(signal);
+                Some(tokio::signal::unix::signal(kind).map_err(|e| {
+                    mlua::Error::runtime(format!("cannot trap signal {signal}: {e}"))
+                })?)
             };
-            if needs_worker {
-                spawn_trap_worker(&traps, signal);
+            traps.borrow_mut().handlers.insert(signal, Trap { handler });
+            if let Some(stream) = new_stream {
+                traps.borrow_mut().workers.insert(signal);
+                spawn_trap_worker(&traps, signal, stream);
             }
             Ok(())
         })?
@@ -1690,33 +1861,267 @@ mod tests {
 
     #[test]
     fn interactive_reports_success() {
-        eval(r#"
+        eval(
+            r#"
             local result = proc.command("true"):interactive()
             assert(result.success == true)
             assert(result.status == 0)
             assert(result.stdout == nil)
             assert(result.stderr == nil)
-        "#)
+        "#,
+        )
         .unwrap();
     }
 
     #[test]
     fn interactive_reports_nonzero_exit() {
-        eval(r#"
+        eval(
+            r#"
             local result = proc.command({ "sh", "-c", "exit 7" }):interactive()
             assert(result.success == false)
             assert(result.status == 7)
-        "#)
+        "#,
+        )
+        .unwrap();
+    }
+
+    /// A stream can be redirected explicitly under `:interactive()` (the fzf
+    /// case: the selection is captured, the UI stays on the terminal).
+    #[test]
+    fn interactive_can_capture_stdout() {
+        eval(
+            r#"
+            local r = proc.command({ "echo", "picked" }):stdout(proc.string()):interactive()
+            assert(r.stdout == "picked\n", "got " .. tostring(r.stdout))
+        "#,
+        )
+        .unwrap();
+    }
+
+    /// `:exec()` accepts only INHERIT (explicit or default).
+    #[test]
+    fn exec_rejects_anything_but_inherit() {
+        let err = eval(r#"proc.command("true"):stdin("x"):exec()"#).unwrap_err();
+        assert!(err.to_string().contains("does not support"), "got: {err}");
+        let err = eval(r#"proc.command("true"):stdout(proc.NULL):exec()"#).unwrap_err();
+        assert!(err.to_string().contains("does not support"), "got: {err}");
+        // Explicit INHERIT passes the check and fails later, at exec itself.
+        let err = eval(r#"proc.command("de-no-such-binary-xyz"):stdout(proc.INHERIT):exec()"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("failed to exec"), "got: {err}");
+    }
+
+    /// A failed exec must not leave the working directory changed.
+    #[test]
+    fn failed_exec_restores_the_directory() {
+        eval(
+            r#"
+            local before = proc.command("pwd"):stdout(proc.string()):run().stdout
+            local ok = pcall(function()
+                proc.command("de-no-such-binary-xyz"):current_dir("/"):exec()
+            end)
+            assert(not ok)
+            local after = proc.command("pwd"):stdout(proc.string()):run().stdout
+            assert(before == after, "cwd changed")
+        "#,
+        )
         .unwrap();
     }
 
     #[test]
-    fn interactive_rejects_configured_redirects() {
-        let err = eval(r#"proc.command("true"):stdout(proc.string()):interactive()"#).unwrap_err();
-        assert!(err.to_string().contains("does not support"), "got: {err}");
+    fn self_alias_raises() {
+        let err = eval(r#"proc.command("true"):stdout(proc.STDOUT)"#).unwrap_err();
+        assert!(err.to_string().contains("onto itself"), "got: {err}");
+        let err = eval(r#"proc.command("true"):stderr(proc.STDERR)"#).unwrap_err();
+        assert!(err.to_string().contains("onto itself"), "got: {err}");
+    }
 
-        let err = eval(r#"proc.command("true"):stderr(proc.string()):interactive()"#).unwrap_err();
-        assert!(err.to_string().contains("does not support"), "got: {err}");
+    /// `2>&1` works with stdout configured first; the alias shares the capture,
+    /// so the merged text is under both fields.
+    #[test]
+    fn stderr_alias_follows_stdout_capture() {
+        eval(
+            r#"
+            local r = proc.command({ "sh", "-c", "echo o; echo e >&2" })
+                :stdout(proc.string()):stderr(proc.STDOUT):run()
+            assert(r.stdout:find("o") and r.stdout:find("e"), "got " .. tostring(r.stdout))
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stdin_from_string_buffer_null_and_file() {
+        eval(
+            r#"
+            local r = proc.command("cat"):stdin("from string"):stdout(proc.string()):run()
+            assert(r.stdout == "from string", "got " .. tostring(r.stdout))
+
+            r = proc.command("cat"):stdin(buffer.fromstring("from buffer"))
+                :stdout(proc.string()):run()
+            assert(r.stdout == "from buffer")
+
+            r = proc.command("cat"):stdin(proc.NULL):stdout(proc.string()):run()
+            assert(r.stdout == "")
+        "#,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.txt");
+        std::fs::write(&path, "from file").unwrap();
+        eval(&format!(
+            r#"
+            local r = proc.command("cat"):stdin(proc.file("{}")):stdout(proc.string()):run()
+            assert(r.stdout == "from file", "got " .. tostring(r.stdout))
+        "#,
+            path.display()
+        ))
+        .unwrap();
+    }
+
+    /// Input larger than a pipe buffer must not deadlock against the child.
+    #[test]
+    fn large_stdin_does_not_deadlock() {
+        eval(
+            r#"
+            local input = string.rep("x", 500000)
+            local r = proc.command("cat"):stdin(input):stdout(proc.string()):run()
+            assert(#r.stdout == 500000, "got " .. #r.stdout)
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stdin_rejects_a_capture_handle() {
+        let err = eval(r#"proc.command("cat"):stdin(proc.string())"#).unwrap_err();
+        assert!(err.to_string().contains("stdin source"), "got: {err}");
+    }
+
+    #[test]
+    fn file_append_mode_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.log");
+        std::fs::write(&path, "first\n").unwrap();
+        eval(&format!(
+            r#"
+            proc.command({{ "echo", "second" }}):stdout(proc.file("{0}", {{ append = true }})):run()
+        "#,
+            path.display()
+        ))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+    }
+
+    /// The same-file check sees through a symlink (same dev/inode).
+    #[test]
+    fn same_file_via_symlink_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.log");
+        let link = dir.path().join("link.log");
+        std::fs::write(&real, "").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = eval(&format!(
+            r#"proc.command("echo"):stdout(proc.file("{}")):stderr(proc.file("{}")):run()"#,
+            real.display(),
+            link.display()
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("separate handles"), "got: {err}");
+    }
+
+    #[test]
+    fn envs_and_env_remove() {
+        eval(
+            r#"
+            local r = proc.command({ "sh", "-c", "echo $A-$B-${C:-unset}" })
+                :envs({ A = "1", B = "2" }):env("C", "3"):env_remove("C")
+                :stdout(proc.string()):run()
+            assert(r.stdout == "1-2-unset\n", "got " .. tostring(r.stdout))
+        "#,
+        )
+        .unwrap();
+    }
+
+    /// Luau strings are bytes, so arguments need not be UTF-8.
+    #[test]
+    fn non_utf8_arguments_reach_the_child() {
+        eval(
+            r#"
+            local r = proc.command("printf"):args({ "%s", "\255\254" })
+                :stdout(proc.buffer()):run()
+            assert(buffer.len(r.stdout) == 2 and buffer.readu8(r.stdout, 0) == 255)
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn try_wait_is_nil_until_exit() {
+        eval(
+            r#"
+            local child = proc.command({ "sleep", "30" }):spawn()
+            assert(child:try_wait() == nil, "still running")
+            child:signal("TERM")
+            local r
+            for _ = 1, 200 do
+                r = child:try_wait()
+                if r then break end
+                proc.command({ "sleep", "0.05" }):run()
+            end
+            assert(r and r.signal_name == "SIGTERM", "never reaped")
+            assert(not pcall(function() return child:id() end), "consumed")
+        "#,
+        )
+        .unwrap();
+    }
+
+    /// An abandoned `:run()` takes its child with it (`kill_on_drop`).
+    #[test]
+    fn abandoned_run_kills_its_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let lua = Lua::new();
+            lua.globals().set("proc", module(&lua).unwrap()).unwrap();
+            let script = format!(
+                r#"proc.command({{ "sh", "-c", "echo $$ > {}; exec sleep 30" }}):run()"#,
+                pidfile.display()
+            );
+            let run = lua.load(script).exec_async();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), run).await;
+            // Let the runtime's reaper collect the killed child (a zombie still
+            // answers signal 0).
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes for existence.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the abandoned child should have been killed");
+    }
+
+    #[test]
+    fn trap_rejects_signals_the_os_refuses() {
+        for sig in ["11", "4", "999"] {
+            let err = eval(&format!("proc.trap({sig}, function() end)")).unwrap_err();
+            assert!(err.to_string().contains("cannot trap"), "{sig}: {err}");
+        }
+    }
+
+    #[test]
+    fn signal_numbers_out_of_range_are_rejected() {
+        let err = eval(r#"proc.command("true"):spawn():signal(5000000000)"#).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "got: {err}");
     }
 
     #[test]

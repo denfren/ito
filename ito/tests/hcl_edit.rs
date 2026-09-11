@@ -52,6 +52,15 @@ fn eval_str(subject: &str, script: &str) -> String {
     eval::<String>(subject, script)
 }
 
+fn eval_err(subject: &str, script: &str) -> String {
+    let lua = lua();
+    lua.globals().set("subject", subject).unwrap();
+    match lua.load(script).eval::<mlua::Value>() {
+        Ok(v) => panic!("expected error, got: {v:?}\nscript:\n{script}"),
+        Err(e) => e.to_string(),
+    }
+}
+
 // ---- layout / snapshot tests ----
 
 #[test]
@@ -124,18 +133,18 @@ fn write_raw_expr_and_ident() {
 }
 
 #[test]
-fn read_raw_handles_computed_expressions() {
+fn raw_handles_computed_expressions() {
     let unit: Value = eval(
         VAR_X_TYPE_LIST_DEFAULT_VAR,
         r#"local h = hcl.edit(subject) return h:block("variable","x"):attr("default"):try_read()"#,
     );
     assert!(unit.is_nil());
 
-    // read_raw round-trips a computed expression into a new attribute verbatim.
+    // raw round-trips a computed expression into a new attribute verbatim.
     insta::assert_snapshot!(eval_str(
         VAR_X_TYPE_LIST_DEFAULT_VAR,
         r#"local h = hcl.edit(subject)
-           local t = h:block("variable","x"):attr("type"):read_raw()
+           local t = h:block("variable","x"):attr("type"):raw()
            h:block("variable","x"):add("alias", t)
            return h:to_string()"#
     ));
@@ -360,5 +369,165 @@ fn type_checks() {
     assert!(eval::<bool>(
         DOC,
         r#"local h = hcl.edit(subject) return h["region"]:is_expr()"#
+    ));
+}
+
+// ---- kind ----
+
+#[test]
+fn kind_names_each_target() {
+    assert_eq!(
+        eval::<String>(DOC, r#"local h = hcl.edit(subject) return h:kind()"#),
+        "body"
+    );
+    assert_eq!(
+        eval::<String>(
+            DOC,
+            r#"local h = hcl.edit(subject) return h:block("resource","aws_instance","web"):kind()"#
+        ),
+        "block"
+    );
+    assert_eq!(
+        eval::<String>(
+            DOC,
+            r#"local h = hcl.edit(subject) return h["region"]:kind()"#
+        ),
+        "expr"
+    );
+}
+
+#[test]
+fn try_kind_is_nil_on_a_missing_path() {
+    let unit: Value = eval(
+        DOC,
+        r#"local h = hcl.edit(subject) return h["nope"]:try_kind()"#,
+    );
+    assert!(unit.is_nil());
+}
+
+// ---- add_at ----
+
+#[test]
+fn add_at_inserts_at_position() {
+    insta::assert_snapshot!(eval_str(
+        VAR_X_TYPE_STRING,
+        r#"local h = hcl.edit(subject)
+           h:block("variable","x"):add_at(1, "default", "dev")
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn add_at_duplicate_key_errors() {
+    let err = eval_err(
+        VAR_X_TYPE_STRING,
+        r#"local h = hcl.edit(subject)
+           h:block("variable","x"):add_at(1, "type", "dev")"#,
+    );
+    assert!(err.contains("duplicate key: type"), "got: {err}");
+}
+
+// ---- update / update_at / update_all ----
+
+#[test]
+fn update_self_reads_and_writes_the_attribute() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):attr("ami"):update(function(v) return v .. "!" end)
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn update_by_key() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):update("ami", function(v) return v .. "!" end)
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn update_returning_nil_removes_the_attribute() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):update("ami", function() return nil end)
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn update_at_by_position() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):update_at(1, function(v) return v .. "-x" end)
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn update_all_applies_to_every_attribute() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):update_all(function(v)
+             if type(v) == "string" then return v .. "-all" end
+             return v
+           end)
+           return h:to_string()"#
+    ));
+}
+
+// ---- upsert / upsert_at ----
+
+#[test]
+fn upsert_adds_when_missing() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):upsert("region", function(v)
+             if v == nil then return "eu-west-1" end
+             return v
+           end)
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn upsert_updates_when_present() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):upsert("ami", function(v) return v .. "!" end)
+           return h:to_string()"#
+    ));
+}
+
+#[test]
+fn upsert_at_inserts_at_position_when_missing() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):upsert_at(1, "region", function(v)
+             if v == nil then return "eu-west-1" end
+             return v
+           end)
+           return h:to_string()"#
+    ));
+}
+
+// ---- remove_at ----
+
+#[test]
+fn remove_at_by_position() {
+    insta::assert_snapshot!(eval_str(
+        DOC,
+        r#"local h = hcl.edit(subject)
+           h:block("resource","aws_instance","web"):remove_at(1)
+           return h:to_string()"#
     ));
 }

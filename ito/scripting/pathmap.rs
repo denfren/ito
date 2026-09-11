@@ -6,9 +6,7 @@
 //! - **virtual** — what a script sees: root-relative, with no leading
 //!   `/`, so the real file `root/subdir/x.txt` is addressed as
 //!   `subdir/x.txt` (the root itself is `""`). `fs.list`/`fs.glob`/
-//!   `fs.finder` emit virtual paths. A leading `/` is still accepted on
-//!   input (e.g. in glob patterns) and treated the same as no leading
-//!   `/`.
+//!   `fs.finder` emit virtual paths. A leading `/` is rejected on input.
 //! - **real** — actual filesystem paths, in two output forms.
 //!   [`PathMapper::to_real_abs`] turns a virtual (or relative) path into
 //!   an **absolute** real path under the root (for disk I/O), and
@@ -43,7 +41,7 @@ pub enum PathError {
     #[error("not a directory: {0}")]
     NotADirectory(PathBuf),
     /// A virtual/relative path escaped the root (via `..` or a symlink).
-    #[error("vfs path escapes root: {0}")]
+    #[error("path is absolute or escapes the root: {0}")]
     Escape(String),
 }
 
@@ -85,13 +83,16 @@ impl PathMapper {
     }
 
     /// Lexically reduce a virtual/relative path to its components under the
-    /// root, dropping `/`, `.` and resolving `..`. An `..` that pops past
-    /// the root is an escape and yields `None`.
+    /// root, dropping `.` and resolving `..`. A leading `/` or a `..` that
+    /// pops past the root is an escape and yields `None`.
     fn lexical(virt: &str) -> Option<PathBuf> {
         let mut rel = PathBuf::new();
         for comp in Path::new(virt).components() {
             match comp {
-                Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+                // An absolute path names a host location, which the rooted
+                // namespace has no spelling for (`ito` would read it as one).
+                Component::RootDir | Component::Prefix(_) => return None,
+                Component::CurDir => {}
                 Component::ParentDir => {
                     if !rel.pop() {
                         return None;
@@ -104,9 +105,9 @@ impl PathMapper {
     }
 
     /// Translate a virtual (or relative) script-visible path into an
-    /// absolute real path under the root. Absolute (`/`-rooted) and
-    /// relative inputs are both taken relative to the root; the intent is
-    /// unambiguous. Any `..` traversal that escapes the root is rejected,
+    /// absolute real path under the root. A leading `/` is rejected (a path
+    /// means the same file as under `ito`), as is any `..` traversal that
+    /// escapes the root,
     /// and the result is checked against symlink-based escapes (see
     /// [`PathMapper::contained`]).
     pub fn to_real_abs(&self, virt: &str) -> Result<PathBuf> {
@@ -116,6 +117,14 @@ impl PathMapper {
             return Err(PathError::Escape(virt.to_string()));
         }
         Ok(real)
+    }
+
+    /// A glob pattern matching `virt` (a script-visible glob) under the root.
+    /// The root is glob-escaped, so metacharacters in its own path are literal.
+    pub fn glob_pattern(&self, virt: &str) -> Result<String> {
+        let rel = Self::lexical(virt).ok_or_else(|| PathError::Escape(virt.to_string()))?;
+        let root = globset::escape(&self.root.to_string_lossy());
+        Ok(format!("{root}/{}", rel.to_string_lossy()))
     }
 
     /// Like [`PathMapper::to_real_abs`], but returns the path relative to

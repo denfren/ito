@@ -41,7 +41,7 @@ use crate::lexer::{as_yaml_1_1_bool, is_yaml_1_1_octal, is_yaml_1_1_sexagesimal}
 /// indicators, flow terminators (`,` `[` `]` `{` `}`), `: `/`:`-at-end,
 /// ` #` comments, surrounding whitespace, control characters, Core-schema
 /// non-strings, and the YAML 1.1 bool/octal/sexagesimal hazards all fail.
-fn is_plain_safe(s: &str) -> bool {
+pub fn is_plain_safe(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
@@ -98,6 +98,17 @@ fn is_plain_safe(s: &str) -> bool {
     true
 }
 
+/// Return `s` unchanged if it is safe as a **plain** scalar, else `None`.
+///
+/// The strict counterpart to [`crate::lexer::as_plain_scalar`], which
+/// scans decoded *content* and so permits interior control characters
+/// (a decoded `"a\tb"` passes there); emitting that as a plain scalar
+/// writes a raw tab into the document. Use this one when choosing an
+/// output style.
+pub fn as_plain_scalar(s: &str) -> Option<&str> {
+    is_plain_safe(s).then_some(s)
+}
+
 /// True iff `s` can be represented in **single-quoted** style.
 ///
 /// Two classes of string cannot, and must fall through to double quotes:
@@ -107,7 +118,7 @@ fn is_plain_safe(s: &str) -> bool {
 ///   line-folded on decode (`ast::decode::decode_single_quoted` trims
 ///   each line's surrounding whitespace), so `' a'` would decode back to
 ///   `"a"` — losing the space. Double-quoted scalars preserve them.
-fn single_quotable(s: &str) -> bool {
+pub fn single_quotable(s: &str) -> bool {
     if s.bytes().any(|b| b < 0x20 || b == 0x7F) {
         return false;
     }
@@ -116,6 +127,19 @@ fn single_quotable(s: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Single-quote `s`, doubling any embedded `'`, or `None` when
+/// single-quoted style cannot preserve the value (see
+/// [`single_quotable`]).
+///
+/// Prefer this over [`crate::lexer::as_single_quoted`] when the question
+/// is "may I *restyle* this value as single-quoted": the lexer's version
+/// rejects only control characters, and so would accept `" pad "` — a
+/// string whose surrounding spaces a single-quoted scalar silently drops
+/// on re-read, because quoted scalars are still line-folded.
+pub fn as_single_quoted(s: &str) -> Option<String> {
+    single_quotable(s).then(|| single_quote(s))
 }
 
 /// Single-quote `s`, doubling any embedded `'`. Caller guarantees `s` has
@@ -139,7 +163,13 @@ fn single_quote(s: &str) -> String {
 /// control character as `\xNN`. This is the inverse of
 /// `ast::decode::decode_double_quoted` and is the only double-quote
 /// *emitter* in the crate.
-fn double_quote(s: &str) -> String {
+///
+/// Unlike [`crate::lexer::as_plain_scalar`] and
+/// [`crate::lexer::as_single_quoted`], this is infallible: double-quoted
+/// style has an escape for every character, so there is no string it
+/// cannot represent — which is why the style ladder in [`quote_with`]
+/// ends here.
+pub fn as_double_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -174,7 +204,7 @@ fn quote_with(s: &str, plain_ok: bool) -> String {
     } else if single_quotable(s) {
         single_quote(s)
     } else {
-        double_quote(s)
+        as_double_quoted(s)
     }
 }
 

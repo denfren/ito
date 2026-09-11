@@ -1,16 +1,16 @@
-# cli — command-line interfaces
+# `cli` — command-line interfaces
 
 `argv` hands a script its arguments as a plain list of strings and stops
 there. `cli` is the other half: declare what the script accepts, parse it
 once, and get `--help` written for you.
 
-| | |
+| Function | Effect |
 | --- | --- |
 | `cli.about(<summary>, [<details>])` | Describe the script, printed above the usage line. Returns nothing. |
-| `cli.opt(<spec>, [<description>], [<details>])` | Declare an option. Returns a handle. |
-| `cli.arg(<name>, [<description>], [<details>])` | Declare a positional. Returns a handle. |
-| `cli.parse()` | Parse the script's `argv` against every declaration made so far. Returns nothing. |
-| `cli.assert(condition, [<message>])` | Report a usage error (usage on stderr, exit 2) if `condition` is falsy. Returns nothing. |
+| `cli.opt(<spec>, [<description>], [<details-or-options>])` | Declare an option. Returns a handle. |
+| `cli.arg(<name>, [<description>], [<details-or-options>])` | Declare a positional. Returns a handle. |
+| `cli.parse([<list>])` | Parse the script's `argv` (or `<list>`) against every declaration made so far. Returns nothing. |
+| `cli.assert(<condition>, [<message>])` | Report a usage error (usage on stderr, exit 2) if `<condition>` is `false` or `nil`. Returns nothing. |
 | `<handle>()` | Read the parsed value. Raises before `cli.parse()`. |
 | `<handle>:get()` | The same read, spelled as a method. |
 | `<handle>:count()` | How many times the option/argument appeared. Raises before `cli.parse()`. |
@@ -42,16 +42,15 @@ end
 ```
 
 ```sh
-ito deploy.luau :: --env prod -n web1 a.conf b.conf
-irun deploy.luau --env prod -n web1 a.conf b.conf   # same, no `::`
+ito deploy.luau --env prod -n web1 a.conf b.conf
 ```
 
-## General rules
+## Conventions
 
 **Declare, parse, read — strictly in that order.** `cli.opt`/`cli.arg`
 register into one process-wide registry that `cli.parse` later consumes;
-they do not return a value, because none exists yet. They return a
-*handle*: an opaque reference into the registry, callable (`env()`) or
+the parsed value does not exist yet when they return. They return a
+*handle* instead: an opaque reference into the registry, callable (`env()`) or
 readable via `:get()` — both spellings are the same read, behind a
 `__call` metamethod and a method respectively. The short form is the one
 to reach for; `:get()` stays for when a handle has travelled far enough
@@ -66,8 +65,9 @@ file-level locals while the parse happens inside `main`, as in the
 example above. It also means **declarations belong in the entry
 script**: a `require`d module's body runs once, so a `cli.opt` at its top
 level joins the caller's command line and shows up in the caller's
-`--help`. Put such calls inside the module's own `main` (which `require`
-never runs) if they must not leak.
+`--help`. A module that declares nothing at load time cannot leak: keep its
+declarations in a function the entry script calls, or leave `cli` to the
+entry script altogether.
 
 **Spec grammar is fish `argparse`'s.** For `cli.opt`, an optional suffix
 says how many values the option takes:
@@ -75,9 +75,9 @@ says how many values the option takes:
 | spec | meaning | reading it (`get`/call) | `:count()` |
 | --- | --- | --- | --- |
 | `v/verbose` | flag | `true`/`false` | occurrences (`-vv` → `2`) |
-| `e/env=` | required value | string, `nil` when absent | `0` or `1` |
-| `f/file=?` | optional value | string, or `true` if bare, `nil` when absent | `0` or `1` |
-| `I/include=+` | repeatable value | list of strings, `{}` when absent | number of elements |
+| `e/env=` | takes a value | string, `nil` when absent | `0` or `1` |
+| `f/file=?` | takes an optional value | string, or `true` if bare, `nil` when absent | `0` or `1` |
+| `I/include=+` | repeatable, takes a value each time | list of strings, `{}` when absent | number of elements |
 
 A `/` names the halves explicitly — whatever sits on a side *is* that
 half, an empty side is that half omitted (`f/` is short-only, `/force`
@@ -88,6 +88,36 @@ cannot reach — a one-character *long* option, reachable only by naming it
 explicitly. A spec with nothing on either side (`""`, `"/"`) is rejected.
 Short flags cluster (`-nvv`); a clustered short option with a value takes
 the rest of the cluster as that value (`-eprod`).
+
+**Values never swallow flags.** A value option reads the next token as its
+value *unless that token looks like a flag*: `--env --help` is a missing
+value (and `--help` still answers), while `--env=--help` passes it
+literally. A negative number (`-5`, `-1.5`) is a value, not a flag, unless
+the script declared a digit as a short option. `-e=` and `--env=` both mean
+an empty value. A single-value option (`=`, `=?`) given twice is a usage
+error rather than last-wins, so `:count()` cannot undercount.
+
+**The third argument may be an options table.** Instead of a `details`
+string, `cli.opt`/`cli.arg` take
+`{details=, default=, required=, choices=, value_name=}`:
+
+```lua
+local env  = cli.opt("e/env=", "deployment target",
+                     {default = "dev", choices = {"dev", "prod"}})
+local tag  = cli.opt("t/tag=", "release tag", {required = true, value_name = "tag"})
+local mode = cli.arg("mode?", "how fast", {default = "fast", choices = {"fast", "slow"}})
+```
+
+`required` (options only) makes absence a usage error. `default` is what an
+absent value reads as — it does not count as an occurrence (`:count()` stays
+`0`); only an optional argument may have one, and flags take none. `choices`
+restricts the accepted values (the default must be one of them).
+`value_name` is the `<name>` the help shows (`--tag=<tag>`). Defaults,
+required and choices are listed in the option's help text. Unknown keys and
+contradictions (`required` with `default`) raise at the declaring call.
+Reading an option from the environment is not offered: `cli` is available
+in `ied` too, where ambient state is absent
+([reproducibility](../binaries/ied.md#reproducibility)).
 
 **A flag reads as a boolean, on purpose.** Presence is the question
 `if force() then` asks, and `0` is truthy in Luau — a flag that returned
@@ -102,22 +132,26 @@ elements for `=+`/`...`, `1`-or-`0` for a single value) — so
 exit `0`) and a malformed command line (usage + complaint to stderr, exit
 `2`) both leave `cli.parse` through a `CliExit` sentinel that the runner
 recognizes and turns into a process exit before returning control to the
-script. This is why every binary — including `iq` (whose return value
-*is* stdout) and `ied` (which owns its own diff/report output) — can
+script. This is why every binary — including `ied` (which owns its own diff/report output) — can
 register `cli.parse` without conflict: the run unwinds out of `eval`
-entirely, so it never reaches `emit_returned`/`emit_reports`/
-`flush_writes` and cannot interleave with or precede anything they would
-have emitted. Nothing is committed either — an `ied` script that calls
+entirely, so it never reaches `emit_reports`/`flush_writes` and cannot
+interleave with or precede anything they would have emitted. Nothing is
+committed either — an `ied` script that calls
 `cli.parse()` and then hits a usage error has buffered nothing yet.
 
 **Two kinds of mistake, two audiences.** A malformed spec — a bad
 `cli.opt`/`cli.arg` string, a duplicate short/long name, an argument
 ordering violation — is the *script's* bug: it raises immediately, as an
 ordinary Luau error, from the declaring call, before any parsing happens.
-A malformed *command line* — unknown option, missing required value,
-missing required argument, leftover positional — is the *user's*: it is
-reported through the usage block on stderr and exits `2`, never as a Lua
-error.
+A malformed *command line* — unknown option (with a "did you mean"
+suggestion when one is close), missing required value, missing required
+option or argument, a value outside `choices`, leftover positional — is the
+*user's*: it is reported through the usage block on stderr, followed by a
+pointer to `--help`, and exits `2`, never as a Luau error. A usage error does
+not hide `--help`: `--nope --help` prints the help and exits `0`. The help
+page starts with `Usage:`. Once `cli.parse`/`cli.assert` has printed and
+exited, the run is over — a `pcall` that swallows the exit gets the same
+exit again from every later `cli.parse`, never a fresh parse.
 
 **Help is answered before positionals are matched.** `cli.parse` scans
 options first (settling whether `--help`/`-h` was given) and only after
@@ -146,13 +180,9 @@ Sets the descriptive prose shown above the usage line, in two parts: a
 summary that appears on every help surface, and optional details that
 only `--help` prints.
 
-**Signature**
+**Signature:** `cli.about(summary: string, details: string?)`
 
-```lua
-cli.about(summary: string, details: string?)
-```
-
-**Parameters**
+**Parameters:**
 
 - `summary` (`string`) — a line or two saying what the script does.
   Shown by `-h`, by `--help`, and above the usage block of a **usage
@@ -186,21 +216,19 @@ whole of the prose: with `--help` claimed, `-h` prints the details too
 rather than withholding them for a spelling that will never show them,
 and its row names only the spelling it owns.
 
-**Return value**
+**Returns:**
 
 None.
 
-**Error conditions**
+**Errors:**
 
 - Raises if called after `cli.parse()` ("the usage block is already
   rendered").
-- Calling it more than once does **not** raise: the last call wins,
-  which is deliberate so a `require`d module setting its own `about`
-  cannot defeat the entry script's. Both halves move together — a
+- Calling it more than once does **not** raise: the last call wins, so a
+  `require`d module that calls it *after* the entry script's own call
+  overrides it (call it last if that matters). Both halves move together — a
   one-argument call clears any `details` an earlier call set, so a
   surviving summary never heads prose written for a different one.
-
-**Example**
 
 ```lua
 cli.about("Copy files to a deployment target.", [[
@@ -213,13 +241,9 @@ and uploads what changed. Nothing is written without --commit.]])
 Declares one option (short and/or long flag) and returns a handle to read
 its parsed value after `cli.parse()`.
 
-**Signature**
+**Signature:** `cli.opt(spec: string, description: string?, details: string|table?) -> handle`
 
-```lua
-cli.opt(spec: string, description: string?, details: string?) -> handle
-```
-
-**Parameters**
+**Parameters:**
 
 - `spec` (`string`) — the option's name(s) and arity, fish-`argparse`
   grammar:
@@ -228,32 +252,35 @@ cli.opt(spec: string, description: string?, details: string?) -> handle
     short and a longer one is long.
   - Arity suffix (default: flag, no suffix):
     - *(none)* — flag, no value, repeats counted.
-    - `=` — required value.
-    - `=?` — optional value (bare presence reads as `true`).
+    - `=` — takes a value.
+    - `=?` — takes an optional value (bare presence reads as `true`).
     - `=+` — repeatable, each occurrence supplying one value.
   - Allowed characters: short name must be an ASCII letter or digit; long
     name must be letters, digits, `-` or `_`.
 - `description` (`string?`) — one-line help text. Shown on **both** `-h`
   (the `Options:` table column) and `--help` (under this option's own
   heading). Omit for no description.
-- `details` (`string?`) — longer prose, shown **only** by `--help`,
-  indented below `description` in this option's section. `-h` and a usage
-  error never show it — the same summary/details split `cli.about` makes
-  for the whole script, here made per option.
+- `details` (`string?` or options `table?`) — a string is longer prose,
+  shown **only** by `--help`, indented below `description` in this option's
+  section. `-h` and a usage error never show it — the same summary/details
+  split `cli.about` makes for the whole script, here made per option. A
+  table is `{details=, default=, required=, choices=, value_name=}` (see
+  the general rules); flags accept only `details`.
 
-**Return value**
+**Returns:**
 
 A handle (see general rules) — callable / `:get()` / `:count()`.
 
-**Error conditions**
+**Errors:**
 
-- Raises immediately (Lua error, not exit 2) for:
+- Raises immediately (Luau error, not exit 2) for:
   - A malformed spec (empty, both halves empty, `=` not at the end, bad
     characters, short half longer than one character where required).
   - A short or long name already declared by a previous `cli.opt`.
+  - A bad options table: an unknown key, a wrong type, `default`/
+    `required`/`choices` on a flag, `default` on a repeatable option,
+    `required` together with `default`, or a `default` outside `choices`.
   - Called after `cli.parse()` ("declare every option first").
-
-**Example**
 
 ```lua
 local verbose = cli.opt("v/verbose", "repeat for more detail")
@@ -280,13 +307,9 @@ On `--help`, that last declaration renders as:
 Declares one positional argument and returns a handle to read its parsed
 value after `cli.parse()`.
 
-**Signature**
+**Signature:** `cli.arg(name: string, description: string?, details: string|table?) -> handle`
 
-```lua
-cli.arg(name: string, description: string?, details: string?) -> handle
-```
-
-**Parameters**
+**Parameters:**
 
 - `name` (`string`) — the positional's name, with an optional arity
   suffix:
@@ -298,14 +321,16 @@ cli.arg(name: string, description: string?, details: string?) -> handle
 - `description` (`string?`) — one-line help text. Shown on **both** `-h`
   (the `Positionals:` table column) and `--help` (under this argument's
   own heading).
-- `details` (`string?`) — longer prose, shown **only** by `--help`,
-  indented below `description` — see `cli.opt`'s `details`.
+- `details` (`string?` or options `table?`) — longer prose, shown **only**
+  by `--help`, indented below `description` — see `cli.opt`'s `details`. As a
+  table, a positional takes `details`, `choices` and (for `name?` only)
+  `default`.
 
-**Return value**
+**Returns:**
 
 A handle (see general rules) — callable / `:get()` / `:count()`.
 
-**Error conditions**
+**Errors:**
 
 - Raises immediately at the declaring call for:
   - A malformed name (empty, or containing characters other than
@@ -317,8 +342,6 @@ A handle (see general rules) — callable / `:get()` / `:count()`.
     arguments must come last") — order is registration order, and
     `<a> [b] <c>` has no unambiguous reading.
   - Called after `cli.parse()` ("declare every argument first").
-
-**Example**
 
 ```lua
 local host  = cli.arg("host", "target machine")     -- required
@@ -332,25 +355,24 @@ Consumes every declaration made so far, matches the script's `argv`
 against it, and populates every handle's value. Must be called exactly
 once, and after every `cli.opt`/`cli.arg` call the script wants included.
 
-**Signature**
+**Signature:** `cli.parse(list: { string }?)`
 
-```lua
-cli.parse()
-```
+**Parameters:**
 
-**Parameters**
+- `list` (`{string}?`) — tokens to parse instead of the script's `argv`
+  (e.g. `{table.unpack(argv, 2)}` after taking a subcommand). The registry
+  is still one-shot: there is no second `cli.parse` with fresh declarations.
 
-None.
-
-**Return value**
+**Returns:**
 
 None, on a successful parse — control returns to the script and every
 handle now reads its value.
 
-**Error conditions**
+**Errors:**
 
-- Raises an ordinary Lua error if called twice ("cli.parse() called
-  twice").
+- Raises an ordinary Luau error if called twice ("cli.parse() called
+  twice"); after an exit that a `pcall` swallowed, it re-raises that same
+  exit instead.
 - Auto-registers `-h`/`--help` unless the script already declared `-h` or
   `--help` itself (in which case the script owns that spelling as a plain
   flag, with no auto-exit behavior).
@@ -359,14 +381,16 @@ handle now reads its value.
   positionals are matched, so a script with required arguments still
   answers `--help`.
 - On a malformed command line — unknown option, an option requiring a
-  value that got none, a missing required positional, or leftover
-  positionals — writes `error: <message>` followed by the usage block (the
-  `about` text omitted) to **stderr** and exits with code **2**.
-- Both exits above are *not* Lua errors the script can catch meaningfully:
+  value that got none (or a flag-looking token in its place), a repeated
+  single-value option, a missing required option or positional, a value
+  outside `choices`, or leftover positionals — writes `error: <message>`
+  followed by the usage block (the `about` **summary** only, no details)
+  and a `--help` pointer to **stderr** and exits with code **2**. If
+  `--help`/`-h` appears anywhere before `--`, the help wins and the exit
+  code is `0`.
+- Both exits above are *not* Luau errors the script can catch meaningfully:
   they leave through the `CliExit` sentinel and unwind straight out of
   `eval` (see general rules). Neither returns to the script.
-
-**Example**
 
 ```lua
 local env = cli.opt("e/env=")
@@ -385,36 +409,33 @@ Reports an invariant that `cli.opt`/`cli.arg` cannot express by themselves —
 a value out of range, two options that conflict — the same way a malformed
 command line is reported.
 
-**Signature**
+**Signature:** `cli.assert(condition: boolean?, message: string?)`
 
-```lua
-cli.assert(condition: boolean, message: string?)
-```
+**Parameters:**
 
-**Parameters**
-
-- `condition` (`boolean`) — already evaluated by the script; `cli.assert`
-  does not interpret truthiness itself.
+- `condition` (`boolean` or `nil`) — already evaluated by the script.
+  `nil` fails; any other type raises, so a stray string or number is a
+  bug rather than a pass.
 - `message` (`string?`) — shown as `error: <message>` above the usage
   block. Defaults to `"assertion failed"` when omitted.
 
 Meant to run *after* `cli.parse()`, since the usual reason to call it is
 checking a parsed value — but nothing enforces that ordering.
 
-**Return value**
+**Returns:**
 
-None, when `condition` is truthy.
+None, when `condition` is `true`.
 
-**Error conditions**
+**Errors:**
 
-- When `condition` is falsy: writes `error: <message>` followed by the
+- Raises an ordinary Luau error if `condition` is neither a boolean nor
+  `nil`.
+- When `condition` is `false` or `nil`: writes `error: <message>` followed by the
   usage block's summary (the same `Detail::Summary` rendering a malformed
   command line gets — no `about` details, no per-option `details`) to
   **stderr** and exits with code **2**. Like `cli.parse`'s own usage
   errors, this leaves through the `CliExit` sentinel and unwinds straight
-  out of `eval`, not as a catchable Lua error.
-
-**Example**
+  out of `eval`, not as a catchable Luau error.
 
 ```lua
 local env = cli.opt("e/env=")
@@ -429,36 +450,34 @@ end
 
 Reads a declared option's or argument's parsed value.
 
-**Signature**
+**Signature:**
 
 ```lua
 handle()       -- via the __call metamethod
 handle:get()   -- identical read, method spelling
 ```
 
-**Parameters**
+**Parameters:**
 
 None.
 
-**Return value** — depends on how the handle was declared:
+**Returns:** — depends on how the handle was declared:
 
 | declared as | return value |
 | --- | --- |
 | flag (`v/verbose`) | `true` if it appeared at least once, else `false` |
-| required (`e/env=`) | string, or `nil` if absent |
+| takes a value (`e/env=`) | string, or `nil` if absent (its `default`, if declared) |
 | optional (`f/file=?`) | string if given a value, `true` if given bare, `nil` if absent |
 | repeatable (`I/include=+`) | list (table) of strings, `{}` if never given |
 | positional, required | string |
 | positional, optional (`host?`) | string, or `nil` if absent |
 | positional, rest (`files...`) | list (table) of strings, `{}` if none left |
 
-**Error conditions**
+**Errors:**
 
 - Raises if called before `cli.parse()` has run: `"<name> read before
   cli.parse() -- declare with cli.opt/cli.arg, then call cli.parse()
   before reading"`.
-
-**Example**
 
 ```lua
 local env = cli.opt("e/env=")
@@ -472,29 +491,23 @@ print(env:get())  -- same value, method spelling
 Answers "how many times did this appear on the command line" — the
 question a boolean flag read cannot answer on its own.
 
-**Signature**
+**Signature:** `handle:count() -> number`
 
-```lua
-handle:count() -> number
-```
-
-**Parameters**
+**Parameters:**
 
 None.
 
-**Return value** — uniform across every handle kind:
+**Returns:** — uniform across every handle kind:
 
 | declared as | `:count()` |
 | --- | --- |
 | flag | number of occurrences (`-vvv` → `3`) |
-| required / optional value | `1` if present, `0` if absent |
+| single value (`=`, `=?`) | `1` if present, `0` if absent (a `default` does not count) |
 | repeatable (`=+`) / rest (`...`) | number of elements collected |
 
-**Error conditions**
+**Errors:**
 
 - Raises before `cli.parse()` has run, same as the value read.
-
-**Example**
 
 ```lua
 local verbose = cli.opt("v/verbose", "repeat for more detail")
@@ -513,13 +526,14 @@ however it is spelled — including something that looks exactly like a
 declared option:
 
 ```sh
-irun grep.luau -- --env      # host is not set; the positional is "--env"
+ito grep.luau -- --env       # host is not set; the positional is "--env"
 ```
 
-The `--` token itself is consumed, not passed through. A required value
-may be attached inline (`--env=prod`, `-eprod`) or given as the next
-token (`--env prod`, `-e prod`); an optional value (`=?`) is only ever
-read when attached — bare `--file` never reaches forward for a value.
+The `--` token itself is consumed, not passed through. A value may be
+attached inline (`--env=prod`, `-eprod`, `-e=prod`) or given as the next
+token (`--env prod`, `-e prod`) provided that token does not look like a
+flag; an optional value (`=?`) is only ever read when attached — bare
+`--file` never reaches forward for a value.
 
 ## `argv` is still there
 

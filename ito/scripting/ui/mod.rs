@@ -7,10 +7,10 @@
 //! - [`progress`] — `indicatif`-backed progress bars and spinners.
 //!
 //! Both read or write the terminal directly, which is ambient state a script
-//! under `iq`/`ied` cannot be allowed to depend on — a query's output is its
+//! under `ied` cannot be allowed to depend on — a query's output is its
 //! return value, and an `ied --diff` preview must not block on a prompt or
 //! print a bar that has no counterpart under `--write`. So `ui` is host-only
-//! (`ito`/`irun`), the same line `proc`/`ssh`/`task` draw, and is registered
+//! (`ito`), the same line `proc`/`ssh`/`task` draw, and is registered
 //! under `host_io` rather than with the core. Absent rather than stubbed, so
 //! `if ui then` is a usable feature test.
 //!
@@ -26,10 +26,12 @@ use mlua::{Lua, Result as LuaResult, Table};
 /// Register the `ui` module: an empty umbrella table, then `prompt` and
 /// `progress` under it.
 ///
-/// Host-only (`ito`/`irun`), like `proc`/`ssh`/`task`. Must run before
+/// Host-only (`ito`), like `proc`/`ssh`/`task`. Must run before
 /// `sandbox(true)` freezes the table, matching every other `host_io` step in
 /// `Engine::build`.
 pub fn register(lua: &Lua) -> LuaResult<()> {
+    // A fresh engine must not inherit an earlier one's bars.
+    progress::reset();
     let module = lua.create_table()?;
 
     let prompt_table: Table = prompt::module(lua)?;

@@ -1,330 +1,350 @@
 //! `ui.progress` — progress bars and spinners, backed by `indicatif`.
 //!
-//! Two layers, like `hcl.builder()`/`hcl.block()` beside `hcl.parse`: a
-//! **shorthand** constructor for the common case, and a **style builder**
-//! for everything `indicatif::ProgressStyle` exposes.
+//! The chapter `docs/src/modules/ui-progress.md` is the surface description.
+//! Implementation notes:
 //!
-//! ```lua
-//! -- shorthand: sensible default template
-//! local bar = ui.progress.bar(#hosts, "checking hosts")
-//! for _, h in ipairs(hosts) do
-//!     probe(h)
-//!     bar:inc(1)
-//! end
-//! bar:finish("done")
+//! - Every bar/spinner joins one shared `indicatif::MultiProgress` (created on
+//!   first use) so concurrent indicators stack instead of overwriting each
+//!   other. A finished bar keeps its last frame; indicatif reaps it once every
+//!   bar above it has finished too.
+//! - Output that shares the terminal (`print`, `io.*`, log records, prompts)
+//!   goes through [`suspended`]/[`pause`] so it never garbles a live bar.
+//!   `ui.progress.suspend(fn)` does *not* use indicatif's own `suspend`, which
+//!   holds the multi's lock while `fn` runs (touching a bar inside deadlocks);
+//!   it hides the draw target for the duration instead, and is async.
+//! - [`teardown`] abandons still-running bars when the run ends or fails.
+//! - A style is a set of optional overrides applied over the bar's or
+//!   spinner's default template, so `:progress_chars()` alone keeps `{msg}`.
 //!
-//! -- style builder: any indicatif template, tick set or fill characters
-//! local style = ui.progress.style()
-//!     :template("{spinner} {msg} [{wide_bar}] {percent}%")
-//!     :progress_chars("#>-")
-//!     :tick_strings({ "◐", "◓", "◑", "◒", "" })
-//! local bar = ui.progress.bar(100):style(style)
-//! ```
-//!
-//! | Call | Effect |
-//! | --- | --- |
-//! | `ui.progress.bar(len[, msg])` | a bar handle with a default template |
-//! | `ui.progress.spinner([msg])` | a spinner handle, self-animating |
-//! | `ui.progress.style()` | a style builder, `indicatif`'s template language |
-//! | `ui.progress.clear()` | drop the shared multi-bar state, for a fresh start |
-//! | `ui.progress.suspend(fn)` | hide every bar, run `fn`, redraw -- for output that must not interleave |
-//!
-//! Every bar/spinner transparently joins one shared `indicatif::MultiProgress`
-//! -- created on first use, so several concurrent indicators (e.g. one per
-//! `task.pool` worker) stack as separate terminal lines instead of
-//! overwriting each other. A single bar draws exactly as it did before this
-//! existed; the difference only shows once a second one is live at the same
-//! time. A finisher (`finish`/`finish_and_clear`/`abandon`) leaves the shared
-//! state; `ui.progress.clear()` drops it outright for a script that wants a
-//! clean slate between unrelated phases rather than stacking onto whatever's
-//! left from the last one.
-//!
-//! `ui.progress.bar(len[, msg])`/`spinner([msg])` return a **handle**
-//! (userdata), not a one-shot call, because a progress indicator is
-//! inherently a thing updated over time — across loop iterations, or from
-//! several `task`s sharing one bar. `indicatif`'s `ProgressBar` is already
-//! `Clone` and internally synchronized (an `Arc` over a mutexed state plus
-//! atomics), so the handle can be cloned into closures spawned onto other
-//! tasks with no locking of its own to add.
-//!
-//! | Method | Effect |
-//! | --- | --- |
-//! | `h:style(style)` | apply a [`style`](#uiprogressstyle) builder |
-//! | `h:inc(n)` | advance the position by `n` |
-//! | `h:dec(n)` | move the position back by `n` |
-//! | `h:set(n)` | set the position to `n` |
-//! | `h:set_length(n)` | change the total (bar only) |
-//! | `h:inc_length(n)` / `h:dec_length(n)` | grow/shrink the total in place |
-//! | `h:set_message(s)` | replace the trailing status text |
-//! | `h:set_prefix(s)` | replace the leading `{prefix}` text |
-//! | `h:tick()` | advance a spinner's animation frame by hand |
-//! | `h:enable_steady_tick(d)` | animate on `indicatif`'s own thread every `d` |
-//! | `h:disable_steady_tick()` | stop that thread |
-//! | `h:position()` / `h:length()` | current position / total (`length` may be `nil`) |
-//! | `h:elapsed()` / `h:eta()` / `h:per_sec()` | timing, seconds / seconds / rate |
-//! | `h:is_finished()` | whether a terminal state was reached |
-//! | `h:println(s)` | print a line above the bar without disturbing it |
-//! | `h:reset()` | clear position, elapsed time and ETA |
-//! | `h:finish([msg])` | stop, keep the bar on screen, optionally set `msg` first |
-//! | `h:finish_and_clear()` | stop and erase the line |
-//! | `h:abandon([msg])` | stop, keep on screen, marked incomplete rather than done |
-//!
-//! **A spinner's animation runs on `indicatif`'s own background thread**
-//! (`enable_steady_tick`), not on ito's single-threaded Luau runtime — a
-//! `task.wait` loop advancing it by hand would stop animating the moment the
-//! script itself awaited anything else. That thread draws only; every method
-//! above still just mutates shared, synchronized state, so nothing here blocks
-//! the calling task.
-//!
-//! Both draw to **stderr** by default -- indicatif's own default target --
-//! which is what keeps a bar from interleaving with a script's own `print`
-//! (stdout) or a piped `iq`-style return value; this module doesn't change it.
-//!
-//! # `ui.progress.style()`
-//!
-//! A builder over `indicatif::ProgressStyle`, `with_*`-chained like every
-//! other ito builder (`hcl.builder()`, `proc.command()`); a terminal
-//! `h:style(...)` on a bar/spinner applies it (there is nothing else to
-//! finish it into — a style has no meaning on its own).
-//!
-//! | Method | Effect |
-//! | --- | --- |
-//! | `s:template(str)` | the layout, `indicatif`'s own placeholder syntax (`{bar}`, `{msg}`, `{pos}`, `{len}`, `{percent}`, `{eta}`, `{elapsed}`, `{spinner}`, `{prefix}`, `{wide_bar}`, …) |
-//! | `s:tick_chars(str)` | one string, one character per spinner frame plus a final frame |
-//! | `s:tick_strings(list)` | the same, as separate strings (multi-byte glyphs) |
-//! | `s:progress_chars(str)` | three characters: filled, current, unfilled |
-//!
-//! A **malformed** template (a stray `{`/`}`, an unterminated brace) raises,
-//! naming the syntax problem; an **unrecognized placeholder** does not
-//! error — `indicatif` renders it empty rather than checking the key set
-//! against the ones it knows.
-//!
-//! # What's not exposed, and why
-//!
-//! **`ProgressTracker` / `with_key`** — a custom computed template field —
-//! takes a Rust trait object invoked on every redraw, on whichever thread is
-//! drawing (this module's own steady-tick thread, or the caller for a
-//! manually-ticked bar). Calling back into a `!Send` `mlua::Lua` from there
-//! has the same shape as `ui.prompt`'s live-validator gap, and isn't
-//! something mlua supports; a script computing its own text updates it with
-//! `h:set_message(...)`/`h:set_prefix(...)` instead of a template key.
-//!
-//! Host-only (`ito`/`irun`): see [`crate::scripting::ui`] for why the whole
-//! `ui` umbrella lives only there.
+//! Both draw to **stderr**, indicatif's own default. Host-only (`ito`): see
+//! [`crate::scripting::ui`].
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use mlua::{Lua, Result as LuaResult, Table, UserData, UserDataMethods, UserDataRef};
-use std::cell::RefCell;
+use super::super::fmt::ansi;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use mlua::{Lua, Result as LuaResult, Table, UserData, UserDataMethods, UserDataRef, Value};
+use std::cell::{Cell, RefCell};
+use std::io::Write;
 use std::time::Duration;
 
 thread_local! {
-    /// The `MultiProgress` every `bar()`/`spinner()` joins, created lazily on
-    /// first use. Single bar or spinner draws identically whether or not it
-    /// has a `MultiProgress` around it, so joining one unconditionally costs
-    /// nothing in the common single-indicator case and makes concurrent bars
-    /// (e.g. one per `task.pool` worker) stack instead of clobbering each
-    /// other's terminal line -- no `ui.progress.multi()` for a script to
-    /// remember to reach for. `ui.progress.clear()` drops it for a script
-    /// that wants a clean slate between unrelated phases.
+    /// The `MultiProgress` every `bar()`/`spinner()` joins, created lazily.
     static MULTI: RefCell<Option<MultiProgress>> = const { RefCell::new(None) };
+    /// Every bar handed out, so [`teardown`] can stop the unfinished ones.
+    static LIVE: RefCell<Vec<ProgressBar>> = const { RefCell::new(Vec::new()) };
+    /// Nesting depth of [`pause`].
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Join the shared `MultiProgress`, creating it if this is the first bar or
-/// spinner since the last `clear()`. Returns the bar `MultiProgress::add`
-/// hands back rather than the one passed in: indicatif's own docs warn that
-/// styling/ticking/setting a message on a bar *before* it's added can draw it
-/// standalone first, leaving a line the `MultiProgress` never learns to erase
-/// -- the "zombie line" duplicates a script would otherwise see while several
-/// bars are starting up together. So callers must add a bare `ProgressBar`
-/// to the multi *first* and do everything else to the bar this returns.
-fn join_multi(pb: ProgressBar) -> ProgressBar {
-    MULTI.with(|cell| {
-        let mut multi = cell.borrow_mut();
-        let multi = multi.get_or_insert_with(MultiProgress::new);
-        multi.add(pb)
-    })
+fn multi() -> Option<MultiProgress> {
+    MULTI.with(|cell| cell.borrow().clone())
 }
 
-/// Drop a bar/spinner from the shared `MultiProgress`'s bookkeeping, erasing
-/// its line on the next redraw. Only `finish_and_clear` calls this: `finish`
-/// and `abandon` mean "keep the last frame on screen", which `remove` would
-/// immediately undo. `MultiProgress`'s own zombie handling already keeps a
-/// finished-but-not-removed member's last frame visible without redrawing
-/// it, so those two need no bookkeeping call at all.
-fn leave_multi(pb: &ProgressBar) {
-    MULTI.with(|cell| {
-        if let Some(multi) = cell.borrow().as_ref() {
-            multi.remove(pb);
+/// Forget all state: a fresh engine must not inherit the last one's bars.
+pub fn reset() {
+    MULTI.with(|cell| *cell.borrow_mut() = None);
+    LIVE.with(|cell| cell.borrow_mut().clear());
+    DEPTH.with(|d| d.set(0));
+}
+
+/// Stop every unfinished bar (abandon, keeping its last frame) and drop the
+/// shared state. Runs when a script ends, successfully or not.
+pub fn teardown() {
+    let live = LIVE.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    for pb in live {
+        if !pb.is_finished() {
+            pb.abandon();
         }
+    }
+    reset();
+}
+
+/// Join the shared `MultiProgress`, creating it if needed. Returns the bar
+/// `MultiProgress::add` hands back: styling or ticking a bar *before* it is
+/// added can draw it standalone first and leave a line nobody erases.
+fn join_multi(pb: ProgressBar) -> ProgressBar {
+    let pb = MULTI.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(MultiProgress::new)
+            .add(pb)
     });
+    LIVE.with(|cell| {
+        let mut live = cell.borrow_mut();
+        live.retain(|p| !p.is_finished());
+        live.push(pb.clone());
+    });
+    pb
 }
 
-/// Map an `indicatif` template/parse error onto a Luau error naming what was
-/// rejected, the same shape a bad strftime pattern gets from `time`.
-fn style_err(e: impl std::fmt::Display) -> mlua::Error {
-    mlua::Error::runtime(format!("ui.progress.style: {e}"))
-}
-
-/// A style under construction. Thin enough that each method just rebuilds
-/// the wrapped `ProgressStyle` and reassigns it -- `ProgressStyle`'s own
-/// builder is consuming (`self -> Self`), so there is nothing to mutate in
-/// place without one. `Rc`-shared, like `HclBody`/`HclBlock`, so a method
-/// can return a *clone* of the handle (same underlying cell) to support
-/// `:template(...):progress_chars(...)` chaining the way every other ito
-/// builder does.
-#[derive(Clone)]
-struct StyleBuilder(std::rc::Rc<std::cell::RefCell<ProgressStyle>>);
-
-impl UserData for StyleBuilder {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method(
-            "template",
-            |_, this, template: String| -> LuaResult<StyleBuilder> {
-                let next = this
-                    .0
-                    .borrow()
-                    .clone()
-                    .template(&template)
-                    .map_err(style_err)?;
-                *this.0.borrow_mut() = next;
-                Ok(this.clone())
-            },
-        );
-        methods.add_method(
-            "tick_chars",
-            |_, this, chars: String| -> LuaResult<StyleBuilder> {
-                let next = this.0.borrow().clone().tick_chars(&chars);
-                *this.0.borrow_mut() = next;
-                Ok(this.clone())
-            },
-        );
-        methods.add_method(
-            "tick_strings",
-            |_, this, strings: Vec<String>| -> LuaResult<StyleBuilder> {
-                let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                let next = this.0.borrow().clone().tick_strings(&refs);
-                *this.0.borrow_mut() = next;
-                Ok(this.clone())
-            },
-        );
-        methods.add_method(
-            "progress_chars",
-            |_, this, chars: String| -> LuaResult<StyleBuilder> {
-                let next = this.0.borrow().clone().progress_chars(&chars);
-                *this.0.borrow_mut() = next;
-                Ok(this.clone())
-            },
-        );
+/// Erase a bar's line. Only `finish_and_clear` calls this: `finish` and
+/// `abandon` keep the last frame on screen, which `remove` would undo.
+fn leave_multi(pb: &ProgressBar) {
+    if let Some(multi) = multi() {
+        multi.remove(pb);
     }
 }
 
-/// A handle around one `ProgressBar`. Cheap to clone (an `Arc` underneath),
-/// but the Luau side only ever sees this wrapper as userdata.
-struct Handle(ProgressBar);
+/// Run `f` with the bars hidden and redrawn afterwards: for plain writes to
+/// the terminal (`print`, log lines). `f` must not touch a bar.
+pub fn suspended<R>(f: impl FnOnce() -> R) -> R {
+    match multi() {
+        Some(m) => m.suspend(f),
+        None => f(),
+    }
+}
+
+/// `stderr` whose writes pause the bars. The log subscriber's writer.
+pub struct SuspendedStderr;
+
+impl Write for SuspendedStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        suspended(|| std::io::stderr().write(buf))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+/// Holds the bars hidden while alive (nestable); restores and redraws on drop.
+/// Unlike `MultiProgress::suspend` it holds no lock, so the code it guards may
+/// touch bars and may await.
+pub(crate) struct Pause(Option<MultiProgress>);
+
+pub(crate) fn pause() -> Pause {
+    let m = multi();
+    if let Some(m) = &m
+        && DEPTH.with(|d| {
+            d.set(d.get() + 1);
+            d.get() == 1
+        })
+    {
+        let _ = m.clear();
+        m.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    Pause(m)
+}
+
+impl Drop for Pause {
+    fn drop(&mut self) {
+        if let Some(m) = &self.0
+            && DEPTH.with(|d| {
+                d.set(d.get().saturating_sub(1));
+                d.get() == 0
+            })
+        {
+            m.set_draw_target(ProgressDrawTarget::stderr());
+            m.suspend(|| ()); // forces a redraw
+        }
+    }
+}
+
+fn err(what: &str, e: impl std::fmt::Display) -> mlua::Error {
+    mlua::Error::runtime(format!("ui.progress.{what}: {e}"))
+}
+
+/// Overrides collected by the style builder; applied over the default
+/// template of whatever the style lands on.
+#[derive(Default, Clone)]
+struct StyleSpec {
+    template: Option<String>,
+    tick: Option<Vec<String>>,
+    progress_chars: Option<String>,
+}
+
+impl StyleSpec {
+    fn build(&self, spinner: bool) -> ProgressStyle {
+        let colour = ansi::enabled_stderr();
+        let base = match (spinner, colour) {
+            (false, true) => BAR_TEMPLATE,
+            (false, false) => BAR_TEMPLATE_PLAIN,
+            (true, true) => SPINNER_TEMPLATE,
+            (true, false) => SPINNER_TEMPLATE_PLAIN,
+        };
+        let mut style = ProgressStyle::with_template(self.template.as_deref().unwrap_or(base))
+            .expect("template validated when set");
+        if let Some(t) = &self.tick {
+            let refs: Vec<&str> = t.iter().map(String::as_str).collect();
+            style = style.tick_strings(&refs);
+        }
+        style = style.progress_chars(self.progress_chars.as_deref().unwrap_or("=> "));
+        style
+    }
+}
+
+/// A style under construction; `Rc`-shared so methods return the same
+/// handle for chaining.
+#[derive(Clone)]
+struct StyleBuilder(std::rc::Rc<RefCell<StyleSpec>>);
+
+impl UserData for StyleBuilder {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("template", |_, this, template: String| {
+            ProgressStyle::with_template(&template).map_err(|e| err("style", e))?;
+            this.0.borrow_mut().template = Some(template);
+            Ok(this.clone())
+        });
+        methods.add_method("tick_chars", |_, this, chars: String| {
+            let v: Vec<String> = chars.chars().map(String::from).collect();
+            if v.len() < 2 {
+                return Err(err("style", "tick_chars needs at least 2 characters"));
+            }
+            this.0.borrow_mut().tick = Some(v);
+            Ok(this.clone())
+        });
+        methods.add_method("tick_strings", |_, this, strings: Vec<String>| {
+            if strings.len() < 2 {
+                return Err(err("style", "tick_strings needs at least 2 strings"));
+            }
+            this.0.borrow_mut().tick = Some(strings);
+            Ok(this.clone())
+        });
+        methods.add_method("progress_chars", |_, this, chars: String| {
+            // indicatif panics on < 2 cells or unequal widths; check up front.
+            let ok = chars.chars().count() >= 2
+                && std::panic::catch_unwind(|| ProgressStyle::default_bar().progress_chars(&chars))
+                    .is_ok();
+            if !ok {
+                return Err(err(
+                    "style",
+                    "progress_chars needs at least 2 characters of equal width",
+                ));
+            }
+            this.0.borrow_mut().progress_chars = Some(chars);
+            Ok(this.clone())
+        });
+    }
+}
+
+/// A handle around one `ProgressBar`.
+struct Handle {
+    pb: ProgressBar,
+    spinner: bool,
+}
+
+/// Read a tick interval (delta grammar); positive and finite.
+fn interval(v: &Value) -> LuaResult<Duration> {
+    let secs = super::super::time::parse_delta_value(v, "enable_steady_tick")?;
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| err("enable_steady_tick", format!("{secs} is not a valid interval")))
+}
+
+/// Without a terminal indicatif draws nothing; say the line on stderr instead.
+fn say(pb: &ProgressBar, msg: &str) {
+    if pb.is_hidden() {
+        eprintln!("{msg}");
+    }
+}
 
 impl UserData for Handle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("style", |_, this, style: UserDataRef<StyleBuilder>| {
-            this.0.set_style(style.0.borrow().clone());
+            this.pb.set_style(style.0.borrow().build(this.spinner));
             Ok(())
         });
-        methods.add_method("inc", |_, this, delta: u64| {
-            this.0.inc(delta);
+        methods.add_method("inc", |_, this, delta: Option<u64>| {
+            this.pb.inc(delta.unwrap_or(1));
             Ok(())
         });
-        methods.add_method("dec", |_, this, delta: u64| {
-            this.0.dec(delta);
+        methods.add_method("dec", |_, this, delta: Option<u64>| {
+            this.pb.dec(delta.unwrap_or(1));
             Ok(())
         });
         methods.add_method("set", |_, this, pos: u64| {
-            this.0.set_position(pos);
+            this.pb.set_position(pos);
             Ok(())
         });
         methods.add_method("set_length", |_, this, len: u64| {
-            this.0.set_length(len);
+            this.pb.set_length(len);
             Ok(())
         });
         methods.add_method("inc_length", |_, this, delta: u64| {
-            this.0.inc_length(delta);
+            this.pb.inc_length(delta);
             Ok(())
         });
         methods.add_method("dec_length", |_, this, delta: u64| {
-            this.0.dec_length(delta);
+            this.pb.dec_length(delta);
             Ok(())
         });
         methods.add_method("set_message", |_, this, msg: String| {
-            this.0.set_message(msg);
+            this.pb.set_message(msg);
             Ok(())
         });
         methods.add_method("set_prefix", |_, this, prefix: String| {
-            this.0.set_prefix(prefix);
+            this.pb.set_prefix(prefix);
             Ok(())
         });
         methods.add_method("tick", |_, this, ()| {
-            this.0.tick();
+            this.pb.tick();
             Ok(())
         });
-        methods.add_method("enable_steady_tick", |_, this, secs: f64| {
-            this.0.enable_steady_tick(Duration::from_secs_f64(secs));
+        methods.add_method("enable_steady_tick", |_, this, every: Value| {
+            this.pb.enable_steady_tick(interval(&every)?);
             Ok(())
         });
         methods.add_method("disable_steady_tick", |_, this, ()| {
-            this.0.disable_steady_tick();
+            this.pb.disable_steady_tick();
             Ok(())
         });
-        methods.add_method("position", |_, this, ()| Ok(this.0.position()));
-        methods.add_method("length", |_, this, ()| Ok(this.0.length()));
-        methods.add_method("elapsed", |_, this, ()| Ok(this.0.elapsed().as_secs_f64()));
-        methods.add_method("eta", |_, this, ()| Ok(this.0.eta().as_secs_f64()));
-        methods.add_method("per_sec", |_, this, ()| Ok(this.0.per_sec()));
-        methods.add_method("is_finished", |_, this, ()| Ok(this.0.is_finished()));
+        methods.add_method("position", |_, this, ()| Ok(this.pb.position()));
+        methods.add_method("length", |_, this, ()| Ok(this.pb.length()));
+        methods.add_method("elapsed", |_, this, ()| {
+            Ok(this.pb.elapsed().as_secs_f64())
+        });
+        methods.add_method("eta", |_, this, ()| Ok(this.pb.eta().as_secs_f64()));
+        methods.add_method("per_sec", |_, this, ()| Ok(this.pb.per_sec()));
+        methods.add_method("is_finished", |_, this, ()| Ok(this.pb.is_finished()));
         methods.add_method("println", |_, this, msg: String| {
-            this.0.println(msg);
+            if this.pb.is_hidden() {
+                eprintln!("{msg}");
+            } else {
+                this.pb.println(msg);
+            }
             Ok(())
         });
         methods.add_method("reset", |_, this, ()| {
-            this.0.reset();
+            this.pb.reset();
             Ok(())
         });
         methods.add_method("finish", |_, this, msg: Option<String>| {
             match msg {
-                Some(msg) => this.0.finish_with_message(msg),
-                None => this.0.finish(),
+                Some(msg) => {
+                    say(&this.pb, &msg);
+                    this.pb.finish_with_message(msg)
+                }
+                None => this.pb.finish(),
             }
-            // Deliberately no leave_multi(): remove() erases the bar's line
-            // on the next redraw, which would undo the very message finish()
-            // just drew. Left registered, indicatif's own zombie handling
-            // keeps a finished member's last frame on screen without
-            // redrawing it further -- exactly "stop, keep on screen".
+            // No leave_multi(): remove() would erase the frame just drawn.
             Ok(())
         });
         methods.add_method("finish_and_clear", |_, this, ()| {
-            this.0.finish_and_clear();
-            leave_multi(&this.0);
+            this.pb.finish_and_clear();
+            leave_multi(&this.pb);
             Ok(())
         });
         methods.add_method("abandon", |_, this, msg: Option<String>| {
             match msg {
-                Some(msg) => this.0.abandon_with_message(msg),
-                None => this.0.abandon(),
+                Some(msg) => {
+                    say(&this.pb, &msg);
+                    this.pb.abandon_with_message(msg)
+                }
+                None => this.pb.abandon(),
             }
-            // Same reasoning as finish(): kept on screen, so not removed.
             Ok(())
         });
     }
 }
 
-/// Bar template: position, a filled/unfilled bar, count and ETA. `msg`
-/// occupies its own segment so `set_message` has somewhere to land without a
-/// second template.
+/// Bar template: message, filled/unfilled bar, count and ETA.
 const BAR_TEMPLATE: &str = "{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})";
+const BAR_TEMPLATE_PLAIN: &str = "{msg} [{bar:40}] {pos}/{len} ({eta})";
 
 /// Spinner template: the animated glyph, then the message.
 const SPINNER_TEMPLATE: &str = "{spinner:.cyan} {msg}";
+const SPINNER_TEMPLATE_PLAIN: &str = "{spinner} {msg}";
 
-/// How often the spinner's own thread redraws. Fast enough to look alive,
-/// far under anything a human perceives as flicker.
-const SPINNER_TICK: Duration = Duration::from_millis(100);
+/// How often a bar's or spinner's own thread redraws.
+const TICK: Duration = Duration::from_millis(100);
 
 /// Build the `ui.progress` table.
 pub fn module(lua: &Lua) -> LuaResult<Table> {
@@ -335,76 +355,53 @@ pub fn module(lua: &Lua) -> LuaResult<Table> {
         "bar",
         lua.create_function(|_, (len, msg): (u64, Option<String>)| {
             let pb = join_multi(ProgressBar::new(len));
-            pb.set_style(
-                ProgressStyle::with_template(BAR_TEMPLATE)
-                    .expect("BAR_TEMPLATE is a valid indicatif template")
-                    .progress_chars("=> "),
-            );
+            pb.set_style(StyleSpec::default().build(false));
             pb.set_message(msg.unwrap_or_default());
-            Ok(Handle(pb))
+            pb.enable_steady_tick(TICK);
+            Ok(Handle { pb, spinner: false })
         })?,
     )?;
 
     // ui.progress.spinner([msg]) -> handle
-    //
-    // Ticks itself on indicatif's own background thread (`enable_steady_tick`)
-    // rather than through `task`, so it keeps animating across an `await` the
-    // script makes elsewhere -- see the module docs.
     module.set(
         "spinner",
         lua.create_function(|_, msg: Option<String>| {
             let pb = join_multi(ProgressBar::new_spinner());
-            pb.set_style(
-                ProgressStyle::with_template(SPINNER_TEMPLATE)
-                    .expect("SPINNER_TEMPLATE is a valid indicatif template"),
-            );
+            pb.set_style(StyleSpec::default().build(true));
             pb.set_message(msg.unwrap_or_default());
-            pb.enable_steady_tick(SPINNER_TICK);
-            Ok(Handle(pb))
+            pb.enable_steady_tick(TICK);
+            Ok(Handle { pb, spinner: true })
         })?,
     )?;
 
-    // ui.progress.style() -> style builder, starting from indicatif's own
-    // generic default (a plain "{wide_bar} {pos}/{len}" shape) -- a script
-    // that only wants to change the fill characters need not restate a
-    // template first.
+    // ui.progress.style() -> empty style builder (overrides only)
     module.set(
         "style",
         lua.create_function(|_, ()| {
-            Ok(StyleBuilder(std::rc::Rc::new(std::cell::RefCell::new(
-                ProgressStyle::default_bar(),
+            Ok(StyleBuilder(std::rc::Rc::new(RefCell::new(
+                StyleSpec::default(),
             ))))
         })?,
     )?;
 
-    // ui.progress.clear() -- drop the shared MultiProgress, so the next
-    // bar()/spinner() starts a fresh one. For a script that wants a clean
-    // slate between unrelated phases rather than stacking onto whatever's
-    // left from the last one.
+    // ui.progress.clear() -- erase every bar's line from the display.
     module.set(
         "clear",
         lua.create_function(|_, ()| {
-            MULTI.with(|cell| *cell.borrow_mut() = None);
+            if let Some(m) = multi() {
+                let _ = m.clear();
+            }
             Ok(())
         })?,
     )?;
 
-    // ui.progress.suspend(fn) -- indicatif's own atomic hide/run/redraw:
-    // clears every live bar's lines, runs the Luau function, then redraws
-    // them, safe against a spinner's own steady-tick thread redrawing
-    // mid-way (a bare pause()/resume() pair couldn't promise that). If no
-    // bar/spinner has been created yet there's nothing to hide, so the
-    // function just runs directly. The multi is cloned out and the
-    // thread-local borrow dropped *before* calling into Luau, since the
-    // function may itself create a new bar (which needs its own borrow).
+    // ui.progress.suspend(fn) -- hide the bars, await fn, redraw. The bars stay
+    // usable inside `fn` (the draw target is hidden, nothing is locked).
     module.set(
         "suspend",
-        lua.create_function(|_, f: mlua::Function| {
-            let multi = MULTI.with(|cell| cell.borrow().clone());
-            match multi {
-                Some(multi) => multi.suspend(|| f.call::<()>(())),
-                None => f.call::<()>(()),
-            }
+        lua.create_async_function(async |_, f: mlua::Function| {
+            let _pause = pause();
+            f.call_async::<()>(()).await
         })?,
     )?;
 
@@ -518,25 +515,79 @@ mod tests {
         .unwrap();
     }
 
+    async fn run(lua: &Lua, code: &str) -> mlua::Result<()> {
+        lua.load(code).exec_async().await
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     #[test]
-    fn suspend_runs_the_function_with_and_without_a_bar() {
+    fn suspend_may_touch_bars_and_nest() {
+        let lua = lua_with_progress();
+        rt().block_on(run(
+            &lua,
+            r#"
+            local b = progress.bar(10, "x")
+            local ran = 0
+            progress.suspend(function()
+                b:inc(2)
+                b:set_message("inside")
+                progress.suspend(function() ran = ran + 1 end)
+                ran = ran + 1
+            end)
+            assert(ran == 2 and b:position() == 2)
+            b:finish_and_clear()
+            progress.suspend(function() ran = 3 end)
+            assert(ran == 3)
+            "#,
+        ))
+        .unwrap();
+        teardown();
+    }
+
+    #[test]
+    fn bad_styles_and_intervals_raise_instead_of_panicking() {
+        let lua = lua_with_progress();
+        for bad in [
+            "progress.style():tick_strings({'x'})",
+            "progress.style():tick_chars('x')",
+            "progress.style():progress_chars('x')",
+            "progress.bar(1):enable_steady_tick(-1)",
+            "progress.bar(1):enable_steady_tick(0)",
+            "progress.bar(1):enable_steady_tick(1e300)",
+        ] {
+            assert!(lua.load(bad).exec().is_err(), "{bad}");
+        }
+        lua.load("progress.bar(1):enable_steady_tick('250ms')")
+            .exec()
+            .unwrap();
+        teardown();
+    }
+
+    #[test]
+    fn inc_defaults_to_one_and_teardown_stops_bars() {
         let lua = lua_with_progress();
         lua.load(
-            r#"
-            local ran = false
-            progress.suspend(function() ran = true end)
-            assert(ran)
-
-            progress.clear()
-            local b = progress.bar(10, "x")
-            ran = false
-            progress.suspend(function() ran = true end)
-            assert(ran)
-            b:finish_and_clear()
-            "#,
+            r##"
+            b = progress.bar(5)
+            b:inc() b:inc()
+            assert(b:position() == 2)
+            b:dec()
+            assert(b:position() == 1)
+            progress.style():progress_chars("#>-")
+            "##,
         )
         .exec()
         .unwrap();
+        let b: UserDataRef<Handle> = lua.globals().get("b").unwrap();
+        assert!(!b.pb.is_finished());
+        teardown();
+        assert!(b.pb.is_finished());
     }
 
     #[test]

@@ -1,102 +1,62 @@
 //! `ui.prompt` — interactive terminal prompts, backed by `dialoguer`.
 //!
-//! Two layers, like `hcl.builder()`/`hcl.block()` beside `hcl.parse`: a
-//! **shorthand** call for the common case, and a **builder** for everything
-//! `dialoguer` exposes on that prompt kind.
+//! The chapter `docs/src/modules/ui-prompt.md` is the surface description.
+//! Implementation notes:
 //!
-//! ```lua
-//! -- shorthand
-//! if ui.prompt.confirm("Deploy to prod?") then ... end
-//! local name = ui.prompt.input("Service name", "web")
+//! - Two layers: a **shorthand** per kind, and a **builder** exposing the
+//!   dialoguer knobs. Both fill the same `*Spec` and run through the same
+//!   `*_run` function, so they cannot drift. Specs hold the script's raw
+//!   values (1-based indices included); everything is validated at
+//!   `:interact()`, so setter call order never matters.
+//! - All prompts run on a blocking thread (`spawn_blocking`): a terminal read
+//!   has no async form and the runtime is single-threaded.
+//! - Prompts are serialised by an async mutex (a terminal has one cursor) and
+//!   run with live `ui.progress` bars paused.
+//! - **Ctrl-C** raises a Luau error: dialoguer/console `raise(SIGINT)` on it,
+//!   so SIGINT is given a no-op handler for the duration of the prompt and the
+//!   read then fails with `Interrupted`. A guard restores the previous handler
+//!   and the cursor however the prompt ends.
+//! - An abandoned prompt (its task cancelled) cannot be interrupted: the
+//!   blocking read keeps going until a key arrives.
+//! - No custom themes, live validators or history/completion: those take Rust
+//!   callbacks run on the reading thread, which a `!Send` Lua cannot serve.
 //!
-//! -- builder: every dialoguer knob, `with_*` chained, `:interact()` finishes
-//! local ok = ui.prompt.confirm_builder()
-//!     :prompt("Deploy to prod?")
-//!     :default(false)
-//!     :wait_for_newline(true)
-//!     :interact()
-//! ```
-//!
-//! | Shorthand | Builder | Returns |
-//! | --- | --- | --- |
-//! | `ui.prompt.confirm(msg[, default])` | `ui.prompt.confirm_builder()` | `bool` |
-//! | `ui.prompt.input(msg[, default])` | `ui.prompt.input_builder()` | `string` |
-//! | `ui.prompt.password(msg[, confirm])` | `ui.prompt.password_builder()` | `string` |
-//! | `ui.prompt.select(msg, items[, default])` | `ui.prompt.select_builder()` | `1`-based index |
-//! | `ui.prompt.multi_select(msg, items[, defaults])` | `ui.prompt.multi_select_builder()` | array of `1`-based indices |
-//!
-//! Each builder is a fresh userdata per call (`ui.prompt.input_builder()`),
-//! carrying the same fields dialoguer's own type does; `with_*`-style
-//! methods here are unprefixed (`:prompt(..)`, `:default(..)`) since the
-//! kind is already in the constructor's name. A terminal `:interact()` (or
-//! `:interact_opt()` on `select`/`multi_select`, which answers `nil` on
-//! Escape instead of raising) consumes the builder and runs the prompt.
-//!
-//! **All prompts block the calling task on the terminal**, so both the
-//! shorthand and the builder's `:interact()` run on a blocking thread via
-//! `spawn_blocking` and are awaited — the same shape `hash.*_file` uses for
-//! a blocking read, and for the same reason: this is the single-threaded
-//! runtime every I/O module shares, and pinning it here would starve every
-//! other `task`. There is no form that runs concurrently with itself, since
-//! a terminal has one cursor.
-//!
-//! **Ctrl-C during a prompt** raises a Luau error (dialoguer reports it as
-//! an I/O interruption) rather than silently returning a default — wrap the
-//! call in `pcall` for "abort gracefully". **Escape** is different: plain
-//! `interact()` also raises for it, but `select`/`multi_select` offer
-//! `:interact_opt()`, which returns `nil` instead — the one gesture
-//! dialoguer itself treats as a first-class "no answer" on those two kinds.
-//!
-//! `select`/`multi_select` index **1-based**, matching every other ito
-//! surface (`path.capture`, `cli` positionals, Luau itself).
-//!
-//! # What's not exposed, and why
-//!
-//! - **Custom themes.** `with_theme` takes a `&dyn Theme` tied to the
-//!   builder's lifetime; a fully custom theme would mean implementing that
-//!   trait from Luau, which mlua has no path for. `:theme("colorful")` /
-//!   `:theme("simple")` cover dialoguer's own two theme types, built fresh
-//!   per `:interact()` rather than borrowed; the default, `:theme("auto")`
-//!   (also what the shorthands use), tracks `ito.colors()` — the same switch
-//!   `string:red()` reads — so a prompt's colour follows `NO_COLOR`/a piped
-//!   stdout/an explicit `ito.colors(false)` like everything else does.
-//! - **Live validators** (`validate_with`) and **history/completion**
-//!   (`Input`'s `history_with`/`completion_with`). All three take a Rust
-//!   closure or trait object invoked *during* the interaction, on whichever
-//!   thread is reading the terminal — here that's a `spawn_blocking` thread,
-//!   and calling back into a `!Send` `mlua::Lua` from it is not something
-//!   mlua supports. The idiomatic replacement is to validate the *result*
-//!   after `:interact()` returns and loop:
-//!   ```lua
-//!   local n
-//!   repeat
-//!       n = tonumber(ui.prompt.input("Port"))
-//!   until n and n > 0 and n < 65536
-//!   ```
-//!
-//! Host-only (`ito`/`irun`): terminal interaction is ambient state a query's
-//! return value or an edit preview must not depend on. See
-//! [`crate::scripting::ui`] for the umbrella module's own rationale.
+//! Host-only (`ito`); see [`crate::scripting::ui`].
 
-use crate::scripting::ansi;
+use crate::scripting::fmt::ansi;
 use dialoguer::theme::{ColorfulTheme, SimpleTheme, Theme};
 use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
-use mlua::{Lua, Result as LuaResult, Table, UserData, UserDataMethods};
+use mlua::{Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
 use std::cell::RefCell;
+use std::io::IsTerminal;
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
-// Theme
+// Shared plumbing
 // ---------------------------------------------------------------------------
 
-/// The theme spellings every builder accepts. A fresh `Box<dyn Theme>` is
-/// built at `:interact()` time rather than held across the builder's life, so
-/// nothing here borrows.
-///
-/// `Auto` (the default) tracks the same switch `string:red()` and friends
-/// read (`ito.colors()`): a prompt is part of the same run's output, so
-/// `NO_COLOR`/a piped stdout/`ito.colors(false)` should turn its colour off
-/// exactly as it does everywhere else, and `:theme(...)` is the explicit
-/// override for a script that wants to disagree.
+/// One prompt at a time.
+static PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A bool argument: `true`/`false` only -- no truthiness coercion.
+fn flag(v: &Value, what: &str) -> LuaResult<bool> {
+    match v {
+        Value::Boolean(b) => Ok(*b),
+        other => Err(mlua::Error::runtime(format!(
+            "ui.prompt: {what} expects a boolean, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// An optional bool argument: `nil` is absent, anything else must be a boolean.
+fn opt_flag(v: Option<Value>, what: &str) -> LuaResult<Option<bool>> {
+    match v {
+        None | Some(Value::Nil) => Ok(None),
+        Some(v) => flag(&v, what).map(Some),
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 enum ThemeChoice {
     #[default]
@@ -117,9 +77,10 @@ impl ThemeChoice {
         }
     }
 
+    /// `auto` tracks `fmt.colors()`, detected against stderr.
     fn build(self) -> Box<dyn Theme> {
         let colorful = match self {
-            ThemeChoice::Auto => ansi::enabled(),
+            ThemeChoice::Auto => ansi::enabled_stderr(),
             ThemeChoice::Simple => false,
             ThemeChoice::Colorful => true,
         };
@@ -131,37 +92,61 @@ impl ThemeChoice {
     }
 }
 
-/// Run a blocking `dialoguer` interaction off the single-threaded runtime,
-/// mapping its `io::Result` (a raised Ctrl-C, or a broken terminal) onto a
-/// Luau error rather than a default value -- a script asking to fall back on
-/// interruption wraps the call in `pcall` itself.
-async fn run_blocking<T, F>(name: &'static str, f: F) -> LuaResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> dialoguer::Result<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| mlua::Error::runtime(format!("ui.prompt.{name}: task failed: {e}")))?
-        .map_err(|e| mlua::Error::runtime(format!("ui.prompt.{name}: {e}")))
+/// Prompts draw on stderr; without a terminal there is nobody to ask.
+fn attended() -> bool {
+    // Tests never prompt.
+    !cfg!(test) && std::io::stderr().is_terminal()
 }
 
-/// Same as [`run_blocking`], for the `_opt` interactions that return
-/// `Option<T>` instead of raising on Escape.
-async fn run_blocking_opt<T, F>(name: &'static str, f: F) -> LuaResult<Option<T>>
+extern "C" fn ignore_sigint(_: libc::c_int) {}
+
+/// While alive: SIGINT is a no-op (so Ctrl-C surfaces as an `Interrupted` read
+/// error instead of killing the process). Dropping restores the previous
+/// handler and shows the cursor dialoguer may have left hidden.
+struct TermGuard(libc::sighandler_t);
+
+impl TermGuard {
+    fn new() -> Self {
+        Self(unsafe { libc::signal(libc::SIGINT, ignore_sigint as *const () as libc::sighandler_t) })
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        unsafe { libc::signal(libc::SIGINT, self.0) };
+        let _ = dialoguer::console::Term::stderr().show_cursor();
+    }
+}
+
+/// Run a dialoguer interaction. `f(opt)` returns `Some` on an answer and
+/// `None` for Escape (only when `opt`). `fallback` is what a non-terminal
+/// session answers (from `:or_default()`), else it is an error.
+async fn run_prompt<T, F>(name: &'static str, fallback: Option<T>, f: F) -> LuaResult<Option<T>>
 where
     T: Send + 'static,
     F: FnOnce() -> dialoguer::Result<Option<T>> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| mlua::Error::runtime(format!("ui.prompt.{name}: task failed: {e}")))?
-        .map_err(|e| mlua::Error::runtime(format!("ui.prompt.{name}: {e}")))
+    if !attended() {
+        return match fallback {
+            Some(v) => Ok(Some(v)),
+            None => Err(mlua::Error::runtime(format!(
+                "ui.prompt.{name}: stderr is not a terminal, so there is nobody to ask \
+                 (give the prompt a default and call :or_default(true) to accept it instead)"
+            ))),
+        };
+    }
+    let _lock = PROMPT_LOCK.lock().await;
+    let _pause = super::progress::pause();
+    tokio::task::spawn_blocking(move || {
+        let _guard = TermGuard::new();
+        f()
+    })
+    .await
+    .map_err(|e| mlua::Error::runtime(format!("ui.prompt.{name}: task failed: {e}")))?
+    .map_err(|e| mlua::Error::runtime(format!("ui.prompt.{name}: {e}")))
 }
 
-/// Validate and convert a 1-based index argument to 0-based, or `None` when
-/// the argument itself was `None`. Shared by `select`'s `default` and
-/// `multi_select`'s `defaults` so the bounds message reads the same either way.
+/// 1-based index argument to 0-based; `None` stays `None`.
 fn to_zero_based(arg_name: &str, one_based: Option<i64>, len: usize) -> LuaResult<Option<usize>> {
     let Some(i) = one_based else { return Ok(None) };
     if i < 1 || i as usize > len {
@@ -182,109 +167,100 @@ fn require_items(name: &'static str, items: &[String]) -> LuaResult<()> {
     }
 }
 
+/// Builder methods every kind shares: `report`, `theme`.
+macro_rules! common_setters {
+    ($m:ident) => {
+        $m.add_method("report", |_, this, v: Value| {
+            this.0.borrow_mut().report = flag(&v, "report")?;
+            Ok(this.clone())
+        });
+        $m.add_method("theme", |_, this, name: String| {
+            this.0.borrow_mut().theme = ThemeChoice::parse(&name)?;
+            Ok(this.clone())
+        });
+    };
+}
+
+/// A boolean setter for field `$f`, exposed as `$name`.
+macro_rules! flag_setter {
+    ($m:ident, $name:literal, $f:ident) => {
+        $m.add_method($name, |_, this, v: Value| {
+            this.0.borrow_mut().$f = flag(&v, $name)?;
+            Ok(this.clone())
+        });
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Confirm
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone)]
 struct ConfirmSpec {
     prompt: String,
     default: Option<bool>,
     show_default: bool,
     wait_for_newline: bool,
     report: bool,
+    or_default: bool,
     theme: ThemeChoice,
 }
 
-struct ConfirmBuilder(RefCell<ConfirmSpec>);
-
-impl ConfirmBuilder {
-    fn new() -> Self {
-        Self(RefCell::new(ConfirmSpec {
+impl Default for ConfirmSpec {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            default: None,
             show_default: true,
+            wait_for_newline: false,
             report: true,
-            ..Default::default()
-        }))
+            or_default: false,
+            theme: ThemeChoice::Auto,
+        }
     }
 }
+
+async fn confirm_run(s: ConfirmSpec, opt: bool) -> LuaResult<Option<bool>> {
+    let fallback = s.default.filter(|_| s.or_default);
+    run_prompt("confirm", fallback, move || {
+        let theme = s.theme.build();
+        let mut p = Confirm::with_theme(theme.as_ref())
+            .with_prompt(s.prompt)
+            .show_default(s.show_default)
+            .wait_for_newline(s.wait_for_newline)
+            .report(s.report);
+        if let Some(d) = s.default {
+            p = p.default(d);
+        }
+        if opt { p.interact_opt() } else { p.interact().map(Some) }
+    })
+    .await
+}
+
+#[derive(Clone)]
+struct ConfirmBuilder(Rc<RefCell<ConfirmSpec>>);
 
 impl UserData for ConfirmBuilder {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("prompt", |_, this, v: String| {
             this.0.borrow_mut().prompt = v;
-            Ok(())
+            Ok(this.clone())
         });
-        methods.add_method("default", |_, this, v: bool| {
-            this.0.borrow_mut().default = Some(v);
-            Ok(())
+        methods.add_method("default", |_, this, v: Value| {
+            this.0.borrow_mut().default = Some(flag(&v, "default")?);
+            Ok(this.clone())
         });
-        methods.add_method("show_default", |_, this, v: bool| {
-            this.0.borrow_mut().show_default = v;
-            Ok(())
-        });
-        methods.add_method("wait_for_newline", |_, this, v: bool| {
-            this.0.borrow_mut().wait_for_newline = v;
-            Ok(())
-        });
-        methods.add_method("report", |_, this, v: bool| {
-            this.0.borrow_mut().report = v;
-            Ok(())
-        });
-        methods.add_method("theme", |_, this, name: String| {
-            this.0.borrow_mut().theme = ThemeChoice::parse(&name)?;
-            Ok(())
-        });
+        flag_setter!(methods, "show_default", show_default);
+        flag_setter!(methods, "wait_for_newline", wait_for_newline);
+        flag_setter!(methods, "or_default", or_default);
+        common_setters!(methods);
         methods.add_async_method("interact", |_, this, ()| async move {
-            let (prompt, default, show_default, wait_for_newline, report, theme) = {
-                let spec = this.0.borrow();
-                (
-                    spec.prompt.clone(),
-                    spec.default,
-                    spec.show_default,
-                    spec.wait_for_newline,
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            run_blocking("confirm", move || {
-                let theme = theme.build();
-                let mut p = Confirm::with_theme(theme.as_ref())
-                    .with_prompt(prompt)
-                    .show_default(show_default)
-                    .wait_for_newline(wait_for_newline)
-                    .report(report);
-                if let Some(d) = default {
-                    p = p.default(d);
-                }
-                p.interact()
-            })
-            .await
+            let spec = this.0.borrow().clone();
+            Ok(confirm_run(spec, false).await?.unwrap_or_default())
         });
         methods.add_async_method("interact_opt", |_, this, ()| async move {
-            let (prompt, default, show_default, wait_for_newline, report, theme) = {
-                let spec = this.0.borrow();
-                (
-                    spec.prompt.clone(),
-                    spec.default,
-                    spec.show_default,
-                    spec.wait_for_newline,
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            run_blocking_opt("confirm", move || {
-                let theme = theme.build();
-                let mut p = Confirm::with_theme(theme.as_ref())
-                    .with_prompt(prompt)
-                    .show_default(show_default)
-                    .wait_for_newline(wait_for_newline)
-                    .report(report);
-                if let Some(d) = default {
-                    p = p.default(d);
-                }
-                p.interact_opt()
-            })
-            .await
+            let spec = this.0.borrow().clone();
+            confirm_run(spec, true).await
         });
     }
 }
@@ -293,7 +269,7 @@ impl UserData for ConfirmBuilder {
 // Input
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone)]
 struct InputSpec {
     prompt: String,
     default: Option<String>,
@@ -302,88 +278,78 @@ struct InputSpec {
     show_default: bool,
     post_completion_text: Option<String>,
     report: bool,
+    or_default: bool,
     theme: ThemeChoice,
 }
 
-struct InputBuilder(RefCell<InputSpec>);
-
-impl InputBuilder {
-    fn new() -> Self {
-        Self(RefCell::new(InputSpec {
+impl Default for InputSpec {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            default: None,
+            initial_text: None,
+            allow_empty: false,
             show_default: true,
+            post_completion_text: None,
             report: true,
-            ..Default::default()
-        }))
+            or_default: false,
+            theme: ThemeChoice::Auto,
+        }
     }
 }
+
+async fn input_run(s: InputSpec) -> LuaResult<String> {
+    let fallback = s.default.clone().filter(|_| s.or_default);
+    let answer = run_prompt("input", fallback, move || {
+        let theme = s.theme.build();
+        let mut p = Input::<String>::with_theme(theme.as_ref())
+            .with_prompt(s.prompt)
+            .allow_empty(s.allow_empty)
+            .show_default(s.show_default)
+            .report(s.report);
+        if let Some(d) = s.default {
+            p = p.default(d);
+        }
+        if let Some(t) = s.initial_text {
+            p = p.with_initial_text(t);
+        }
+        if let Some(t) = s.post_completion_text {
+            p = p.with_post_completion_text(t);
+        }
+        p.interact_text().map(Some)
+    })
+    .await?;
+    Ok(answer.unwrap_or_default())
+}
+
+#[derive(Clone)]
+struct InputBuilder(Rc<RefCell<InputSpec>>);
 
 impl UserData for InputBuilder {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("prompt", |_, this, v: String| {
             this.0.borrow_mut().prompt = v;
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("default", |_, this, v: String| {
             this.0.borrow_mut().default = Some(v);
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("initial_text", |_, this, v: String| {
             this.0.borrow_mut().initial_text = Some(v);
-            Ok(())
-        });
-        methods.add_method("allow_empty", |_, this, v: bool| {
-            this.0.borrow_mut().allow_empty = v;
-            Ok(())
-        });
-        methods.add_method("show_default", |_, this, v: bool| {
-            this.0.borrow_mut().show_default = v;
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("post_completion_text", |_, this, v: String| {
             this.0.borrow_mut().post_completion_text = Some(v);
-            Ok(())
+            Ok(this.clone())
         });
-        methods.add_method("report", |_, this, v: bool| {
-            this.0.borrow_mut().report = v;
-            Ok(())
-        });
-        methods.add_method("theme", |_, this, name: String| {
-            this.0.borrow_mut().theme = ThemeChoice::parse(&name)?;
-            Ok(())
-        });
+        flag_setter!(methods, "allow_empty", allow_empty);
+        flag_setter!(methods, "show_default", show_default);
+        flag_setter!(methods, "or_default", or_default);
+        common_setters!(methods);
         methods.add_async_method("interact", |_, this, ()| async move {
-            let (prompt, default, initial_text, allow_empty, show_default, post, report, theme) = {
-                let spec = this.0.borrow();
-                (
-                    spec.prompt.clone(),
-                    spec.default.clone(),
-                    spec.initial_text.clone(),
-                    spec.allow_empty,
-                    spec.show_default,
-                    spec.post_completion_text.clone(),
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            run_blocking("input", move || {
-                let theme = theme.build();
-                let mut p = Input::<String>::with_theme(theme.as_ref())
-                    .with_prompt(prompt)
-                    .allow_empty(allow_empty)
-                    .show_default(show_default)
-                    .report(report);
-                if let Some(d) = default {
-                    p = p.default(d);
-                }
-                if let Some(t) = initial_text {
-                    p = p.with_initial_text(t);
-                }
-                if let Some(t) = post {
-                    p = p.with_post_completion_text(t);
-                }
-                p.interact_text()
-            })
-            .await
+            let spec = this.0.borrow().clone();
+            input_run(spec).await
         });
     }
 }
@@ -392,7 +358,7 @@ impl UserData for InputBuilder {
 // Password
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone)]
 struct PasswordSpec {
     prompt: String,
     allow_empty_password: bool,
@@ -401,65 +367,55 @@ struct PasswordSpec {
     theme: ThemeChoice,
 }
 
-struct PasswordBuilder(RefCell<PasswordSpec>);
-
-impl PasswordBuilder {
-    fn new() -> Self {
-        Self(RefCell::new(PasswordSpec {
+impl Default for PasswordSpec {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            allow_empty_password: false,
+            confirmation: None,
             report: true,
-            ..Default::default()
-        }))
+            theme: ThemeChoice::Auto,
+        }
     }
 }
+
+async fn password_run(s: PasswordSpec) -> LuaResult<String> {
+    let answer = run_prompt("password", None, move || {
+        let theme = s.theme.build();
+        let mut p = Password::with_theme(theme.as_ref())
+            .with_prompt(s.prompt)
+            .allow_empty_password(s.allow_empty_password)
+            .report(s.report);
+        if let Some((prompt, mismatch)) = s.confirmation {
+            p = p.with_confirmation(prompt, mismatch);
+        }
+        p.interact().map(Some)
+    })
+    .await?;
+    Ok(answer.unwrap_or_default())
+}
+
+#[derive(Clone)]
+struct PasswordBuilder(Rc<RefCell<PasswordSpec>>);
 
 impl UserData for PasswordBuilder {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("prompt", |_, this, v: String| {
             this.0.borrow_mut().prompt = v;
-            Ok(())
+            Ok(this.clone())
         });
-        methods.add_method("allow_empty_password", |_, this, v: bool| {
-            this.0.borrow_mut().allow_empty_password = v;
-            Ok(())
-        });
+        flag_setter!(methods, "allow_empty_password", allow_empty_password);
         methods.add_method(
             "with_confirmation",
             |_, this, (prompt, mismatch_err): (String, String)| {
                 this.0.borrow_mut().confirmation = Some((prompt, mismatch_err));
-                Ok(())
+                Ok(this.clone())
             },
         );
-        methods.add_method("report", |_, this, v: bool| {
-            this.0.borrow_mut().report = v;
-            Ok(())
-        });
-        methods.add_method("theme", |_, this, name: String| {
-            this.0.borrow_mut().theme = ThemeChoice::parse(&name)?;
-            Ok(())
-        });
+        common_setters!(methods);
         methods.add_async_method("interact", |_, this, ()| async move {
-            let (prompt, allow_empty_password, confirmation, report, theme) = {
-                let spec = this.0.borrow();
-                (
-                    spec.prompt.clone(),
-                    spec.allow_empty_password,
-                    spec.confirmation.clone(),
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            run_blocking("password", move || {
-                let theme = theme.build();
-                let mut p = Password::with_theme(theme.as_ref())
-                    .with_prompt(prompt)
-                    .allow_empty_password(allow_empty_password)
-                    .report(report);
-                if let Some((prompt, mismatch)) = confirmation {
-                    p = p.with_confirmation(prompt, mismatch);
-                }
-                p.interact()
-            })
-            .await
+            let spec = this.0.borrow().clone();
+            password_run(spec).await
         });
     }
 }
@@ -468,128 +424,96 @@ impl UserData for PasswordBuilder {
 // Select
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone)]
 struct SelectSpec {
     prompt: Option<String>,
     items: Vec<String>,
-    default: usize,
+    /// 1-based, validated at run time.
+    default: Option<i64>,
     max_length: Option<usize>,
     clear: bool,
     report: bool,
+    or_default: bool,
     theme: ThemeChoice,
 }
 
-struct SelectBuilder(RefCell<SelectSpec>);
-
-impl SelectBuilder {
-    fn new() -> Self {
-        Self(RefCell::new(SelectSpec {
+impl Default for SelectSpec {
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            items: Vec::new(),
+            default: None,
+            max_length: None,
             clear: true,
             report: true,
-            ..Default::default()
-        }))
+            or_default: false,
+            theme: ThemeChoice::Auto,
+        }
     }
 }
+
+/// The chosen 1-based index and its item, or `None` on Escape.
+async fn select_run(s: SelectSpec, opt: bool) -> LuaResult<Option<(i64, String)>> {
+    require_items("select", &s.items)?;
+    let default = to_zero_based("default", s.default, s.items.len())?;
+    let items = s.items.clone();
+    let fallback = default.filter(|_| s.or_default);
+    let index = run_prompt("select", fallback, move || {
+        let theme = s.theme.build();
+        let mut p = Select::with_theme(theme.as_ref())
+            .items(&s.items)
+            .default(default.unwrap_or(0))
+            .clear(s.clear)
+            .report(s.report);
+        if let Some(t) = s.prompt {
+            p = p.with_prompt(t);
+        }
+        if let Some(m) = s.max_length {
+            p = p.max_length(m);
+        }
+        if opt { p.interact_opt() } else { p.interact().map(Some) }
+    })
+    .await?;
+    Ok(index.map(|i| (i as i64 + 1, items[i].clone())))
+}
+
+#[derive(Clone)]
+struct SelectBuilder(Rc<RefCell<SelectSpec>>);
 
 impl UserData for SelectBuilder {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("prompt", |_, this, v: String| {
             this.0.borrow_mut().prompt = Some(v);
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("items", |_, this, v: Vec<String>| {
             this.0.borrow_mut().items = v;
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("item", |_, this, v: String| {
             this.0.borrow_mut().items.push(v);
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("default", |_, this, one_based: i64| {
-            let len = this.0.borrow().items.len();
-            let zero = to_zero_based("default", Some(one_based), len)?.expect("Some in, Some out");
-            this.0.borrow_mut().default = zero;
-            Ok(())
+            this.0.borrow_mut().default = Some(one_based);
+            Ok(this.clone())
         });
         methods.add_method("max_length", |_, this, v: usize| {
             this.0.borrow_mut().max_length = Some(v);
-            Ok(())
+            Ok(this.clone())
         });
-        methods.add_method("clear", |_, this, v: bool| {
-            this.0.borrow_mut().clear = v;
-            Ok(())
-        });
-        methods.add_method("report", |_, this, v: bool| {
-            this.0.borrow_mut().report = v;
-            Ok(())
-        });
-        methods.add_method("theme", |_, this, name: String| {
-            this.0.borrow_mut().theme = ThemeChoice::parse(&name)?;
-            Ok(())
-        });
+        flag_setter!(methods, "clear", clear);
+        flag_setter!(methods, "or_default", or_default);
+        common_setters!(methods);
         methods.add_async_method("interact", |_, this, ()| async move {
-            let (prompt, items, default, max_length, clear, report, theme) = {
-                let spec = this.0.borrow();
-                require_items("select", &spec.items)?;
-                (
-                    spec.prompt.clone(),
-                    spec.items.clone(),
-                    spec.default,
-                    spec.max_length,
-                    spec.clear,
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            let index = run_blocking("select", move || {
-                let theme = theme.build();
-                let mut p = Select::with_theme(theme.as_ref())
-                    .items(&items)
-                    .default(default)
-                    .clear(clear)
-                    .report(report);
-                if let Some(p2) = prompt {
-                    p = p.with_prompt(p2);
-                }
-                if let Some(m) = max_length {
-                    p = p.max_length(m);
-                }
-                p.interact()
-            })
-            .await?;
-            Ok(index as i64 + 1)
+            let spec = this.0.borrow().clone();
+            let (i, item) = select_run(spec, false).await?.unzip();
+            Ok((i, item))
         });
         methods.add_async_method("interact_opt", |_, this, ()| async move {
-            let (prompt, items, default, max_length, clear, report, theme) = {
-                let spec = this.0.borrow();
-                require_items("select", &spec.items)?;
-                (
-                    spec.prompt.clone(),
-                    spec.items.clone(),
-                    spec.default,
-                    spec.max_length,
-                    spec.clear,
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            let index = run_blocking_opt("select", move || {
-                let theme = theme.build();
-                let mut p = Select::with_theme(theme.as_ref())
-                    .items(&items)
-                    .default(default)
-                    .clear(clear)
-                    .report(report);
-                if let Some(p2) = prompt {
-                    p = p.with_prompt(p2);
-                }
-                if let Some(m) = max_length {
-                    p = p.max_length(m);
-                }
-                p.interact_opt()
-            })
-            .await?;
-            Ok(index.map(|i| i as i64 + 1))
+            let spec = this.0.borrow().clone();
+            let (i, item) = select_run(spec, true).await?.unzip();
+            Ok((i, item))
         });
     }
 }
@@ -598,149 +522,108 @@ impl UserData for SelectBuilder {
 // MultiSelect
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone)]
 struct MultiSelectSpec {
     prompt: Option<String>,
     items: Vec<String>,
-    defaults: Vec<bool>,
+    /// Pre-checked, 1-based, validated at run time.
+    checked: Vec<i64>,
+    all: bool,
     max_length: Option<usize>,
     clear: bool,
     report: bool,
     theme: ThemeChoice,
 }
 
-struct MultiSelectBuilder(RefCell<MultiSelectSpec>);
-
-impl MultiSelectBuilder {
-    fn new() -> Self {
-        Self(RefCell::new(MultiSelectSpec {
+impl Default for MultiSelectSpec {
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            items: Vec::new(),
+            checked: Vec::new(),
+            all: false,
+            max_length: None,
             clear: true,
             report: true,
-            ..Default::default()
-        }))
+            theme: ThemeChoice::Auto,
+        }
     }
 }
+
+async fn multi_select_run(s: MultiSelectSpec, opt: bool) -> LuaResult<Option<Vec<i64>>> {
+    require_items("multi_select", &s.items)?;
+    let mut defaults = vec![s.all; s.items.len()];
+    for i in &s.checked {
+        let zero = to_zero_based("checked", Some(*i), s.items.len())?.expect("Some in, Some out");
+        defaults[zero] = true;
+    }
+    let picked = run_prompt("multi_select", None, move || {
+        let theme = s.theme.build();
+        let mut p = MultiSelect::with_theme(theme.as_ref())
+            .items(&s.items)
+            .defaults(&defaults)
+            .clear(s.clear)
+            .report(s.report);
+        if let Some(t) = s.prompt {
+            p = p.with_prompt(t);
+        }
+        if let Some(m) = s.max_length {
+            p = p.max_length(m);
+        }
+        if opt { p.interact_opt() } else { p.interact().map(Some) }
+    })
+    .await?;
+    Ok(picked.map(|v| v.into_iter().map(|i| i as i64 + 1).collect()))
+}
+
+#[derive(Clone)]
+struct MultiSelectBuilder(Rc<RefCell<MultiSelectSpec>>);
 
 impl UserData for MultiSelectBuilder {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("prompt", |_, this, v: String| {
             this.0.borrow_mut().prompt = Some(v);
-            Ok(())
+            Ok(this.clone())
         });
         methods.add_method("items", |_, this, v: Vec<String>| {
-            let mut spec = this.0.borrow_mut();
-            spec.defaults = vec![false; v.len()];
-            spec.items = v;
-            Ok(())
+            this.0.borrow_mut().items = v;
+            Ok(this.clone())
         });
-        methods.add_method("item", |_, this, (v, checked): (String, Option<bool>)| {
+        methods.add_method("item", |_, this, (v, checked): (String, Option<Value>)| {
             let mut spec = this.0.borrow_mut();
             spec.items.push(v);
-            spec.defaults.push(checked.unwrap_or(false));
-            Ok(())
-        });
-        // :checked(i) marks the i'th (1-based) item pre-selected. Plural
-        // `defaults({...})` sets the whole array at once for a caller who
-        // already has the list of indices to check.
-        methods.add_method("checked", |_, this, one_based: i64| {
-            let len = this.0.borrow().items.len();
-            let zero = to_zero_based("checked", Some(one_based), len)?.expect("Some in, Some out");
-            this.0.borrow_mut().defaults[zero] = true;
-            Ok(())
-        });
-        methods.add_method("defaults", |_, this, one_based_list: Vec<i64>| {
-            let len = this.0.borrow().items.len();
-            let mut flags = vec![false; len];
-            for one_based in one_based_list {
-                let zero =
-                    to_zero_based("defaults", Some(one_based), len)?.expect("Some in, Some out");
-                flags[zero] = true;
+            if opt_flag(checked, "item's checked")?.unwrap_or(false) {
+                let n = spec.items.len() as i64;
+                spec.checked.push(n);
             }
-            this.0.borrow_mut().defaults = flags;
-            Ok(())
+            drop(spec);
+            Ok(this.clone())
+        });
+        methods.add_method("checked", |_, this, one_based: i64| {
+            this.0.borrow_mut().checked.push(one_based);
+            Ok(this.clone())
+        });
+        methods.add_method("all", |_, this, ()| {
+            this.0.borrow_mut().all = true;
+            Ok(this.clone())
+        });
+        methods.add_method("defaults", |_, this, list: Vec<i64>| {
+            this.0.borrow_mut().checked = list;
+            Ok(this.clone())
         });
         methods.add_method("max_length", |_, this, v: usize| {
             this.0.borrow_mut().max_length = Some(v);
-            Ok(())
+            Ok(this.clone())
         });
-        methods.add_method("clear", |_, this, v: bool| {
-            this.0.borrow_mut().clear = v;
-            Ok(())
-        });
-        methods.add_method("report", |_, this, v: bool| {
-            this.0.borrow_mut().report = v;
-            Ok(())
-        });
-        methods.add_method("theme", |_, this, name: String| {
-            this.0.borrow_mut().theme = ThemeChoice::parse(&name)?;
-            Ok(())
-        });
+        flag_setter!(methods, "clear", clear);
+        common_setters!(methods);
         methods.add_async_method("interact", |_, this, ()| async move {
-            let (prompt, items, defaults, max_length, clear, report, theme) = {
-                let spec = this.0.borrow();
-                require_items("multi_select", &spec.items)?;
-                (
-                    spec.prompt.clone(),
-                    spec.items.clone(),
-                    spec.defaults.clone(),
-                    spec.max_length,
-                    spec.clear,
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            let indices = run_blocking("multi_select", move || {
-                let theme = theme.build();
-                let mut p = MultiSelect::with_theme(theme.as_ref())
-                    .items(&items)
-                    .defaults(&defaults)
-                    .clear(clear)
-                    .report(report);
-                if let Some(p2) = prompt {
-                    p = p.with_prompt(p2);
-                }
-                if let Some(m) = max_length {
-                    p = p.max_length(m);
-                }
-                p.interact()
-            })
-            .await?;
-            Ok(indices
-                .into_iter()
-                .map(|i| i as i64 + 1)
-                .collect::<Vec<_>>())
+            let spec = this.0.borrow().clone();
+            Ok(multi_select_run(spec, false).await?.unwrap_or_default())
         });
         methods.add_async_method("interact_opt", |_, this, ()| async move {
-            let (prompt, items, defaults, max_length, clear, report, theme) = {
-                let spec = this.0.borrow();
-                require_items("multi_select", &spec.items)?;
-                (
-                    spec.prompt.clone(),
-                    spec.items.clone(),
-                    spec.defaults.clone(),
-                    spec.max_length,
-                    spec.clear,
-                    spec.report,
-                    spec.theme,
-                )
-            };
-            let indices = run_blocking_opt("multi_select", move || {
-                let theme = theme.build();
-                let mut p = MultiSelect::with_theme(theme.as_ref())
-                    .items(&items)
-                    .defaults(&defaults)
-                    .clear(clear)
-                    .report(report);
-                if let Some(p2) = prompt {
-                    p = p.with_prompt(p2);
-                }
-                if let Some(m) = max_length {
-                    p = p.max_length(m);
-                }
-                p.interact_opt()
-            })
-            .await?;
-            Ok(indices.map(|v| v.into_iter().map(|i| i as i64 + 1).collect::<Vec<_>>()))
+            let spec = this.0.borrow().clone();
+            multi_select_run(spec, true).await
         });
     }
 }
@@ -753,130 +636,104 @@ impl UserData for MultiSelectBuilder {
 pub fn module(lua: &Lua) -> LuaResult<Table> {
     let module = lua.create_table()?;
 
-    // ---- shorthands --------------------------------------------------
-
-    // Shorthands build against `ThemeChoice::Auto` -- the same `ito.colors()`
-    // switch every other module's output tracks -- rather than dialoguer's own
-    // default `SimpleTheme`, so a prompt's colour follows the run the way
-    // `string:red()` does. A script wanting the other themes uses the builder.
+    // Shorthands fill the same specs as the builders, with the auto theme.
     module.set(
         "confirm",
-        lua.create_async_function(|_, (msg, default): (String, Option<bool>)| async move {
-            run_blocking("confirm", move || {
-                let theme = ThemeChoice::Auto.build();
-                let mut p = Confirm::with_theme(theme.as_ref()).with_prompt(msg);
-                if let Some(d) = default {
-                    p = p.default(d);
-                }
-                p.interact()
-            })
-            .await
+        lua.create_async_function(async |_, (msg, default): (String, Option<Value>)| {
+            let default = opt_flag(default, "default")?;
+            let spec = ConfirmSpec {
+                prompt: msg,
+                default,
+                ..Default::default()
+            };
+            Ok(confirm_run(spec, false).await?.unwrap_or_default())
         })?,
     )?;
-
     module.set(
         "input",
-        lua.create_async_function(|_, (msg, default): (String, Option<String>)| async move {
-            run_blocking("input", move || {
-                let theme = ThemeChoice::Auto.build();
-                let mut p = Input::<String>::with_theme(theme.as_ref()).with_prompt(msg);
-                if let Some(d) = default {
-                    p = p.default(d);
-                }
-                p.interact_text()
+        lua.create_async_function(async |_, (msg, default): (String, Option<String>)| {
+            input_run(InputSpec {
+                prompt: msg,
+                default,
+                ..Default::default()
             })
             .await
         })?,
     )?;
-
     module.set(
         "password",
-        lua.create_async_function(|_, (msg, confirm): (String, Option<bool>)| async move {
-            run_blocking("password", move || {
-                let theme = ThemeChoice::Auto.build();
-                let mut p = Password::with_theme(theme.as_ref()).with_prompt(msg);
-                if confirm.unwrap_or(false) {
-                    p = p.with_confirmation("Confirm", "passwords didn't match");
-                }
-                p.interact()
+        lua.create_async_function(async |_, (msg, confirm): (String, Option<Value>)| {
+            let confirm = opt_flag(confirm, "confirm")?.unwrap_or(false);
+            password_run(PasswordSpec {
+                prompt: msg,
+                confirmation: confirm
+                    .then(|| ("Confirm".to_string(), "passwords didn't match".to_string())),
+                ..Default::default()
             })
             .await
         })?,
     )?;
-
     module.set(
         "select",
         lua.create_async_function(
-            |_, (msg, items, default): (String, Vec<String>, Option<i64>)| async move {
-                require_items("select", &items)?;
-                let default = to_zero_based("default", default, items.len())?;
-                let index = run_blocking("select", move || {
-                    let theme = ThemeChoice::Auto.build();
-                    let mut p = Select::with_theme(theme.as_ref())
-                        .with_prompt(msg)
-                        .items(&items);
-                    if let Some(d) = default {
-                        p = p.default(d);
-                    }
-                    p.interact()
-                })
-                .await?;
-                Ok(index as i64 + 1)
+            async |_, (msg, items, default): (String, Vec<String>, Option<i64>)| {
+                let spec = SelectSpec {
+                    prompt: Some(msg),
+                    items,
+                    default,
+                    ..Default::default()
+                };
+                let (i, item) = select_run(spec, false).await?.unzip();
+                Ok((i, item))
             },
         )?,
     )?;
-
     module.set(
         "multi_select",
         lua.create_async_function(
-            |_, (msg, items, defaults): (String, Vec<String>, Option<Vec<i64>>)| async move {
-                require_items("multi_select", &items)?;
-                let mut checked = vec![false; items.len()];
-                if let Some(defaults) = defaults {
-                    for one_based in defaults {
-                        let zero = to_zero_based("defaults", Some(one_based), items.len())?
-                            .expect("Some(_) in, Some(_) out");
-                        checked[zero] = true;
-                    }
-                }
-                let indices = run_blocking("multi_select", move || {
-                    let theme = ThemeChoice::Auto.build();
-                    MultiSelect::with_theme(theme.as_ref())
-                        .with_prompt(msg)
-                        .items(&items)
-                        .defaults(&checked)
-                        .interact()
-                })
-                .await?;
-                Ok(indices
-                    .into_iter()
-                    .map(|i| i as i64 + 1)
-                    .collect::<Vec<_>>())
+            async |_, (msg, items, defaults): (String, Vec<String>, Option<Vec<i64>>)| {
+                let spec = MultiSelectSpec {
+                    prompt: Some(msg),
+                    items,
+                    checked: defaults.unwrap_or_default(),
+                    ..Default::default()
+                };
+                Ok(multi_select_run(spec, false).await?.unwrap_or_default())
             },
         )?,
     )?;
 
-    // ---- builders ------------------------------------------------------
-
     module.set(
         "confirm_builder",
-        lua.create_function(|_, ()| Ok(ConfirmBuilder::new()))?,
+        lua.create_function(|_, ()| {
+            Ok(ConfirmBuilder(Rc::new(RefCell::new(ConfirmSpec::default()))))
+        })?,
     )?;
     module.set(
         "input_builder",
-        lua.create_function(|_, ()| Ok(InputBuilder::new()))?,
+        lua.create_function(|_, ()| Ok(InputBuilder(Rc::new(RefCell::new(InputSpec::default())))))?,
     )?;
     module.set(
         "password_builder",
-        lua.create_function(|_, ()| Ok(PasswordBuilder::new()))?,
+        lua.create_function(|_, ()| {
+            Ok(PasswordBuilder(Rc::new(RefCell::new(
+                PasswordSpec::default(),
+            ))))
+        })?,
     )?;
     module.set(
         "select_builder",
-        lua.create_function(|_, ()| Ok(SelectBuilder::new()))?,
+        lua.create_function(|_, ()| {
+            Ok(SelectBuilder(Rc::new(RefCell::new(SelectSpec::default()))))
+        })?,
     )?;
     module.set(
         "multi_select_builder",
-        lua.create_function(|_, ()| Ok(MultiSelectBuilder::new()))?,
+        lua.create_function(|_, ()| {
+            Ok(MultiSelectBuilder(Rc::new(RefCell::new(
+                MultiSelectSpec::default(),
+            ))))
+        })?,
     )?;
 
     Ok(module)
@@ -886,9 +743,8 @@ pub fn module(lua: &Lua) -> LuaResult<Table> {
 mod tests {
     use super::*;
 
-    /// `select`/`multi_select` validate bounds before ever touching the
-    /// terminal, so those paths are testable with no TTY at all; the async
-    /// functions still need a runtime to drive `exec_async`.
+    /// Validation happens before the terminal is touched, and tests are never
+    /// "attended", so everything here runs without a TTY.
     fn eval(script: &str) -> LuaResult<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -903,67 +759,80 @@ mod tests {
         })
     }
 
+    fn fails(script: &str, needle: &str) {
+        let err = eval(script).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+    }
+
     #[test]
     fn select_rejects_empty_items() {
-        let err = eval(r#"prompt.select("x", {})"#).unwrap_err();
-        assert!(err.to_string().contains("items must not be empty"), "{err}");
+        fails(r#"prompt.select("x", {})"#, "items must not be empty");
     }
 
     #[test]
     fn select_rejects_out_of_range_default() {
-        let err = eval(r#"prompt.select("x", {"a", "b"}, 3)"#).unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
-        let err = eval(r#"prompt.select("x", {"a", "b"}, 0)"#).unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+        fails(r#"prompt.select("x", {"a", "b"}, 3)"#, "out of range");
+        fails(r#"prompt.select("x", {"a", "b"}, 0)"#, "out of range");
     }
 
     #[test]
-    fn multi_select_rejects_empty_items() {
-        let err = eval(r#"prompt.multi_select("x", {})"#).unwrap_err();
-        assert!(err.to_string().contains("items must not be empty"), "{err}");
-    }
-
-    #[test]
-    fn multi_select_rejects_out_of_range_defaults() {
-        let err = eval(r#"prompt.multi_select("x", {"a", "b"}, {1, 5})"#).unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+    fn multi_select_validation() {
+        fails(r#"prompt.multi_select("x", {})"#, "items must not be empty");
+        fails(r#"prompt.multi_select("x", {"a", "b"}, {1, 5})"#, "out of range");
     }
 
     #[test]
     fn builder_rejects_unknown_theme() {
-        let err = eval(r#"prompt.confirm_builder():theme("neon")"#).unwrap_err();
-        assert!(err.to_string().contains("unknown theme"), "{err}");
+        fails(r#"prompt.confirm_builder():theme("neon")"#, "unknown theme");
     }
 
     #[test]
-    fn builder_select_validates_default_bounds_before_interact() {
-        let err = eval(
-            r#"
-            local b = prompt.select_builder()
-            b:items({"a", "b"})
-            b:default(9)
-            "#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+    fn index_validation_is_deferred_to_interact_so_order_is_free() {
+        // default before items is fine; the bound is checked when it runs.
+        fails(
+            r#"prompt.select_builder():default(2):items({"a"}):interact()"#,
+            "out of range",
+        );
+        fails(
+            r#"prompt.multi_select_builder():checked(3):items({"a"}):interact()"#,
+            "out of range",
+        );
+        fails(r#"prompt.select_builder():interact()"#, "items must not be empty");
     }
 
     #[test]
-    fn builder_select_interact_rejects_empty_items() {
-        let err = eval(r#"prompt.select_builder():interact()"#).unwrap_err();
-        assert!(err.to_string().contains("items must not be empty"), "{err}");
+    fn bools_are_not_coerced() {
+        fails(r#"prompt.confirm_builder():report("false")"#, "expects a boolean");
+        fails(r#"prompt.confirm_builder():default(1)"#, "expects a boolean");
+        fails(r#"prompt.confirm("x", "yes")"#, "expects a boolean");
+        fails(r#"prompt.password("x", 1)"#, "expects a boolean");
+        fails(r#"prompt.select_builder():clear(nil)"#, "expects a boolean");
     }
 
     #[test]
-    fn builder_multi_select_checked_and_defaults() {
-        // No :interact() here (needs a TTY); this just exercises the spec
-        // mutation paths for bounds-checking.
+    fn no_terminal_is_a_clear_error_unless_or_default() {
+        fails(r#"prompt.confirm("go?")"#, "not a terminal");
+        fails(r#"prompt.input_builder():prompt("n"):or_default(true):interact()"#, "not a terminal");
         eval(
             r#"
-            local b = prompt.multi_select_builder()
-            b:items({"a", "b", "c"})
-            b:checked(2)
-            b:defaults({1, 3})
+            assert(prompt.confirm_builder():default(true):or_default(true):interact() == true)
+            assert(prompt.input_builder():default("web"):or_default(true):interact() == "web")
+            local i, item = prompt.select_builder():items({"a", "b"}):default(2):or_default(true):interact()
+            assert(i == 2 and item == "b")
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn builders_chain() {
+        eval(
+            r#"
+            prompt.confirm_builder():prompt("go?"):default(true):wait_for_newline(true):report(false)
+            prompt.input_builder():prompt("name"):default("web"):allow_empty(true)
+            prompt.select_builder():items({"a", "b"}):prompt("pick"):default(2)
+            prompt.multi_select_builder():items({"a", "b", "c"}):all():checked(2):defaults({1, 3})
+            prompt.multi_select_builder():item("a", true):item("b")
             "#,
         )
         .unwrap();

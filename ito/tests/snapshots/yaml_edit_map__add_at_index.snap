@@ -1,0 +1,8 @@
+---
+source: ito/tests/yaml_edit_map.rs
+assertion_line: 79
+expression: "eval(\"a: 1\\nc: 3\\n\",\nr#\"local s = yaml.edit(subject) s:doc():add_at(2, \"b\", 2) return s:to_string()\"#)"
+---
+a: 1
+b: 2
+c: 3

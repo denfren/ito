@@ -85,9 +85,9 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::types::{Bucket, DeleteMarkerEntry, Object, ObjectVersion, Tag, Tagging};
-use aws_smithy_types::date_time::Format;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use mlua::{
     AnyUserData, Lua, LuaSerdeExt, MultiValue, Result as LuaResult, Table, UserData,
@@ -96,14 +96,8 @@ use mlua::{
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use super::{BoxError, ClientSource, lua_err};
+use super::{BoxError, ClientSource, array, date_to_string, err_in, lua_err};
 use crate::scripting::redirect::{Redirect, capture_to_value, open_shared_file};
-
-/// Format a timestamp as RFC 3339, which keeps it comparable and printable in
-/// Luau, which has no native date type.
-fn date_to_string(dt: &aws_smithy_types::DateTime) -> Option<String> {
-    dt.fmt(Format::DateTime).ok()
-}
 
 /// The `{ ok = .. }` envelope every operation returns as its first value.
 fn envelope(lua: &Lua, ok: bool) -> LuaResult<Table> {
@@ -131,7 +125,7 @@ fn target_from_value(value: &Value) -> LuaResult<Option<Redirect>> {
         }
     };
     match redirect {
-        Redirect::Inherit(_) | Redirect::SameAsOther => Err(mlua::Error::runtime(
+        Redirect::Inherit(_) | Redirect::AliasStdout | Redirect::AliasStderr => Err(mlua::Error::runtime(
             "expected a body target (proc.string(), proc.buffer(), proc.file(path) \
              or proc.null())",
         )),
@@ -149,14 +143,14 @@ async fn deliver_bytes(lua: &Lua, target: &Redirect, bytes: &[u8]) -> LuaResult<
     match target {
         Redirect::Capture { kind, .. } => capture_to_value(lua, *kind, bytes),
         Redirect::Null => Ok(Value::Nil),
-        Redirect::File { path, file } => {
-            let handle = open_shared_file(path, file)?;
+        Redirect::File { path, file, append } => {
+            let handle = open_shared_file(path, file, *append)?;
             write_all_blocking(handle, bytes.to_vec(), path).await?;
             Ok(Value::String(
                 lua.create_string(path.to_string_lossy().as_bytes())?,
             ))
         }
-        Redirect::Inherit(_) | Redirect::SameAsOther => {
+        Redirect::Inherit(_) | Redirect::AliasStdout | Redirect::AliasStderr => {
             unreachable!("rejected by target_from_value")
         }
     }
@@ -212,6 +206,17 @@ async fn respond(
     Ok(MultiValue::from_vec(vec![Value::Table(env), second]))
 }
 
+/// `max_keys` must be a positive count; S3 would otherwise answer one entry.
+fn check_max_keys(n: &i32) -> LuaResult<()> {
+    if *n <= 0 {
+        return Err(err_in(
+            "aws.s3:max_keys",
+            format!("expected a positive count, got {n}"),
+        ));
+    }
+    Ok(())
+}
+
 // --- list_buckets ----------------------------------------------------------
 
 /// Builder for `ListBuckets`. Takes no arguments; it exists so that every
@@ -244,7 +249,7 @@ impl UserData for ListBuckets {
 
                 // A missing bucket list is not a thing; anything that could make
                 // this fail has already raised.
-                respond(&lua, true, Value::Table(buckets), target).await
+                respond(&lua, true, Value::Table(array(&lua, buckets)), target).await
             },
         );
     }
@@ -307,6 +312,7 @@ impl UserData for ListObjects {
         // A cap on total keys, for the "just show me some" case. Pagination is
         // otherwise followed to exhaustion.
         methods.add_function("max_keys", |_, (ud, v): (AnyUserData, i32)| {
+            check_max_keys(&v)?;
             ud.borrow::<Self>()?.state.lock().unwrap().max_keys = Some(v);
             Ok(ud)
         });
@@ -330,6 +336,10 @@ impl UserData for ListObjects {
                 if let Some(v) = &state.start_after {
                     req = req.start_after(v);
                 }
+                // Page size: no point fetching more than the cap.
+                if let Some(n) = state.max_keys {
+                    req = req.max_keys(n.min(1000));
+                }
 
                 let objects = lua.create_table()?;
                 let prefixes = lua.create_table()?;
@@ -343,28 +353,33 @@ impl UserData for ListObjects {
                     // result, which covers "nothing there".
                     let page = page.map_err(|e| lua_err(BoxError::from(e)))?;
 
+                    // The cap is on objects, counted here: `max_keys` on the
+                    // request only sizes each *page*.
                     for object in page.contents.unwrap_or_default() {
+                        if state.max_keys.is_some_and(|max| n_objects >= max) {
+                            break;
+                        }
                         n_objects += 1;
                         objects.raw_set(n_objects, object_to_table(&lua, object)?)?;
-                        // Checked here rather than via `max_keys` on the request:
-                        // that caps each *page*, not the total.
-                        if state.max_keys.is_some_and(|max| n_objects >= max) {
-                            break 'pages;
-                        }
                     }
 
+                    // The page's prefixes are kept even when the cap cuts its
+                    // objects short, so a delimiter listing never loses them.
                     for cp in page.common_prefixes.unwrap_or_default() {
                         if let Some(p) = cp.prefix {
                             n_prefixes += 1;
                             prefixes.raw_set(n_prefixes, p)?;
                         }
                     }
+                    if state.max_keys.is_some_and(|max| n_objects >= max) {
+                        break 'pages;
+                    }
                 }
 
                 // Both keys are always present, so neither needs a nil guard.
                 let data = lua.create_table()?;
-                data.raw_set("objects", objects)?;
-                data.raw_set("common_prefixes", prefixes)?;
+                data.raw_set("objects", array(&lua, objects))?;
+                data.raw_set("common_prefixes", array(&lua, prefixes))?;
 
                 respond(&lua, true, Value::Table(data), target).await
             },
@@ -448,6 +463,7 @@ impl UserData for ListObjectVersions {
         // that is what S3's own `max-keys` bounds per page, and counting them
         // separately would make the limit depend on the mix.
         methods.add_function("max_keys", |_, (ud, v): (AnyUserData, i32)| {
+            check_max_keys(&v)?;
             ud.borrow::<Self>()?.state.lock().unwrap().max_keys = Some(v);
             Ok(ud)
         });
@@ -487,30 +503,44 @@ impl UserData for ListObjectVersions {
                     if let Some(v) = &version_id_marker {
                         req = req.version_id_marker(v);
                     }
+                    if let Some(n) = state.max_keys {
+                        req = req.max_keys(n.min(1000));
+                    }
 
                     // A missing bucket raises, as for every other listing: it is
                     // a bug in the script's input, not an answer.
                     let page = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
 
-                    for version in page.versions.unwrap_or_default() {
-                        n_versions += 1;
-                        versions.raw_set(n_versions, version_to_table(&lua, version)?)?;
-                        if state
-                            .max_keys
-                            .is_some_and(|max| n_versions + n_markers >= max)
-                        {
-                            break 'pages;
-                        }
+                    // S3 returns versions and markers as two lists; merged back
+                    // into key order (stable, so each list keeps its own
+                    // newest-first order) so a cap keeps a key-ordered prefix
+                    // rather than all versions before any marker.
+                    let mut entries: Vec<(String, Result<ObjectVersion, DeleteMarkerEntry>)> =
+                        Vec::new();
+                    for v in page.versions.unwrap_or_default() {
+                        entries.push((v.key.clone().unwrap_or_default(), Ok(v)));
                     }
-
-                    for marker in page.delete_markers.unwrap_or_default() {
-                        n_markers += 1;
-                        delete_markers.raw_set(n_markers, delete_marker_to_table(&lua, marker)?)?;
+                    for m in page.delete_markers.unwrap_or_default() {
+                        entries.push((m.key.clone().unwrap_or_default(), Err(m)));
+                    }
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (_, entry) in entries {
                         if state
                             .max_keys
                             .is_some_and(|max| n_versions + n_markers >= max)
                         {
-                            break 'pages;
+                            break;
+                        }
+                        match entry {
+                            Ok(version) => {
+                                n_versions += 1;
+                                versions.raw_set(n_versions, version_to_table(&lua, version)?)?;
+                            }
+                            Err(marker) => {
+                                n_markers += 1;
+                                delete_markers
+                                    .raw_set(n_markers, delete_marker_to_table(&lua, marker)?)?;
+                            }
                         }
                     }
 
@@ -519,6 +549,12 @@ impl UserData for ListObjectVersions {
                             n_prefixes += 1;
                             prefixes.raw_set(n_prefixes, p)?;
                         }
+                    }
+                    if state
+                        .max_keys
+                        .is_some_and(|max| n_versions + n_markers >= max)
+                    {
+                        break 'pages;
                     }
 
                     if page.is_truncated != Some(true) {
@@ -536,9 +572,9 @@ impl UserData for ListObjectVersions {
 
                 // All three keys are always present, so none needs a nil guard.
                 let data = lua.create_table()?;
-                data.raw_set("versions", versions)?;
-                data.raw_set("delete_markers", delete_markers)?;
-                data.raw_set("common_prefixes", prefixes)?;
+                data.raw_set("versions", array(&lua, versions))?;
+                data.raw_set("delete_markers", array(&lua, delete_markers))?;
+                data.raw_set("common_prefixes", array(&lua, prefixes))?;
 
                 respond(&lua, true, Value::Table(data), target).await
             },
@@ -620,7 +656,7 @@ impl UserData for HeadObject {
                     )
                 };
 
-                let mut req = client.head_object().bucket(bucket).key(key);
+                let mut req = client.head_object().bucket(bucket.clone()).key(key);
                 if let Some(v) = version_id {
                     req = req.version_id(v);
                 }
@@ -633,6 +669,19 @@ impl UserData for HeadObject {
                     Err(SdkError::ServiceError(e))
                         if matches!(e.err(), HeadObjectError::NotFound(_)) =>
                     {
+                        // The same `NotFound` also answers a missing *bucket*,
+                        // which is a bug in the script's input and raises. One
+                        // more request, paid only on this path; any other
+                        // outcome (403 without ListBucket, say) stays "no key".
+                        if let Err(SdkError::ServiceError(b)) =
+                            client.head_bucket().bucket(&bucket).send().await
+                            && matches!(b.err(), HeadBucketError::NotFound(_))
+                        {
+                            return Err(err_in(
+                                "head_object",
+                                format!("bucket '{bucket}' does not exist"),
+                            ));
+                        }
                         return respond(&lua, false, Value::Nil, target).await;
                     }
                     Err(e) => return Err(lua_err(BoxError::from(e))),
@@ -680,6 +729,7 @@ struct GetObject {
     key: String,
     version_id: Arc<Mutex<Option<String>>>,
     range: Arc<Mutex<Option<String>>>,
+    parse: Arc<Mutex<Option<String>>>,
 }
 
 impl UserData for GetObject {
@@ -695,11 +745,19 @@ impl UserData for GetObject {
             Ok(ud)
         });
 
+        // Parse the body as `"json"`, `"yaml"` or `"toml"` instead of returning
+        // the raw string; a body that does not parse raises.
+        methods.add_function("parse", |_, (ud, fmt): (AnyUserData, String)| {
+            parse_format(&fmt)?;
+            *ud.borrow::<Self>()?.parse.lock().unwrap() = Some(fmt);
+            Ok(ud)
+        });
+
         methods.add_async_function(
             "send",
             |lua, (ud, target): (AnyUserData, Value)| async move {
                 let target = target_from_value(&target)?;
-                let (client, bucket, key, version_id, range) = {
+                let (client, bucket, key, version_id, range, parse) = {
                     let this = ud.borrow::<Self>()?;
                     (
                         this.client.clone(),
@@ -707,6 +765,7 @@ impl UserData for GetObject {
                         this.key.clone(),
                         this.version_id.lock().unwrap().clone(),
                         this.range.lock().unwrap().clone(),
+                        this.parse.lock().unwrap().clone(),
                     )
                 };
 
@@ -748,7 +807,6 @@ impl UserData for GetObject {
                     env.raw_set("last_modified", v)?;
                 }
 
-                let content_type = out.content_type.clone();
                 let mut body = out.body;
 
                 let second = match target {
@@ -761,7 +819,7 @@ impl UserData for GetObject {
                             .await
                             .map_err(|e| lua_err(BoxError::from(e)))?
                             .into_bytes();
-                        parse_body(&lua, content_type.as_deref(), &bytes)?
+                        parse_body(&lua, parse.as_deref(), &bytes)?
                     }
                     Some(Redirect::Capture { kind, .. }) => {
                         let bytes = body
@@ -781,8 +839,8 @@ impl UserData for GetObject {
                     }
                     // Written chunk by chunk as it arrives, so a large object
                     // never has to fit in memory.
-                    Some(Redirect::File { path, file }) => {
-                        let mut handle = Some(open_shared_file(&path, &file)?);
+                    Some(Redirect::File { path, file, append }) => {
+                        let mut handle = Some(open_shared_file(&path, &file, append)?);
                         while let Some(chunk) = body.next().await {
                             let chunk = chunk.map_err(|e| lua_err(BoxError::from(e)))?;
                             let f = handle.take().expect("handle round-trips each chunk");
@@ -790,7 +848,7 @@ impl UserData for GetObject {
                         }
                         Value::String(lua.create_string(path.to_string_lossy().as_bytes())?)
                     }
-                    Some(Redirect::Inherit(_) | Redirect::SameAsOther) => {
+                    Some(Redirect::Inherit(_) | Redirect::AliasStdout | Redirect::AliasStderr) => {
                         unreachable!("rejected by target_from_value")
                     }
                 };
@@ -801,47 +859,49 @@ impl UserData for GetObject {
     }
 }
 
-/// Turn a body into Luau data, using the content type S3 reported.
-///
-/// Parsing is best-effort by design: a body whose type claims JSON but does not
-/// parse comes back as the string, so a fetch never fails over a header the
-/// uploader controls.
-fn parse_body(lua: &Lua, content_type: Option<&str>, bytes: &[u8]) -> LuaResult<Value> {
-    // The type may carry parameters (`application/json; charset=utf-8`).
-    let base = content_type
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-
-    let text = std::str::from_utf8(bytes).ok();
-    if let Some(text) = text {
-        let parsed = match base.as_str() {
-            "application/json" | "text/json" => serde_json::from_str::<serde_json::Value>(text)
-                .ok()
-                .and_then(|v| lua.to_value(&v).ok()),
-            "application/yaml" | "text/yaml" | "application/x-yaml" | "text/x-yaml" => {
-                yamlito::parse(text)
-                    .ok()
-                    .and_then(|tree| yamlito::Yaml::from_tree(&tree).ok())
-                    .and_then(|v| lua.to_value(&v).ok())
-            }
-            "application/toml" | "text/toml" => text
-                .parse::<::toml::Value>()
-                .ok()
-                .and_then(|v| lua.to_value(&v).ok()),
-            _ => None,
-        };
-        if let Some(value) = parsed {
-            return Ok(value);
-        }
+/// Validate a `:parse()` format name.
+fn parse_format(fmt: &str) -> LuaResult<&str> {
+    match fmt {
+        "json" | "yaml" | "toml" => Ok(fmt),
+        other => Err(err_in(
+            "aws.s3:parse",
+            format!("unknown format '{other}', expected \"json\", \"yaml\" or \"toml\""),
+        )),
     }
+}
 
-    // Not a parseable type, not valid UTF-8, or malformed: hand back the bytes.
-    // A Luau string is 8-bit clean, so binary survives intact.
-    Ok(Value::String(lua.create_string(bytes)?))
+/// Turn a body into Luau data: the raw string unless `format` (set by
+/// `:parse()`) names a codec. The return type never depends on what the uploader
+/// put in `Content-Type`; a body that does not parse as the requested format
+/// raises.
+fn parse_body(lua: &Lua, format: Option<&str>, bytes: &[u8]) -> LuaResult<Value> {
+    let Some(format) = format else {
+        // A Luau string is 8-bit clean, so binary survives intact.
+        return Ok(Value::String(lua.create_string(bytes)?));
+    };
+    let format = parse_format(format)?;
+    let fail = |e: String| {
+        err_in(
+            "get_object:parse",
+            format!("body is not valid {format}: {e}"),
+        )
+    };
+    let text = std::str::from_utf8(bytes).map_err(|e| fail(e.to_string()))?;
+    match format {
+        "json" => lua.to_value(
+            &serde_json::from_str::<serde_json::Value>(text).map_err(|e| fail(e.to_string()))?,
+        ),
+        "yaml" => {
+            let tree = yamlito::parse(text).map_err(|e| fail(format!("{e:?}")))?;
+            let v = yamlito::Yaml::from_tree(&tree).map_err(|e| fail(format!("{e:?}")))?;
+            lua.to_value(&v)
+        }
+        _ => lua.to_value(
+            &text
+                .parse::<::toml::Value>()
+                .map_err(|e| fail(e.to_string()))?,
+        ),
+    }
 }
 
 // --- tagging ---------------------------------------------------------------
@@ -914,6 +974,18 @@ fn require_non_empty(what: &str, value: &str) -> LuaResult<()> {
     Ok(())
 }
 
+/// Tagging sends take no body target; one passed anyway raises instead of being
+/// silently ignored.
+fn no_target(extra: &Value) -> LuaResult<()> {
+    if extra.is_nil() {
+        return Ok(());
+    }
+    Err(err_in(
+        "aws.s3",
+        "tagging operations take no :send() target (there is no body to redirect)",
+    ))
+}
+
 /// `(envelope, data)` for the tagging operations.
 ///
 /// Tagging has no body to stream — the result is a handful of string pairs — so
@@ -938,33 +1010,43 @@ impl UserData for GetObjectTagging {
             Ok(ud)
         });
 
-        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, bucket, key, version_id) = {
-                let this = ud.borrow::<Self>()?;
-                (
-                    this.client.clone(),
-                    this.bucket.clone(),
-                    this.key.clone(),
-                    this.version_id.lock().unwrap().clone(),
-                )
-            };
+        methods.add_async_function(
+            "send",
+            |lua, (ud, extra): (AnyUserData, Value)| async move {
+                no_target(&extra)?;
+                let (client, bucket, key, version_id) = {
+                    let this = ud.borrow::<Self>()?;
+                    (
+                        this.client.clone(),
+                        this.bucket.clone(),
+                        this.key.clone(),
+                        this.version_id.lock().unwrap().clone(),
+                    )
+                };
 
-            let mut req = client.get_object_tagging().bucket(bucket).key(key);
-            if let Some(v) = version_id {
-                req = req.version_id(v);
-            }
+                let mut req = client.get_object_tagging().bucket(bucket).key(key);
+                if let Some(v) = version_id {
+                    req = req.version_id(v);
+                }
 
-            // A missing key or bucket raises: unlike `head_object`, this is not
-            // an existence question, so there is no false `ok` to report.
-            let out = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
+                // A missing key is `ok = false` like `head_object`/`get_object`; a
+                // missing bucket still raises.
+                let out = match req.send().await {
+                    Ok(out) => out,
+                    Err(SdkError::ServiceError(e)) if e.err().code() == Some("NoSuchKey") => {
+                        return tagging_result(envelope(&lua, false)?, Value::Nil);
+                    }
+                    Err(e) => return Err(lua_err(BoxError::from(e))),
+                };
 
-            let env = envelope(&lua, true)?;
-            if let Some(v) = &out.version_id {
-                env.raw_set("version_id", v.clone())?;
-            }
-            let tags = tag_set_to_table(&lua, out.tag_set())?;
-            tagging_result(env, Value::Table(tags))
-        });
+                let env = envelope(&lua, true)?;
+                if let Some(v) = &out.version_id {
+                    env.raw_set("version_id", v.clone())?;
+                }
+                let tags = tag_set_to_table(&lua, out.tag_set())?;
+                tagging_result(env, Value::Table(tags))
+            },
+        );
     }
 }
 
@@ -992,47 +1074,51 @@ impl UserData for PutObjectTagging {
             Ok(ud)
         });
 
-        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, bucket, key, version_id, tags) = {
-                let this = ud.borrow::<Self>()?;
-                (
-                    this.client.clone(),
-                    this.bucket.clone(),
-                    this.key.clone(),
-                    this.version_id.lock().unwrap().clone(),
-                    this.tags.lock().unwrap().clone(),
-                )
-            };
+        methods.add_async_function(
+            "send",
+            |lua, (ud, extra): (AnyUserData, Value)| async move {
+                no_target(&extra)?;
+                let (client, bucket, key, version_id, tags) = {
+                    let this = ud.borrow::<Self>()?;
+                    (
+                        this.client.clone(),
+                        this.bucket.clone(),
+                        this.key.clone(),
+                        this.version_id.lock().unwrap().clone(),
+                        this.tags.lock().unwrap().clone(),
+                    )
+                };
 
-            // A put replaces the whole set, so an omitted `:tags()` would clear
-            // it. Refuse rather than do that by accident: erasing is
-            // `delete_object_tagging`, which says so.
-            let Some(tags) = tags else {
-                return Err(mlua::Error::runtime(
-                    "put_object_tagging requires :tags(t) — a put replaces the \
+                // A put replaces the whole set, so an omitted `:tags()` would clear
+                // it. Refuse rather than do that by accident: erasing is
+                // `delete_object_tagging`, which says so.
+                let Some(tags) = tags else {
+                    return Err(mlua::Error::runtime(
+                        "put_object_tagging requires :tags(t) — a put replaces the \
                      entire tag set; use delete_object_tagging to clear it",
-                ));
-            };
+                    ));
+                };
 
-            let mut req = client
-                .put_object_tagging()
-                .bucket(bucket)
-                .key(key)
-                .tagging(tags);
-            if let Some(v) = version_id {
-                req = req.version_id(v);
-            }
+                let mut req = client
+                    .put_object_tagging()
+                    .bucket(bucket)
+                    .key(key)
+                    .tagging(tags);
+                if let Some(v) = version_id {
+                    req = req.version_id(v);
+                }
 
-            let out = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
+                let out = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
 
-            let env = envelope(&lua, true)?;
-            // S3 names the version the tags landed on, which on a versioned
-            // bucket is the only way to know which one that was.
-            if let Some(v) = &out.version_id {
-                env.raw_set("version_id", v.clone())?;
-            }
-            tagging_result(env, Value::Nil)
-        });
+                let env = envelope(&lua, true)?;
+                // S3 names the version the tags landed on, which on a versioned
+                // bucket is the only way to know which one that was.
+                if let Some(v) = &out.version_id {
+                    env.raw_set("version_id", v.clone())?;
+                }
+                tagging_result(env, Value::Nil)
+            },
+        );
     }
 }
 
@@ -1051,30 +1137,34 @@ impl UserData for DeleteObjectTagging {
             Ok(ud)
         });
 
-        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, bucket, key, version_id) = {
-                let this = ud.borrow::<Self>()?;
-                (
-                    this.client.clone(),
-                    this.bucket.clone(),
-                    this.key.clone(),
-                    this.version_id.lock().unwrap().clone(),
-                )
-            };
+        methods.add_async_function(
+            "send",
+            |lua, (ud, extra): (AnyUserData, Value)| async move {
+                no_target(&extra)?;
+                let (client, bucket, key, version_id) = {
+                    let this = ud.borrow::<Self>()?;
+                    (
+                        this.client.clone(),
+                        this.bucket.clone(),
+                        this.key.clone(),
+                        this.version_id.lock().unwrap().clone(),
+                    )
+                };
 
-            let mut req = client.delete_object_tagging().bucket(bucket).key(key);
-            if let Some(v) = version_id {
-                req = req.version_id(v);
-            }
+                let mut req = client.delete_object_tagging().bucket(bucket).key(key);
+                if let Some(v) = version_id {
+                    req = req.version_id(v);
+                }
 
-            let out = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
+                let out = req.send().await.map_err(|e| lua_err(BoxError::from(e)))?;
 
-            let env = envelope(&lua, true)?;
-            if let Some(v) = &out.version_id {
-                env.raw_set("version_id", v.clone())?;
-            }
-            tagging_result(env, Value::Nil)
-        });
+                let env = envelope(&lua, true)?;
+                if let Some(v) = &out.version_id {
+                    env.raw_set("version_id", v.clone())?;
+                }
+                tagging_result(env, Value::Nil)
+            },
+        );
     }
 }
 
@@ -1086,27 +1176,31 @@ struct GetBucketTagging {
 
 impl UserData for GetBucketTagging {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, bucket) = {
-                let this = ud.borrow::<Self>()?;
-                (this.client.clone(), this.bucket.clone())
-            };
+        methods.add_async_function(
+            "send",
+            |lua, (ud, extra): (AnyUserData, Value)| async move {
+                no_target(&extra)?;
+                let (client, bucket) = {
+                    let this = ud.borrow::<Self>()?;
+                    (this.client.clone(), this.bucket.clone())
+                };
 
-            let tags = match client.get_bucket_tagging().bucket(bucket).send().await {
-                Ok(out) => tag_set_to_table(&lua, out.tag_set())?,
-                // "No tags" is an answer, and S3 spells it as an error. A
-                // missing bucket, denied access or bad credential is not, and
-                // still raises.
-                Err(SdkError::ServiceError(e)) if is_no_such_tag_set(e.err()) => {
-                    lua.create_table()?
-                }
-                Err(e) => return Err(lua_err(BoxError::from(e))),
-            };
+                let tags = match client.get_bucket_tagging().bucket(bucket).send().await {
+                    Ok(out) => tag_set_to_table(&lua, out.tag_set())?,
+                    // "No tags" is an answer, and S3 spells it as an error. A
+                    // missing bucket, denied access or bad credential is not, and
+                    // still raises.
+                    Err(SdkError::ServiceError(e)) if is_no_such_tag_set(e.err()) => {
+                        lua.create_table()?
+                    }
+                    Err(e) => return Err(lua_err(BoxError::from(e))),
+                };
 
-            // `ok` is true either way: reading "no tags" succeeded.
-            let env = envelope(&lua, true)?;
-            tagging_result(env, Value::Table(tags))
-        });
+                // `ok` is true either way: reading "no tags" succeeded.
+                let env = envelope(&lua, true)?;
+                tagging_result(env, Value::Table(tags))
+            },
+        );
     }
 }
 
@@ -1125,34 +1219,38 @@ impl UserData for PutBucketTagging {
             Ok(ud)
         });
 
-        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, bucket, tags) = {
-                let this = ud.borrow::<Self>()?;
-                (
-                    this.client.clone(),
-                    this.bucket.clone(),
-                    this.tags.lock().unwrap().clone(),
-                )
-            };
+        methods.add_async_function(
+            "send",
+            |lua, (ud, extra): (AnyUserData, Value)| async move {
+                no_target(&extra)?;
+                let (client, bucket, tags) = {
+                    let this = ud.borrow::<Self>()?;
+                    (
+                        this.client.clone(),
+                        this.bucket.clone(),
+                        this.tags.lock().unwrap().clone(),
+                    )
+                };
 
-            let Some(tags) = tags else {
-                return Err(mlua::Error::runtime(
-                    "put_bucket_tagging requires :tags(t) — a put replaces the \
+                let Some(tags) = tags else {
+                    return Err(mlua::Error::runtime(
+                        "put_bucket_tagging requires :tags(t) — a put replaces the \
                      entire tag set; use delete_bucket_tagging to clear it",
-                ));
-            };
+                    ));
+                };
 
-            client
-                .put_bucket_tagging()
-                .bucket(bucket)
-                .tagging(tags)
-                .send()
-                .await
-                .map_err(|e| lua_err(BoxError::from(e)))?;
+                client
+                    .put_bucket_tagging()
+                    .bucket(bucket)
+                    .tagging(tags)
+                    .send()
+                    .await
+                    .map_err(|e| lua_err(BoxError::from(e)))?;
 
-            let env = envelope(&lua, true)?;
-            tagging_result(env, Value::Nil)
-        });
+                let env = envelope(&lua, true)?;
+                tagging_result(env, Value::Nil)
+            },
+        );
     }
 }
 
@@ -1164,22 +1262,26 @@ struct DeleteBucketTagging {
 
 impl UserData for DeleteBucketTagging {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_async_function("send", |lua, ud: AnyUserData| async move {
-            let (client, bucket) = {
-                let this = ud.borrow::<Self>()?;
-                (this.client.clone(), this.bucket.clone())
-            };
+        methods.add_async_function(
+            "send",
+            |lua, (ud, extra): (AnyUserData, Value)| async move {
+                no_target(&extra)?;
+                let (client, bucket) = {
+                    let this = ud.borrow::<Self>()?;
+                    (this.client.clone(), this.bucket.clone())
+                };
 
-            client
-                .delete_bucket_tagging()
-                .bucket(bucket)
-                .send()
-                .await
-                .map_err(|e| lua_err(BoxError::from(e)))?;
+                client
+                    .delete_bucket_tagging()
+                    .bucket(bucket)
+                    .send()
+                    .await
+                    .map_err(|e| lua_err(BoxError::from(e)))?;
 
-            let env = envelope(&lua, true)?;
-            tagging_result(env, Value::Nil)
-        });
+                let env = envelope(&lua, true)?;
+                tagging_result(env, Value::Nil)
+            },
+        );
     }
 }
 
@@ -1213,6 +1315,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, bucket: String| {
             let c = c.clone();
             async move {
+                require_non_empty("bucket", &bucket)?;
                 Ok(ListObjects {
                     client: c.s3().await,
                     state: Arc::new(Mutex::new(ListObjectsState {
@@ -1233,6 +1336,7 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, bucket: String| {
             let c = c.clone();
             async move {
+                require_non_empty("bucket", &bucket)?;
                 Ok(ListObjectVersions {
                     client: c.s3().await,
                     state: Arc::new(Mutex::new(ListObjectVersionsState {
@@ -1254,6 +1358,8 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, (bucket, key): (String, String)| {
             let c = c.clone();
             async move {
+                require_non_empty("bucket", &bucket)?;
+                require_non_empty("key", &key)?;
                 Ok(HeadObject {
                     client: c.s3().await,
                     bucket,
@@ -1270,12 +1376,15 @@ pub(crate) fn module(lua: &Lua, source: ClientSource) -> LuaResult<Table> {
         lua.create_async_function(move |_, (bucket, key): (String, String)| {
             let c = c.clone();
             async move {
+                require_non_empty("bucket", &bucket)?;
+                require_non_empty("key", &key)?;
                 Ok(GetObject {
                     client: c.s3().await,
                     bucket,
                     key,
                     version_id: Arc::new(Mutex::new(None)),
                     range: Arc::new(Mutex::new(None)),
+                    parse: Arc::new(Mutex::new(None)),
                 })
             }
         })?,
@@ -1515,9 +1624,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_body_per_content_type() {
+    fn parses_json_body_on_request() {
         let lua = Lua::new();
-        let v = parse_body(&lua, Some("application/json"), br#"{"a":1}"#).unwrap();
+        let v = parse_body(&lua, Some("json"), br#"{"a":1}"#).unwrap();
         let t = match v {
             Value::Table(t) => t,
             other => panic!("expected a table, got {}", other.type_name()),
@@ -1525,30 +1634,35 @@ mod tests {
         assert_eq!(t.get::<i64>("a").unwrap(), 1);
     }
 
-    /// Content-type parameters must not defeat the match.
+    /// Asked-for parsing that fails raises: the script named the format.
     #[test]
-    fn parses_json_with_charset_parameter() {
+    fn malformed_json_raises_when_parse_requested() {
         let lua = Lua::new();
-        let v = parse_body(&lua, Some("application/json; charset=utf-8"), br#"{"a":2}"#).unwrap();
-        assert!(matches!(v, Value::Table(_)));
-    }
-
-    /// A body whose type lies must come back as a string rather than fail.
-    #[test]
-    fn malformed_json_falls_back_to_string() {
-        let lua = Lua::new();
-        let v = parse_body(&lua, Some("application/json"), b"not json at all").unwrap();
-        match v {
-            Value::String(s) => assert_eq!(s.to_str().unwrap().to_owned(), "not json at all"),
-            other => panic!("expected a string, got {}", other.type_name()),
-        }
+        let err = parse_body(&lua, Some("json"), b"not json at all").unwrap_err();
+        assert!(err.to_string().contains("get_object:parse"), "{err}");
     }
 
     #[test]
-    fn unknown_content_type_stays_a_string() {
+    fn unknown_parse_format_raises() {
         let lua = Lua::new();
-        let v = parse_body(&lua, Some("text/plain"), b"hello").unwrap();
+        assert!(parse_format("xml").is_err());
+        assert!(parse_body(&lua, Some("xml"), b"<a/>").is_err());
+    }
+
+    /// Without `:parse()` the body is always the raw string, whatever the
+    /// uploader's content type claimed (S3-10).
+    #[test]
+    fn body_is_a_string_by_default() {
+        let lua = Lua::new();
+        let v = parse_body(&lua, None, br#"{"a":1}"#).unwrap();
         assert!(matches!(v, Value::String(_)));
+    }
+
+    #[test]
+    fn max_keys_must_be_positive() {
+        assert!(check_max_keys(&0).is_err());
+        assert!(check_max_keys(&-3).is_err());
+        assert!(check_max_keys(&1).is_ok());
     }
 
     /// Binary bodies survive: a Luau string is 8-bit clean.
@@ -1556,7 +1670,7 @@ mod tests {
     fn binary_body_survives_intact() {
         let lua = Lua::new();
         let bytes = [0u8, 159, 146, 150];
-        let v = parse_body(&lua, Some("application/octet-stream"), &bytes).unwrap();
+        let v = parse_body(&lua, None, &bytes).unwrap();
         match v {
             Value::String(s) => assert_eq!(s.as_bytes().to_vec(), bytes),
             other => panic!("expected a string, got {}", other.type_name()),
@@ -1592,7 +1706,8 @@ mod tests {
             Redirect::Inherit(InheritTarget::Same),
             Redirect::Inherit(InheritTarget::Stdout),
             Redirect::Inherit(InheritTarget::Stderr),
-            Redirect::SameAsOther,
+            Redirect::AliasStdout,
+            Redirect::AliasStderr,
         ] {
             let ud = lua.create_userdata(sentinel).unwrap();
             match target_from_value(&Value::UserData(ud)) {
@@ -1635,6 +1750,7 @@ mod tests {
         let target = Redirect::File {
             path: path.clone(),
             file: Arc::new(Mutex::new(None)),
+            append: false,
         };
 
         let v = block_on(deliver_bytes(&lua, &target, b"{\"a\":1}")).unwrap();
@@ -1665,6 +1781,7 @@ mod tests {
         let target = Redirect::File {
             path: path.clone(),
             file: Arc::new(Mutex::new(None)),
+            append: false,
         };
 
         let values = block_on(respond(&lua, false, Value::Nil, Some(target))).unwrap();

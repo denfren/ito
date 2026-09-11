@@ -11,11 +11,27 @@
 //! file, and do not add a second test here that traps the same signal number
 //! as another test in this file.
 //!
-//! `host_io` (and so `proc` itself) exists only under `ito`/`irun`, so these
+//! `host_io` (and so `proc` itself) exists only under `ito`, so these
 //! all drive the compiled `ito` binary via `assert_cmd`.
 
 use assert_cmd::Command;
+use assert_cmd::assert::Assert;
 use predicates::prelude::*;
+
+/// Runs a script given as source. A script is always a path, so the source is
+/// written to a temporary file first; the file outlives the run.
+trait RunScript {
+    fn run_script(&mut self, src: &str) -> Assert;
+}
+
+impl RunScript for Command {
+    fn run_script(&mut self, src: &str) -> Assert {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("s.luau");
+        std::fs::write(&script, src).unwrap();
+        self.arg(&script).assert()
+    }
+}
 
 fn ito() -> Command {
     Command::cargo_bin("ito").unwrap()
@@ -31,7 +47,7 @@ fn ito() -> Command {
 /// helper this replaces from the unit tests).
 fn signal_self_and_wait(name: &str) -> String {
     format!(
-        r#"proc.command({{ "kill", "-{name}", tostring(ito.pid()) }}):run()
+        r#"proc.command({{ "kill", "-{name}", tostring(proc.pid()) }}):run()
            for _ = 1, 200 do
                task.wait("5ms")
            end"#
@@ -53,8 +69,7 @@ fn trap_runs_on_delivery_and_counts_it() {
         signal_self_and_wait("USR1")
     );
     ito()
-        .args(["-s", &script])
-        .assert()
+        .run_script(&script)
         .success()
         .stdout(predicate::str::contains(format!(
             "signal={} count=1",
@@ -75,8 +90,7 @@ fn retrapping_replaces_rather_than_stacks() {
         signal_self_and_wait("USR2")
     );
     ito()
-        .args(["-s", &script])
-        .assert()
+        .run_script(&script)
         .success()
         .stdout(predicate::str::contains("hits=1 last=second"));
 }
@@ -94,8 +108,7 @@ fn untrap_silences_the_signal() {
         signal_self_and_wait("HUP")
     );
     ito()
-        .args(["-s", &script])
-        .assert()
+        .run_script(&script)
         .success()
         .stdout(predicate::str::contains("hits=0"));
 }
@@ -114,8 +127,7 @@ fn untrap_then_retrap_reuses_the_worker() {
         signal_self_and_wait("ALRM")
     );
     ito()
-        .args(["-s", &script])
-        .assert()
+        .run_script(&script)
         .success()
         .stdout(predicate::str::contains("hits=1 last=second"));
 }
@@ -130,13 +142,13 @@ fn untrap_then_retrap_reuses_the_worker() {
 fn an_untrapped_signal_keeps_its_default_disposition() {
     let script = r#"
         proc.trap(proc.SIGUSR1, function() end) -- unrelated signal, irrelevant here
-        proc.command({ "kill", "-TERM", tostring(ito.pid()) }):run()
+        proc.command({ "kill", "-TERM", tostring(proc.pid()) }):run()
         for _ = 1, 200 do
             task.wait("5ms")
         end
         print("should not print: the process should have died of SIGTERM")
     "#;
-    let assert = ito().args(["-s", script]).assert();
+    let assert = ito().run_script(script);
     let output = assert.get_output();
     assert!(
         !output.status.success(),
@@ -147,22 +159,20 @@ fn an_untrapped_signal_keeps_its_default_disposition() {
 #[test]
 fn proc_exit_terminates_immediately_with_the_given_code() {
     ito()
-        .args(["-s", "proc.exit(7) print(\"unreachable\")"])
-        .assert()
+        .run_script("proc.exit(7) print(\"unreachable\")")
         .code(7)
         .stdout(predicate::str::contains("unreachable").not());
 }
 
 #[test]
 fn proc_exit_defaults_to_zero() {
-    ito().args(["-s", "proc.exit()"]).assert().code(0);
+    ito().run_script("proc.exit()").code(0);
 }
 
 #[test]
 fn kill_and_stop_are_rejected_by_the_cli_script_too() {
     ito()
-        .args(["-s", "proc.trap(proc.SIGKILL, function() end)"])
-        .assert()
+        .run_script("proc.trap(proc.SIGKILL, function() end)")
         .code(3)
         .stderr(predicate::str::contains("cannot be trapped"));
 }

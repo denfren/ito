@@ -2,9 +2,9 @@
 //!
 //! A VFS is anchored at a real `root` directory. Scripts see a
 //! root-relative namespace with no leading `/`: a real file
-//! `root/subdir/x.txt` is addressed as `subdir/x.txt` (a leading `/` is
-//! still accepted on input and treated the same as none). Paths that
-//! escape the root (via `..`) are rejected.
+//! `root/subdir/x.txt` is addressed as `subdir/x.txt`. A leading `/` is
+//! rejected (it would mean a different file under `ito`), as are paths that
+//! escape the root (via `..`).
 //!
 //! Reads always go straight to disk. How writes get there depends on the
 //! run's [`Writes`] mode (see [`register_with`]):
@@ -18,9 +18,12 @@
 //! - **Denied** — the write functions are not registered at all.
 //!
 //! Either way a write creates parent directories as needed (`mkdir -p`)
-//! and a removal of an absent file is a no-op.
+//! and a removal of an absent file is a no-op. A write or remove aimed at a
+//! directory raises when it is queued, and the whole plan is validated before
+//! the first write lands. Content is bytes, not text (a Luau string is any byte
+//! sequence), and two spellings of one file through a symlink share one slot.
 //!
-//! This is the rooted `fs` — the one `iq` and `ied` expose, where a
+//! This is the rooted `fs` — the one `ied` exposes, where a
 //! boundary is what makes a `--diff` preview mean something. `ito`'s `fs`
 //! is the host filesystem instead; see [`super::rfs`].
 //!
@@ -74,31 +77,49 @@ impl Writes {
 /// A buffered action against a path. `fs.write` and `fs.remove` both
 /// land in the same per-path slot, so the last call wins.
 enum Action {
-    /// Write this content on flush (parents auto-created).
-    Write(String),
+    /// Write these bytes on flush (parents auto-created).
+    Write(Vec<u8>),
     /// Delete the path on flush (no error if it is already absent).
     Remove,
 }
 
-/// Write `content` to `path`, creating missing parents.
+/// Write `content` to `path`, creating missing parents. `shown` is the path as
+/// the script spells it, for error messages.
 ///
 /// The single place a write actually happens, shared by [`Vfs::flush`] and the
 /// host filesystem's `fs.write` ([`super::rfs`]), so the two cannot drift on
 /// details like parent creation or error wording.
-pub(crate) fn write_now(path: &Path, content: &str) -> std::result::Result<(), String> {
+pub(crate) fn write_now(
+    path: &Path,
+    content: &[u8],
+    shown: &str,
+) -> std::result::Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir for {shown}: {e}"))?;
     }
-    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(path, content).map_err(|e| format!("write {shown}: {e}"))
 }
 
-/// Delete `path`. An already-absent file is success, not an error — removing
-/// something that is not there is the state the caller asked for.
-pub(crate) fn remove_now(path: &Path) -> std::result::Result<(), String> {
+/// Delete the file `path`. An already-absent file is success, not an error —
+/// removing something that is not there is the state the caller asked for. A
+/// directory is refused with a plain message rather than the raw OS error.
+pub(crate) fn remove_now(path: &Path, shown: &str) -> std::result::Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("remove {}: {e}", path.display())),
+        Err(_) if path.symlink_metadata().is_ok_and(|m| m.is_dir()) => {
+            Err(format!("remove {shown}: is a directory"))
+        }
+        Err(e) => Err(format!("remove {shown}: {e}")),
+    }
+}
+
+/// Read a file's bytes, `None` if it is absent.
+fn read_opt(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -140,15 +161,62 @@ impl Vfs {
     /// Flush buffered actions (sorted by path). Writes create parent
     /// directories as needed; removes delete the file if present.
     /// Called by the host after the script returns, and only then.
+    ///
+    /// The plan is validated before the first write, so a target that cannot
+    /// take its action (a directory, a file standing where a parent directory
+    /// is needed) fails the run with nothing applied, not half of it.
     pub fn flush(&self) -> std::result::Result<(), String> {
         let pending = self.pending.borrow();
         for (path, action) in &pending.actions {
+            self.check_target(path, matches!(action, Action::Write(_)))?;
+        }
+        for (path, action) in &pending.actions {
+            let shown = self.mapper.relativize(path);
             match action {
-                Action::Write(content) => write_now(path, content)?,
-                Action::Remove => remove_now(path)?,
+                Action::Write(content) => write_now(path, content, &shown)?,
+                Action::Remove => remove_now(path, &shown)?,
             }
         }
         Ok(())
+    }
+
+    /// Whether `path` can take a write (or a remove): it must not be a
+    /// directory, and a write needs every existing ancestor to be one.
+    fn check_target(&self, path: &Path, write: bool) -> std::result::Result<(), String> {
+        let shown = self.mapper.relativize(path);
+        let verb = if write { "write" } else { "remove" };
+        let is_dir = if write {
+            path.metadata().is_ok_and(|m| m.is_dir())
+        } else {
+            path.symlink_metadata().is_ok_and(|m| m.is_dir())
+        };
+        if is_dir {
+            return Err(format!("{verb} {shown}: is a directory"));
+        }
+        if write {
+            let mut anc = path.parent();
+            while let Some(a) = anc {
+                match a.metadata() {
+                    Ok(m) if m.is_dir() => break,
+                    Ok(_) => return Err(format!("write {shown}: a parent is not a directory")),
+                    Err(_) => anc = a.parent(),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The slot key for `real`: symlinks in it resolved (the leaf too for a
+    /// write, which goes through a link), so two spellings of one file share a
+    /// slot instead of racing on flush.
+    fn slot(&self, real: PathBuf, follow_leaf: bool) -> PathBuf {
+        if follow_leaf && let Ok(c) = real.canonicalize() {
+            return c;
+        }
+        match (real.parent().and_then(|p| p.canonicalize().ok()), real.file_name()) {
+            (Some(p), Some(n)) => p.join(n),
+            _ => real,
+        }
     }
 
     /// List the paths whose buffered action differs from current disk
@@ -163,11 +231,9 @@ impl Vfs {
             .actions
             .iter()
             .filter_map(|(path, action)| match action {
-                Action::Write(new) => match std::fs::read_to_string(path) {
-                    Ok(old) => (old != **new).then(|| Ok(self.mapper.relativize(path))),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        Some(Ok(self.mapper.relativize(path)))
-                    }
+                Action::Write(new) => match read_opt(path) {
+                    Ok(Some(old)) => (old != *new).then(|| Ok(self.mapper.relativize(path))),
+                    Ok(None) => Some(Ok(self.mapper.relativize(path))),
                     Err(e) => Some(Err(e)),
                 },
                 Action::Remove => path
@@ -190,21 +256,38 @@ impl Vfs {
         let pending = self.pending.borrow();
         let mut out = String::new();
         for (path, action) in &pending.actions {
-            let old = match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-            };
+            let old = read_opt(path)?;
+            let rel = self.mapper.relativize(path);
             let new = match action {
-                Action::Write(content) => content.as_str(),
-                Action::Remove => "",
+                Action::Write(content) => content.as_slice(),
+                Action::Remove => {
+                    // A remove of an absent file changes nothing; of an existing
+                    // one (even an empty one) it is a deletion.
+                    let Some(old) = old else { continue };
+                    match std::str::from_utf8(&old) {
+                        Ok(text) if !text.is_empty() => {
+                            let diff = similar::TextDiff::from_lines(text, "");
+                            out.push_str(
+                                &diff
+                                    .unified_diff()
+                                    .context_radius(3)
+                                    .header(&format!("a/{rel}"), "/dev/null")
+                                    .to_string(),
+                            );
+                        }
+                        Ok(_) => out.push_str(&format!("--- a/{rel}\n+++ /dev/null\n")),
+                        Err(_) => out.push_str(&format!(
+                            "Binary file a/{rel} deleted\n"
+                        )),
+                    }
+                    continue;
+                }
             };
             if old.as_deref() == Some(new) {
                 continue;
             }
             let is_new_file = old.is_none();
             let old = old.unwrap_or_default();
-            let rel = self.mapper.relativize(path);
             // An empty write to a new path has no line-level diff to show, but
             // we still emit the header so callers (and humans) can see the file
             // will be created.
@@ -212,7 +295,11 @@ impl Vfs {
                 out.push_str(&format!("--- /dev/null\n+++ b/{rel}\n"));
                 continue;
             }
-            let diff = similar::TextDiff::from_lines(&old, new);
+            let (Ok(old), Ok(new)) = (std::str::from_utf8(&old), std::str::from_utf8(new)) else {
+                out.push_str(&format!("Binary files a/{rel} and b/{rel} differ\n"));
+                continue;
+            };
+            let diff = similar::TextDiff::from_lines(old, new);
             out.push_str(
                 &diff
                     .unified_diff()
@@ -223,6 +310,40 @@ impl Vfs {
         }
         Ok(out)
     }
+}
+
+/// `fs.stat`'s table for `path` (links followed), or `None` if it is absent.
+/// `mtime` is whole seconds since the Unix epoch; `mode` the permission bits
+/// (Unix only, otherwise absent).
+pub(crate) fn stat_table(lua: &Lua, path: &Path) -> Result<Option<Table>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(mlua::Error::runtime(format!("stat: {e}"))),
+    };
+    let t = lua.create_table()?;
+    let kind = if meta.is_file() {
+        "file"
+    } else if meta.is_dir() {
+        "dir"
+    } else {
+        "other"
+    };
+    t.set("kind", kind)?;
+    t.set("size", meta.len())?;
+    if let Some(secs) = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        t.set("mtime", secs.as_secs())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        t.set("mode", meta.permissions().mode() & 0o7777)?;
+    }
+    Ok(Some(t))
 }
 
 fn build_matcher(pattern: &str) -> Result<GlobMatcher> {
@@ -379,20 +500,22 @@ fn walk_tree(root: &Path, dir: &Path, ancestors: &mut Vec<PathBuf>, out: &mut Ve
 /// without sharing a policy flag.
 pub struct RootedSource {
     mapper: PathMapper,
+    /// Where the walk starts: the root, or a directory under it.
+    start: PathBuf,
 }
 
 impl finder::Source for RootedSource {
     fn start(&self) -> PathBuf {
-        self.mapper.root().to_path_buf()
+        self.start.clone()
     }
 
-    fn render(&self, path: &Path) -> Option<String> {
-        // `contained` canonicalizes, so a link whose target leaves the root is
-        // refused here even though its own path looks inside.
-        if !self.mapper.contained(path) {
-            return None;
-        }
-        Some(self.mapper.to_virtual(path))
+    fn renderer(&self) -> finder::Renderer {
+        let mapper = self.mapper.clone();
+        std::sync::Arc::new(move |path| {
+            // `contained` canonicalizes, so a link whose target leaves the root
+            // is refused here even though its own path looks inside.
+            mapper.contained(path).then(|| mapper.to_virtual(path))
+        })
     }
 
     /// The rooted traversals do not distinguish links: a link is simply the file
@@ -447,16 +570,22 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
     // fs.list(dir) -> {String}
     // Entries (files and directories) directly under `dir`, as
     // script-visible root-relative paths. Sorted.
+    // `dir` defaults to the root. Entries whose link leaves the root are
+    // dropped, as every other traversal does.
     let v = vfs.clone();
     module.set(
         "list",
-        lua.create_function(move |_, dir: String| -> Result<Vec<String>> {
+        lua.create_function(move |_, dir: Option<String>| -> Result<Vec<String>> {
+            let dir = dir.unwrap_or_default();
             let real = v.resolve(&dir)?;
             let entries = std::fs::read_dir(&real)
-                .map_err(|e| mlua::Error::runtime(format!("list {}: {e}", real.display())))?;
+                .map_err(|e| mlua::Error::runtime(format!("list {dir:?}: {e}")))?;
             let mut out: Vec<String> = Vec::new();
             for entry in entries.flatten() {
-                out.push(v.mapper.to_virtual(&entry.path()));
+                let p = entry.path();
+                if v.mapper.contained(&p) {
+                    out.push(v.mapper.to_virtual(&p));
+                }
             }
             out.sort();
             Ok(out)
@@ -470,7 +599,13 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
     module.set(
         "walk",
         lua.create_function(move |lua, dir: Option<String>| -> Result<Vec<Table>> {
-            let start = v.resolve(dir.as_deref().unwrap_or(""))?;
+            let given = dir.as_deref().unwrap_or("");
+            let start = v.resolve(given)?;
+            if !start.is_dir() {
+                return Err(mlua::Error::runtime(format!(
+                    "walk {given:?}: no such directory"
+                )));
+            }
             let root = v.mapper.root();
             let mut steps: Vec<WalkStep> = Vec::new();
             let mut ancestors: Vec<PathBuf> =
@@ -480,7 +615,9 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
             let mut out = Vec::with_capacity(steps.len());
             for step in steps {
                 let t = lua.create_table()?;
-                t.set("path", v.mapper.to_virtual(&step.dir))?;
+                // The root itself reads `"."`, the host spelling of the start.
+                let shown = v.mapper.to_virtual(&step.dir);
+                t.set("path", if shown.is_empty() { ".".into() } else { shown })?;
                 t.set("dirs", step.dirs)?;
                 t.set("files", step.files)?;
                 out.push(t);
@@ -498,8 +635,7 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
     module.set(
         "glob",
         lua.create_function(move |_, pattern: String| -> Result<Vec<String>> {
-            let real_pat = v.resolve(&pattern)?;
-            let matcher = build_matcher(&real_pat.to_string_lossy())?;
+            let matcher = build_matcher(&v.mapper.glob_pattern(&pattern)?)?;
             let mut files: Vec<PathBuf> = Vec::new();
             let root = v.mapper.root();
             let mut ancestors: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -515,34 +651,48 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
         })?,
     )?;
 
-    // fs.finder() -> Finder
-    // Start an `fd`-like search over the VFS root. There is no pattern
-    // argument -- an unfiltered finder means "everything under the root", and
-    // each condition is added as its own named filter. There is no start
-    // directory either: the root is the only place a rooted search can begin,
-    // so the host form's `dir` argument would have nothing to name here.
+    // fs.finder([dir]) -> Finder
+    // Start an `fd`-like search over `dir` (default: the root), which must be
+    // inside the root. There is no pattern argument -- an unfiltered finder
+    // means "everything under here", and each condition is added as its own
+    // named filter.
     // Chain `:name()`/`:path()`/`:ext()`, `:exclude()`, `:files()`/`:dirs()`/
     // `:type()`, `:depth()`/`:min_depth()`/`:max_depth()`, `:hidden()`/
     // `:no_ignore()`/`:unrestricted()`, `:sort()`/`:limit()`, then a terminal:
-    // `:find()`, `:first()`, `:count()` or `:any()`.
+    // `:find()`, `:count()` or `:any()`.
     let v = vfs.clone();
     module.set(
         "finder",
-        lua.create_function(move |_, ()| -> Result<Finder> {
+        lua.create_function(move |_, dir: Option<String>| -> Result<Finder> {
+            let start = v.resolve(dir.as_deref().unwrap_or(""))?;
             Ok(Finder(finder::Finder::new(RootedSource {
                 mapper: v.mapper.clone(),
+                start,
             })))
         })?,
     )?;
 
-    // fs.read(path) -> String   (reads current disk state)
+    // fs.read(path) -> String   (reads current disk state; bytes, not text --
+    // a Luau string holds any byte sequence)
     let v = vfs.clone();
     module.set(
         "read",
-        lua.create_function(move |_, path: String| -> Result<String> {
+        lua.create_function(move |lua, path: String| -> Result<mlua::LuaString> {
             let real = v.resolve(&path)?;
-            std::fs::read_to_string(&real)
-                .map_err(|e| mlua::Error::runtime(format!("read {}: {e}", real.display())))
+            let bytes = std::fs::read(&real)
+                .map_err(|e| mlua::Error::runtime(format!("read {path}: {e}")))?;
+            lua.create_string(bytes)
+        })?,
+    )?;
+
+    // fs.stat(path) -> {kind, size, mtime, mode} | nil
+    // `nil` if absent. Follows links; `kind` is "file", "dir" or "other".
+    let v = vfs.clone();
+    module.set(
+        "stat",
+        lua.create_function(move |lua, path: String| -> Result<Option<Table>> {
+            let real = v.resolve(&path)?;
+            stat_table(lua, &real)
         })?,
     )?;
 
@@ -553,12 +703,14 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
         let v = vfs.clone();
         module.set(
             "write",
-            lua.create_function(move |_, (path, content): (String, String)| -> Result<()> {
-                let real = v.resolve(&path)?;
+            lua.create_function(move |_, (path, content): (String, mlua::LuaString)| -> Result<()> {
+                let real = v.slot(v.resolve(&path)?, true);
+                v.check_target(&real, true)
+                    .map_err(mlua::Error::runtime)?;
                 v.pending
                     .borrow_mut()
                     .actions
-                    .insert(real, Action::Write(content));
+                    .insert(real, Action::Write(content.as_bytes().to_vec()));
                 Ok(())
             })?,
         )?;
@@ -570,7 +722,9 @@ pub fn register_with(lua: &Lua, vfs: &Vfs, writes: Writes) -> Result<()> {
         module.set(
             "remove",
             lua.create_function(move |_, path: String| -> Result<()> {
-                let real = v.resolve(&path)?;
+                let real = v.slot(v.resolve(&path)?, false);
+                v.check_target(&real, false)
+                    .map_err(mlua::Error::runtime)?;
                 v.pending.borrow_mut().actions.insert(real, Action::Remove);
                 Ok(())
             })?,

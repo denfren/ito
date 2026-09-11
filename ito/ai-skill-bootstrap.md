@@ -1,7 +1,7 @@
 # Bootstrap the `ito` family of skills
 
 ## Goal
-Write skills for the `ito` command line utilities `iq`, `ied` and `ito`.
+Write skills for the `ito` command line utilities `ied` and `ito`.
 The command has extensive built-in help; the skill should distill it
 into a dense, skimmable reference.
 

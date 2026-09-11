@@ -1,6 +1,6 @@
 # `aws.autoscaling` — AWS EC2 Auto Scaling
 
-| Function/Method | Effect |
+| Function | Effect |
 | --- | --- |
 | `aws.autoscaling.describe_groups()` | list Auto Scaling groups (paginated) |
 | `:name(<value>)` | filter `describe_groups` to one or more group names |
@@ -16,6 +16,7 @@
 | `:desired_capacity(<n>)` | set the group's desired capacity |
 | `:health_check_grace_period(<secs>)` | set the health-check grace period |
 | `:default_cooldown(<secs>)` | set the default scaling cooldown |
+| `:launch_template({name=, id=, version=})` | point the group at a launch template (version) |
 | `aws.autoscaling.start_instance_refresh(<group>)` | begin replacing a group's instances in batches |
 | `:min_healthy_percentage(<n>)` | minimum capacity to keep in service during the refresh |
 | `:max_healthy_percentage(<n>)` | maximum capacity above desired during the refresh |
@@ -23,19 +24,33 @@
 | `:skip_matching()` | leave instances already matching the desired configuration |
 | `:auto_rollback()` | roll back automatically on failure |
 | `:strategy(<name>)` | the refresh strategy, e.g. `"Rolling"` |
+| `:launch_template({name=, id=, version=})` | the launch template version the refresh converges on |
 | `:wait()` | poll until the refresh reaches a terminal state |
 | `aws.autoscaling.describe_instance_refreshes(<group>)` | list a group's instance refreshes (paginated) |
 | `:id(<id>)` | narrow to one refresh id |
-| `aws.autoscaling.cancel_instance_refresh(<group>)` | stop a group's in-progress refresh |
-| `aws.autoscaling.rollback_instance_refresh(<group>)` | revert a group's refresh to its prior configuration |
+| `aws.autoscaling.describe_scaling_activities()` | list scaling activities (paginated), account-wide or per group |
+| `:group(<group>)` | narrow to one group |
+| `:id(<id>)`/`:ids(<ids>)` | narrow to one or more activity ids |
+| `:include_deleted_groups()` | include activity from deleted groups |
+| `aws.autoscaling.describe_policies()` | list scaling policies (paginated), account-wide or per group |
+| `:group(<group>)` | narrow to one group |
+| `:name(<value>)` | filter by one or more policy names |
+| `:policy_type(<value>)` | filter by one or more policy types |
+| `aws.autoscaling.cancel_instance_refresh(<group>)` | stop a group's in-progress refresh (`:wait()` for `Cancelled`) |
+| `aws.autoscaling.rollback_instance_refresh(<group>)` | revert a group's refresh to its prior configuration (`:wait()` for the rollback) |
 | `aws.autoscaling.create_or_update_tags(<group>)` | set tags on a group (not on its instances) |
 | `:tags(<map>)` | the `{[key] = value}` tag set to write; required |
 | `:propagate_at_launch([<bool>])` | copy these tags onto newly launched instances |
 | `aws.autoscaling.delete_tags(<group>)` | remove tags from a group |
 | `:tags(<keys-or-map>)` | key array or `{[key] = value}` map to remove; required |
 
-Every entry function returns a builder finalized by `:send()`, which
-either raises or returns `(envelope, data)`.
+Every entry function returns a mutable builder finalized by `:send()`, which
+either raises or returns `(envelope, data)`. Configuration methods mutate the
+builder in place and return the same handle, so calls chain; an invalid
+argument raises at the entry call or at its setter, and a bad combination is
+caught by `:send()` before the request goes out.
+
+## Example
 
 ```lua
 local r, groups = aws.autoscaling.describe_groups():name("web-prod"):send()
@@ -68,8 +83,26 @@ carrying `ok`, and the response as native Luau data. Calls that return
 nothing on the wire (`set_desired_capacity`, `update_group`,
 `create_or_update_tags`, `delete_tags`) yield `nil`
 as the second value — the envelope alone is the answer. `describe_groups`,
-`describe_instances` and `describe_instance_refreshes` follow pagination
-to exhaustion before `:send()` returns; there is no manual paging.
+`describe_groups`, `describe_instances`, `describe_instance_refreshes`,
+`describe_scaling_activities` and `describe_policies` follow pagination to
+exhaustion before `:send()` returns; there is no manual paging.
+
+**Empty lists raise.** An explicitly empty id/name/value list (`:name({})`,
+`describe_instances({})`, …) raises instead of widening the query to the
+whole account; omit the argument for "everything". An empty group name
+raises at the entry call, for every function.
+
+**Boolean flags** (`:honor_cooldown`, `:skip_matching`, `:auto_rollback`,
+`:wait`, `:include_deleted_groups`, `:propagate_at_launch`) all take an
+optional strict boolean: bare means `true`, `false` turns it off, anything
+else raises.
+
+**Errors carry the call name** (`describe_groups: …`), for both validation
+and AWS failures.
+
+**API limits.** `describe_instances` splits more than 50 ids into several
+requests. The API caps group names at 1600, activity ids and policy names
+at 50 per call; larger lists are sent as given and fail at AWS.
 
 AWS API failures — bad credentials, denied access, connectivity, a
 malformed request — raise a Luau error whose message is the SDK's error
@@ -79,7 +112,12 @@ when there is no refresh in progress on the group; `update_group` raises
 if called with no knob set, since that would otherwise be a request that
 silently does nothing.
 
-## `describe_groups`
+`describe_scaling_activities` and `describe_policies` also follow
+pagination to exhaustion, and both accept **no** group at all: omitting
+`:group()` is an account-wide read, for a script correlating an incident
+across a fleet rather than one known-bad group.
+
+## `aws.autoscaling.describe_groups`
 
 List Auto Scaling groups, optionally filtered.
 
@@ -88,17 +126,22 @@ List Auto Scaling groups, optionally filtered.
 **Parameters:** none. Filtering is added via the builder's methods before
 `:send()`.
 
-**Builder methods:**
+**Methods:**
 
-- `:name(<value>)` — one group name or an array of names (`value_to_string_list`:
-  a bare string or a table of strings). Repeatable; names accumulate.
-  Omitted, every group in the region/account is described.
+- `:name(<value>)` — one group name or an array of names (a bare string
+  or a table of strings; an empty table raises). Repeatable; names
+  accumulate. Omitted, every group in the region/account is described.
+  Note `:name` is the **group name** here, whereas `aws.ec2`'s `:name` is
+  the `tag:Name`.
 - `:tag(<key>, <value>)` — filters on `tag:<key>`, matching `<value>` (a
   string or array of strings), the same spelling `aws.ec2` uses.
 - `:tag_key(<key>)` — filters on `tag-key`, matching any group carrying
   that key (a string or array of strings).
 - `:filter(<name>, <value>)` — any named filter the API accepts, for
-  filters not covered by `:tag`/`:tag_key`.
+  filters not covered by `:tag`/`:tag_key`. Filters apply to the **tags**
+  only (`tag-key`, `tag-value`, `tag:<key>`, `tag`-style names), not to
+  arbitrary group fields; the API ignores unknown names.
+- `:send()` — finalize the builder and run the request (async).
 
 **Returns:** `(envelope, groups)` — `groups` is an array of group tables
 (see below), always present even when empty.
@@ -118,7 +161,6 @@ end
 
 ### The group table
 
-| Field | Type |
 | --- | --- |
 | `name` | string |
 | `arn` | string |
@@ -129,7 +171,9 @@ end
 | `health_check_grace_period` | number |
 | `default_cooldown` | number |
 | `launch_configuration_name` | string |
-| `launch_template` | table (`name`, `version`) |
+| `launch_template` | table (`id`, `name`, `version`); for a mixed-instances group, taken from its policy |
+| `capacity_rebalance`, `placement_group`, `max_instance_lifetime`, `default_instance_warmup`, `service_linked_role_arn` | as the API returned them |
+| `load_balancer_names`, `termination_policies`, `suspended_processes` | table (array of strings) |
 | `vpc_zone_identifier` | string |
 | `status` | string |
 | `new_instances_protected_from_scale_in` | boolean |
@@ -141,7 +185,8 @@ end
 | `instances` | table (array) |
 
 Every field is present only when the API returned it, except
-`availability_zones`, `target_group_arns`, `tags`, `tag_details` and
+`availability_zones`, `target_group_arns`, `load_balancer_names`,
+`termination_policies`, `suspended_processes`, `tags`, `tag_details` and
 `instances`, which are always tables — possibly empty — so indexing them
 needs no guard.
 
@@ -161,14 +206,15 @@ tags.
 
 Each entry in `instances` carries `instance_id`, `instance_type`,
 `availability_zone`, `lifecycle_state` (`InService`, `Pending`,
-`Terminating`, …), `health_status` (`Healthy`/`Unhealthy`), `image_id`
-and `protected_from_scale_in`.
+`Terminating`, …), `health_status` (`Healthy`/`Unhealthy`), `image_id`,
+`protected_from_scale_in`, and the `launch_template` (`id`, `name`,
+`version`) or `launch_configuration_name` it was launched from.
 
 > **The embedded `instances` array is capped at 50 by the API.** For a
 > group larger than that it is incomplete, silently. Use
 > `describe_instances` for the uncapped view.
 
-## `describe_instances`
+## `aws.autoscaling.describe_instances`
 
 List Auto Scaling instances directly — the uncapped counterpart to a
 group table's embedded `instances`, and the only way to ask the reverse
@@ -180,12 +226,14 @@ question (which group an instance belongs to), since each row carries
 **Parameters:**
 
 - `ids` (optional) — a string or array of instance ids. `nil`/omitted
-  describes every Auto Scaling instance in the account.
+  describes every Auto Scaling instance in the account; an empty table
+  raises. More than 50 ids are split into several requests.
 
 **Returns:** `(envelope, instances)` — an array of instance-detail
 tables: `instance_id`, `instance_type`, `group_name`,
 `availability_zone`, `lifecycle_state`, `health_status`, `image_id`,
-`protected_from_scale_in` (each present only when the API returned it).
+`protected_from_scale_in`, `launch_template` (`id`, `name`, `version`),
+`launch_configuration_name` (each present only when the API returned it).
 
 **Errors:** raises on any AWS API error.
 
@@ -194,7 +242,7 @@ local r, instances = aws.autoscaling.describe_instances({ "i-abc" }):send()
 print(instances[1].group_name)
 ```
 
-## `set_desired_capacity`
+## `aws.autoscaling.set_desired_capacity`
 
 Move a group to a size **within its existing `min_size`/`max_size`
 bounds**. Kept apart from `update_group` deliberately: asking for 20
@@ -208,12 +256,13 @@ silently raise the ceiling.
 - `group` (string) — the Auto Scaling group name.
 - `n` (number) — the desired capacity.
 
-**Builder methods:**
+**Methods:**
 
 - `:honor_cooldown()` — wait out the group's cooldown period instead of
   scaling now. Off by default: the API's own default is off, and a script
   asking for a capacity usually means now, not "once the cooldown
   allows it".
+- `:send()` — finalize the builder and run the request (async).
 
 **Returns:** `(envelope, nil)` — the API returns nothing; the envelope
 alone is the answer.
@@ -225,7 +274,7 @@ other AWS API error.
 aws.autoscaling.set_desired_capacity("web-prod", 6):send()
 ```
 
-## `update_group`
+## `aws.autoscaling.update_group`
 
 Patch a group's bounds, desired capacity, health-check grace period or
 default cooldown — the call that reshapes the group itself, as opposed to
@@ -237,7 +286,7 @@ default cooldown — the call that reshapes the group itself, as opposed to
 
 - `group` (string) — the Auto Scaling group name.
 
-**Builder methods** (every one optional; an unset knob is left alone, so
+**Methods:** (every one optional; an unset knob is left alone, so
 this is a patch, not a replacement):
 
 - `:min_size(<n>)`
@@ -245,6 +294,12 @@ this is a patch, not a replacement):
 - `:desired_capacity(<n>)`
 - `:health_check_grace_period(<secs>)`
 - `:default_cooldown(<secs>)`
+- `:launch_template({name = <name> | id = <id>, version = <version>})` —
+  point the group at a launch template; `version` may be `"$Latest"`,
+  `"$Default"` or a number. New instances use it; follow with
+  `start_instance_refresh` (whose own `:launch_template()` states the
+  target) to replace the running ones.
+- `:send()` — finalize the builder and run the request (async).
 
 **Returns:** `(envelope, nil)` — the API returns nothing.
 
@@ -267,7 +322,7 @@ A refresh replaces a group's instances in batches. It is asynchronous:
 through `describe_instance_refreshes` — or through `:wait()` on the start
 builder itself.
 
-### `start_instance_refresh`
+### `aws.autoscaling.start_instance_refresh`
 
 Begin an instance refresh on a group.
 
@@ -277,23 +332,35 @@ Begin an instance refresh on a group.
 
 - `group` (string) — the Auto Scaling group name.
 
-**Builder methods:**
+**Methods:**
 
 - `:min_healthy_percentage(<n>)` — minimum percentage of capacity that
-  must stay in service during the refresh.
+  must stay in service during the refresh (0–100).
 - `:max_healthy_percentage(<n>)` — maximum percentage of capacity allowed
-  above desired capacity during the refresh.
+  above desired capacity during the refresh (100–200).
 - `:instance_warmup(<secs>)` — seconds to wait after an instance reaches
-  `InService` before counting it healthy; falls back to the group's own
-  warmup when unset.
-- `:skip_matching()` — leave instances that already match the desired
-  configuration alone, rather than replacing them too.
-- `:auto_rollback()` — roll back automatically if the refresh fails.
-- `:strategy(<name>)` — the refresh strategy, e.g. `"Rolling"`.
-- `:wait()` — poll `describe_instance_refreshes` (every 15 seconds) until
-  the refresh reaches a terminal state, instead of returning the id and
-  leaving the loop to the script. It yields rather than blocking, so
-  several groups can refresh concurrently under [`task`](task.md).
+  `InService` before counting it healthy (≥ 0); falls back to the group's
+  default instance warmup, and failing that its health-check grace
+  period, when unset.
+- `:skip_matching([<bool>])` — leave instances that already match the
+  desired configuration alone, rather than replacing them too.
+- `:auto_rollback([<bool>])` — roll back automatically if the refresh
+  fails.
+- `:strategy(<name>)` — the refresh strategy, e.g. `"Rolling"`; an
+  unknown name raises.
+- `:launch_template({name = .. | id = .., version = ..})` — the launch
+  template version the refresh converges on (`DesiredConfiguration`), so
+  a new version can be rolled out.
+- `:wait([<bool>])` — poll `describe_instance_refreshes` (immediately,
+  then every 15 seconds) until the refresh reaches a terminal state,
+  instead of returning the id and leaving the loop to the script. Up to
+  two consecutive polling errors are tolerated; the third raises. It
+  yields rather than blocking, so several groups can refresh concurrently
+  under [`task`](task.md).
+- `:send()` — finalize the builder and run the request (async).
+
+Preferences are sent only when at least one of the preference methods
+was called.
 
 **Returns:**
 
@@ -324,7 +391,7 @@ if not r.ok then
 end
 ```
 
-### `describe_instance_refreshes`
+### `aws.autoscaling.describe_instance_refreshes`
 
 List a group's instance refreshes, newest first.
 
@@ -334,14 +401,14 @@ List a group's instance refreshes, newest first.
 
 - `group` (string) — the Auto Scaling group name.
 
-**Builder methods:**
+**Methods:**
 
 - `:id(<id>)` — narrow the listing to one refresh id. Repeatable.
+- `:send()` — finalize the builder and run the request (async).
 
 **Returns:** `(envelope, refreshes)` — an array of refresh tables, newest
 first, as the API returns them:
 
-| Field | Type |
 | --- | --- |
 | `instance_refresh_id` | string |
 | `group_name` | string |
@@ -351,6 +418,7 @@ first, as the API returns them:
 | `instances_to_update` | number |
 | `start_time` | string (RFC 3339) |
 | `end_time` | string (RFC 3339) |
+| `launch_template` | table (`id`, `name`, `version`), the desired configuration |
 
 **Errors:** raises on any AWS API error.
 
@@ -361,7 +429,7 @@ local r, refreshes = aws.autoscaling
 print(refreshes[1].status, refreshes[1].percentage_complete)
 ```
 
-### `cancel_instance_refresh`
+### `aws.autoscaling.cancel_instance_refresh`
 
 Stop a group's in-progress refresh, leaving already-replaced instances
 replaced.
@@ -372,7 +440,11 @@ replaced.
 
 - `group` (string) — the Auto Scaling group name.
 
-**Returns:** `(envelope, { instance_refresh_id = <id> })`.
+**Methods:** `:wait([<bool>])` — poll until the refresh is
+terminal, like `start_instance_refresh`'s; `ok` is true when it ended
+`Cancelled`.
+
+`:wait()` `(envelope, refresh)`.
 
 **Errors:** raises when there is no refresh in progress on the group, or
 on any other AWS API error.
@@ -381,7 +453,7 @@ on any other AWS API error.
 aws.autoscaling.cancel_instance_refresh("web-prod"):send()
 ```
 
-### `rollback_instance_refresh`
+### `aws.autoscaling.rollback_instance_refresh`
 
 Return a group to the configuration in place before its current refresh
 started.
@@ -392,13 +464,125 @@ started.
 
 - `group` (string) — the Auto Scaling group name.
 
-**Returns:** `(envelope, { instance_refresh_id = <id> })`.
+**Methods:** `:wait([<bool>])` — poll until the rollback is
+terminal; `ok` is true when it ended `RollbackSuccessful`.
+
+`:wait()` `(envelope, refresh)`.
 
 **Errors:** raises when there is no refresh in progress on the group, or
 on any other AWS API error.
 
 ```lua
 aws.autoscaling.rollback_instance_refresh("web-prod"):send()
+```
+
+## `aws.autoscaling.describe_scaling_activities`
+
+List scaling activities — the group's own event log: launch/terminate
+attempts, health-check replacements, capacity changes — each carrying a
+`cause` string naming what triggered it. This is the call to reach for
+when root-causing "why did my fleet change".
+
+**Signature:** `aws.autoscaling.describe_scaling_activities() -> builder`
+
+**Parameters:** none. Configure the request through the builder's
+methods, below.
+
+**Methods:**
+
+- `:group(<group>)` — narrow to one Auto Scaling group. Omitted, the read
+  is account-wide, which can be slower.
+- `:id(<id>)`/`:ids(<ids>)` — narrow to specific activity ids (a string or
+  array of strings for `:ids`). Unknown ids are ignored with no error.
+- `:include_deleted_groups([<bool>])` — include activity from groups that have
+  since been deleted. Off by default, matching the API: a deleted group's
+  history is not what "what happened to my fleet" usually means.
+- `:send()` — finalize the builder and run the request (async).
+
+**Returns:** `(envelope, activities)` — newest first, as the API returns
+them:
+
+| --- | --- |
+| `activity_id` | string |
+| `group_name` | string |
+| `description` | string |
+| `cause` | string |
+| `status_code` | string |
+| `status_message` | string |
+| `progress` | number (0–100) |
+| `details` | string |
+| `group_state` | string (`InService` or `Deleted`) |
+| `start_time` | string (RFC 3339) |
+| `end_time` | string (RFC 3339) |
+
+Only activities started within the last six weeks are returned,
+regardless of any filter.
+
+**Errors:** raises on any AWS API error.
+
+```lua
+local r, activities = aws.autoscaling.describe_scaling_activities()
+    :group("web-prod")
+    :send()
+
+for _, a in ipairs(activities) do
+    print(a.status_code, a.cause)
+end
+```
+
+## `aws.autoscaling.describe_policies`
+
+List scaling policies — their adjustment, cooldown and the CloudWatch
+alarms that drive them. Diagnosing *why* a policy fired is a job for the
+alarm's own history in CloudWatch, not this call alone; this is what the
+policy is configured to do, not a record of it doing so.
+
+**Signature:** `aws.autoscaling.describe_policies() -> builder`
+
+**Parameters:** none. Configure the request through the builder's
+methods, below.
+
+**Methods:**
+
+- `:group(<group>)` — narrow to one Auto Scaling group. Omitted, every
+  policy in the account is described.
+- `:name(<value>)` — filter to one or more policy names (a string or
+  array of strings).
+- `:policy_type(<value>)` — filter to one or more policy types
+  (`SimpleScaling`, `StepScaling`, `TargetTrackingScaling`,
+  `PredictiveScaling`).
+- `:send()` — finalize the builder and run the request (async).
+
+**Returns:** `(envelope, policies)`:
+
+| --- | --- |
+| `group_name` | string |
+| `name` | string |
+| `arn` | string |
+| `policy_type` | string |
+| `adjustment_type` | string |
+| `scaling_adjustment` | number |
+| `min_adjustment_magnitude` | number |
+| `cooldown` | number |
+| `estimated_instance_warmup` | number |
+| `enabled` | boolean |
+| `metric_aggregation_type` | string |
+| `step_adjustments` | table (array of `{metric_interval_lower_bound, metric_interval_upper_bound, scaling_adjustment}`) |
+| `target_tracking` | table (`target_value`, `disable_scale_in`, `predefined_metric_type`, `resource_label`), target-tracking policies only |
+| `alarms` | table (array of `{name, arn}`) |
+
+`alarms` is always a table, possibly empty, flattened to the name/ARN a
+script needs to correlate against CloudWatch — nothing about an alarm's
+current state lives here.
+
+**Errors:** raises on any AWS API error.
+
+```lua
+local r, policies = aws.autoscaling.describe_policies():group("web-prod"):send()
+
+for _, p in ipairs(policies) do
+    print(p.name, p.policy_type, p.alarms[1] and p.alarms[1].name)
+end
 ```
 
 ## Tagging
@@ -420,7 +604,7 @@ the group once keeps `ResourceId` from being repeated on every tag, and
 `ResourceType` is always `auto-scaling-group`, so we set it rather than
 asking.
 
-### `create_or_update_tags`
+### `aws.autoscaling.create_or_update_tags`
 
 Set tags on an Auto Scaling group, creating each key or overwriting its
 value.
@@ -431,10 +615,11 @@ value.
 
 - `group` (string) — the Auto Scaling group name.
 
-**Builder methods:**
+**Methods:**
 
 - `:tags(<map>)` — the tag set, a `{[key] = value}` map (`{ Env = "prod" }`).
-  Keys and values must both be strings. **Required**: neither "nothing" nor
+  Keys must be strings; values are strings, with numbers and booleans
+  coerced to their string form (as `aws.ec2` does). **Required**: neither "nothing" nor
   "everything" is a good guess at what an absent tag set meant. A list of
   keys is refused here — a write has no value to set. Called more than once,
   the last call wins.
@@ -447,6 +632,7 @@ value.
   spelling it per tag would need a nested table that fights the
   `{[key] = value}` map — so a set genuinely needing both must be split
   into two calls.
+- `:send()` — finalize the builder and run the request (async).
 
 **Returns:** `(envelope, nil)` — the API returns nothing; the envelope
 alone is the answer.
@@ -474,7 +660,7 @@ aws.autoscaling.create_or_update_tags("web-prod")
     :send()
 ```
 
-### `delete_tags`
+### `aws.autoscaling.delete_tags`
 
 Remove tags from an Auto Scaling group.
 
@@ -484,7 +670,7 @@ Remove tags from an Auto Scaling group.
 
 - `group` (string) — the Auto Scaling group name.
 
-**Builder methods:**
+**Methods:**
 
 - `:tags(<keys-or-map>)` — **either** an array of key strings
   (`{ "Env", "Name" }`), which deletes each key whatever value it holds, or
@@ -498,6 +684,7 @@ Remove tags from an Auto Scaling group.
 - `:propagate_at_launch()` — **not available here.** Calling it raises
   `delete_tags: ':propagate_at_launch()' applies to
   'create_or_update_tags'; a delete removes the tag either way`.
+- `:send()` — finalize the builder and run the request (async).
 
 **Returns:** `(envelope, nil)` — the API returns nothing.
 

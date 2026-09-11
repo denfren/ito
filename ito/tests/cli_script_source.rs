@@ -1,6 +1,6 @@
 //! Integration tests for how the CLI decides *what* to run and *where* paths
-//! point: `SCRIPT` as a path, `-C` applying after path arguments, and `-r`
-//! granting imports to scripts that have no file of their own.
+//! point: `SCRIPT` as a path (the only script source), and `-C` applying
+//! after path arguments.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -27,17 +27,7 @@ fn nested_fixture() -> TempDir {
     dir
 }
 
-// --- `-C` is accepted alongside every script source ---
-
-#[test]
-fn dash_c_works_with_inline() {
-    let dir = TempDir::new().unwrap();
-    ito()
-        .args(["-C", dir.path().to_str().unwrap(), "-s", r#"print("ok")"#])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("ok"));
-}
+// --- `-C` is accepted before the script ---
 
 #[test]
 fn dash_c_works_with_a_path() {
@@ -145,109 +135,18 @@ fn bare_invocation_lists_scripts_as_paths() {
         .stdout(predicate::str::contains("secret").not());
 }
 
-// --- `-r` grants imports to stdin / `-s` scripts ---
-
-/// A tmpdir holding `lib/mod.luau`, importable as `./lib/mod`.
-fn lib_fixture() -> TempDir {
-    let dir = TempDir::new().unwrap();
-    fs::create_dir(dir.path().join("lib")).unwrap();
-    fs::write(
-        dir.path().join("lib/mod.luau"),
-        r#"return { id = function() return "LIB" end }"#,
-    )
-    .unwrap();
-    dir
-}
+// --- `-` is a path like any other ---
 
 #[test]
-fn stdin_cannot_require_without_dash_r() {
-    let dir = lib_fixture();
+fn dash_is_a_path_not_stdin() {
+    // There is no stdin script: `-` names a file, and there is none here.
+    let dir = TempDir::new().unwrap();
     ito()
         .current_dir(dir.path())
         .arg("-")
-        .write_stdin(r#"require("./lib/mod")"#)
+        .write_stdin(r#"print("from stdin")"#)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("imports are disabled"))
-        .stderr(predicate::str::contains("-r"));
-}
-
-#[test]
-fn inline_cannot_require_without_dash_r() {
-    let dir = lib_fixture();
-    ito()
-        .current_dir(dir.path())
-        .args(["-s", r#"require("./lib/mod")"#])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("imports are disabled"));
-}
-
-#[test]
-fn dash_r_allows_stdin_to_require() {
-    let dir = lib_fixture();
-    ito()
-        .current_dir(dir.path())
-        .args(["-", "-r", "."])
-        .write_stdin(r#"print(require("./lib/mod").id())"#)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("LIB"));
-}
-
-#[test]
-fn dash_r_allows_inline_to_require() {
-    let dir = lib_fixture();
-    ito()
-        .current_dir(dir.path())
-        .args(["-s", r#"print(require("./lib/mod").id())"#, "-r", "."])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("LIB"));
-}
-
-#[test]
-fn dash_r_resolves_against_the_invocation_dir_not_dash_c() {
-    // `-C` applies after path arguments, so `-r .` means the directory the
-    // user typed it in even though `-C` moves the `fs` root elsewhere.
-    let dir = lib_fixture();
-    fs::create_dir(dir.path().join("other")).unwrap();
-    ito()
-        .current_dir(dir.path())
-        .args(["-", "-r", ".", "-C", "other"])
-        .write_stdin(r#"print(require("./lib/mod").id())"#)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("LIB"));
-}
-
-#[test]
-fn dash_r_confines_imports_to_its_tree() {
-    let dir = lib_fixture();
-    fs::write(
-        dir.path().join("secret.luau"),
-        r#"return { id = function() return "ESCAPED" end }"#,
-    )
-    .unwrap();
-    // Rooted at `lib`, a `../` reaches out of the tree and is refused.
-    ito()
-        .current_dir(dir.path())
-        .args(["-", "-r", "lib"])
-        .write_stdin(r#"print(require("../secret").id())"#)
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains("ESCAPED").not());
-}
-
-#[test]
-fn dash_r_is_rejected_with_a_script_file() {
-    let dir = lib_fixture();
-    fs::write(dir.path().join("main.lua"), r#"print("hi")"#).unwrap();
-    // A file already imports relative to itself, so `-r` would be ambiguous.
-    ito()
-        .current_dir(dir.path())
-        .args(["main.lua", "-r", "."])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("-r/--require applies to stdin"));
+        .code(2)
+        .stdout(predicate::str::contains("from stdin").not())
+        .stderr(predicate::str::contains("no script at"));
 }

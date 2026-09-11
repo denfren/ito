@@ -44,6 +44,13 @@ fn to_err(msg: impl std::fmt::Display) -> mlua::Error {
     mlua::Error::runtime(msg.to_string())
 }
 
+fn parse_err(name: &Option<String>, e: impl std::fmt::Display) -> mlua::Error {
+    match name {
+        Some(n) => to_err(format!("hcl parse error in {n}: {e}")),
+        None => to_err(format!("hcl parse error: {e}")),
+    }
+}
+
 /// A raw HCL expression value (bare keyword, traversal, function call,
 /// etc.), produced by `hcl.expr`/`hcl.ident`. Unlike a plain string
 /// attribute value (which is emitted quoted), this is rendered verbatim.
@@ -58,7 +65,7 @@ impl HclExpr {
     }
 
     /// Wrap a value-model expression. Used by the `hcl.edit` cursor's
-    /// `read_raw` to hand back a computed expression as an `HclExpr`.
+    /// `raw` to hand back a computed expression as an `HclExpr`.
     pub(super) fn from_expression(expr: hcl::Expression) -> Self {
         HclExpr(expr)
     }
@@ -106,8 +113,9 @@ fn to_expr(lua: &Lua, value: Value) -> Result<hcl::Expression> {
     {
         return Ok(ud.borrow::<HclExpr>()?.clone().0);
     }
-    let json: serde_json::Value = lua.from_value(value)?;
-    hcl::to_expression(json).map_err(|e| to_err(format!("hcl value error: {e}")))
+    let data = crate::scripting::codec::to_data(lua, &value, "hcl write error")?;
+    let edit = convert::data_to_hcl(&data).map_err(to_err)?;
+    Ok(hcl::Expression::from(edit))
 }
 
 fn ident(name: &str) -> Result<hcl::Identifier> {
@@ -159,6 +167,14 @@ fn render_comment(out: &mut String, comment: &Option<String>, pad: &str) {
 
 impl HclBody {
     fn add_attribute(&mut self, lua: &Lua, key: &str, value: Value) -> Result<()> {
+        let duplicate = self
+            .items
+            .borrow()
+            .iter()
+            .any(|i| matches!(i, Item::Attribute(a, _) if a.key.as_str() == key));
+        if duplicate {
+            return Err(to_err(format!("hcl builder error: duplicate attribute {key:?}")));
+        }
         let attr = hcl::Attribute::new(ident(key)?, to_expr(lua, value)?);
         self.items.borrow_mut().push(Item::Attribute(attr, None));
         Ok(())
@@ -241,7 +257,11 @@ impl HclBlock {
         let id = ident(&self.ident)?;
         let mut header = format!("{pad}{id}");
         for label in self.labels.borrow().iter() {
-            header.push_str(&format!(" {label:?}"));
+            // HCL's own string escaping (`${`/`%{` included), not Rust's `{:?}`
+            let quoted = hcl::format::to_string(&hcl::Expression::from(label.as_str()))
+                .map_err(|e| to_err(format!("hcl label error: {e}")))?;
+            header.push(' ');
+            header.push_str(quoted.trim_end());
         }
         header.push_str(" {\n");
         Ok(header)
@@ -327,6 +347,8 @@ impl UserData for HclBlock {
                 Ok(block.clone())
             },
         );
+        methods.add_method("to_string", |_, block, ()| block.render(0));
+        methods.add_meta_method(mlua::MetaMethod::ToString, |_, block, ()| block.render(0));
     }
 }
 
@@ -337,9 +359,9 @@ pub fn register(lua: &Lua) -> Result<()> {
     // hcl.parse(text) -> value
     module.set(
         "parse",
-        lua.create_function(|lua, text: String| -> Result<Value> {
+        lua.create_function(|lua, (text, name): (String, Option<String>)| -> Result<Value> {
             let value: hcl::Value =
-                hcl::from_str(&text).map_err(|e| to_err(format!("hcl parse error: {e}")))?;
+                hcl::from_str(&text).map_err(|e| parse_err(&name, e))?;
             lua.to_value(&value)
         })?,
     )?;
@@ -350,7 +372,10 @@ pub fn register(lua: &Lua) -> Result<()> {
     module.set(
         "to_string",
         lua.create_function(|lua, value: Value| -> Result<String> {
-            let v: hcl::Value = lua.from_value(value)?;
+            let data = crate::scripting::codec::to_data(lua, &value, "hcl serialize error")?;
+            let expr = hcl::Expression::from(convert::data_to_hcl(&data).map_err(to_err)?);
+            let v: hcl::Value = hcl::eval::Evaluate::evaluate(&expr, &hcl::eval::Context::new())
+                .map_err(|e| to_err(format!("hcl serialize error: {e}")))?;
             hcl::to_string(&v).map_err(|e| to_err(format!("hcl serialize error: {e}")))
         })?,
     )?;
@@ -404,10 +429,9 @@ pub fn register(lua: &Lua) -> Result<()> {
     // document's layout and comments; edits are surgical.
     module.set(
         "edit",
-        lua.create_function(|_, text: String| -> Result<HclDoc> {
-            let body: hcl::edit::structure::Body = text
-                .parse()
-                .map_err(|e| to_err(format!("hcl parse error: {e}")))?;
+        lua.create_function(|_, (text, name): (String, Option<String>)| -> Result<HclDoc> {
+            let body: hcl::edit::structure::Body =
+                text.parse().map_err(|e| parse_err(&name, e))?;
             Ok(HclDoc::new(Rc::new(RefCell::new(body))))
         })?,
     )?;

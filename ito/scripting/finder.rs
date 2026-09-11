@@ -258,21 +258,26 @@ pub struct Hit {
     real: PathBuf,
 }
 
+/// See [`Source::renderer`].
+pub type Renderer = std::sync::Arc<dyn Fn(&Path) -> Option<String> + Send + Sync>;
+
 /// The walk a host supplies. `rfs` walks the host filesystem; `vfs` walks the
 /// root and refuses escapes, so the finder itself needs to know neither.
 pub trait Source {
     /// Absolute path the walk starts at.
     fn start(&self) -> PathBuf;
-    /// Render an absolute path the way this `fs` spells results, or `None` to
-    /// drop it -- which is how the rooted VFS declines a symlink leaving the
-    /// root without the finder knowing what a root is.
-    fn render(&self, path: &Path) -> Option<String>;
+    /// A renderer of absolute paths the way this `fs` spells results, returning
+    /// `None` to drop one -- which is how the rooted VFS declines a symlink
+    /// leaving the root without the finder knowing what a root is. `Send + Sync`
+    /// because the walker's prune callback needs it: the walk applies it to
+    /// entries *before* descending, so an outward link is never entered.
+    fn renderer(&self) -> Renderer;
     /// Whether links are resolved whatever the script asked for.
     ///
-    /// The rooted VFS says yes: `iq`/`ied` are deliberately **not**
+    /// The rooted VFS says yes: `ied` are deliberately **not**
     /// symlink-aware, so a link is the thing it points at rather than an object
     /// in its own right, and there is no `:follow()` to ask with. That is safe
-    /// precisely because [`render`](Source::render) is a containment check on
+    /// precisely because [`renderer`](Source::renderer) is a containment check on
     /// the *resolved* location -- resolving more can only surface files already
     /// inside the root, and a link leaving it is refused whether or not it was
     /// followed. The host filesystem says no and lets `:follow()` decide.
@@ -448,6 +453,16 @@ impl<S: Source> Finder<S> {
         };
 
         let start = self.source.start();
+        let render = self.source.renderer();
+        // A missing start raises, as `fs.list` does, rather than looking like
+        // an empty result.
+        if !start.is_dir() {
+            let shown = render(&start).unwrap_or_default();
+            return Err(mlua::Error::runtime(format!(
+                "finder: {}: no such directory",
+                if shown.is_empty() { "." } else { &shown }
+            )));
+        }
         let mut builder = WalkBuilder::new(&start);
         builder
             .hidden(restrictions.skip_hidden)
@@ -470,30 +485,23 @@ impl<S: Source> Finder<S> {
         // nothing. Filtering after the fact would drop `target` and still walk
         // `target/debug/...`, which is both slower and wrong: an exclude names a
         // region, not a single entry.
-        if !excludes.patterns.is_empty() {
+        {
             let excludes = excludes.clone();
-            // Matched against the descent from the start directory rather than
-            // the rendered path: the walker's callback has to be `Send + Sync`
-            // and a `Source` is neither (it is `Rc`-held, single-threaded by
-            // design). The two agree on everything an exclude can express --
-            // both spell the descent with `/` and neither carries the start
-            // directory's own prefix -- so `**/target/**` and `node_modules`
-            // mean the same here as in the result-side check below.
-            let start = start.clone();
+            let render = render.clone();
             builder.filter_entry(move |entry| {
                 // Depth 0 is the start directory: pruning it would empty the
                 // search, and the caller already chose it by name.
                 if entry.depth() == 0 {
                     return true;
                 }
-                let descent = entry
-                    .path()
-                    .strip_prefix(&start)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .into_owned();
+                // A path the renderer declines (a link leaving the rooted VFS)
+                // is pruned here, before the walk descends into it.
+                let Some(rendered) = render(entry.path()) else {
+                    return false;
+                };
+                // Matched against the same rendered string `:path()` sees.
                 let name = entry.file_name().to_string_lossy();
-                !excludes.is_match(&descent, &name)
+                excludes.patterns.is_empty() || !excludes.is_match(&rendered, &name)
             });
         }
         // Depth bounds prune rather than filter: `max_depth` above stops the
@@ -517,7 +525,7 @@ impl<S: Source> Finder<S> {
                 continue;
             }
             let path = entry.path();
-            let Some(rendered) = self.source.render(path) else {
+            let Some(rendered) = render(path) else {
                 continue;
             };
             let name = entry.file_name().to_string_lossy();
@@ -773,9 +781,9 @@ fn capture_pairs(re: &regex::Regex, text: &str) -> Vec<(String, String)> {
         return Vec::new();
     };
     let mut pairs = Vec::new();
-    // Group 0 is skipped: it is the whole match, which the caller already has as
-    // `text`.
-    for (i, group) in caps.iter().enumerate().skip(1) {
+    // Group 0 (the whole match) is kept, so the shape is `re.captures`'s: the
+    // line's `text` is the whole *line*, group 0 just the match within it.
+    for (i, group) in caps.iter().enumerate() {
         // A group that did not participate is omitted rather than empty-stringed
         // -- the distinction `re.captures` also keeps.
         let Some(m) = group else { continue };
@@ -821,10 +829,10 @@ where
 /// `:grep()`/`:grep_files()` are here for a different reason, and a temporary
 /// one: they are the only terminals that *open* a matched file, so under a root
 /// they would need the containment check to cover reads as well as paths.
-/// [`Source::render`] settles which paths may be named, not which bytes may be
+/// [`Source::renderer`] settles which paths may be named, not which bytes may be
 /// read, and the two are the same question only as long as nothing follows a
 /// rendered path back to disk. Wiring that up is the work of exposing grep on
-/// `iq`/`ied`; until then the rooted finder simply does not have it.
+/// `ied`; until then the rooted finder simply does not have it.
 pub fn add_methods_with_follow<T, S, M>(methods: &mut M, project: fn(&T) -> &Finder<S>)
 where
     T: Clone + mlua::UserData + 'static,

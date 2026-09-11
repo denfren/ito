@@ -1,0 +1,10 @@
+---
+source: ito/tests/hcl_edit.rs
+assertion_line: 135
+expression: "eval_str(VAR_X_TYPE_LIST_DEFAULT_VAR,\nr#\"local h = hcl.edit(subject)\n           local t = h:block(\"variable\",\"x\"):attr(\"type\"):raw()\n           h:block(\"variable\",\"x\"):add(\"alias\", t)\n           return h:to_string()\"#)"
+---
+variable "x" {
+  type = list(string)
+  default = var.fallback
+  alias = list(string)
+}

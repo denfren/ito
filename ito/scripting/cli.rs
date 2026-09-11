@@ -23,10 +23,16 @@
 //! themselves — a value out of range, two options that conflict — the same way
 //! a malformed command line is reported: the message on stderr, the usage
 //! block's summary beneath it, exit 2. It takes the condition already
-//! evaluated (Luau decides truthiness, not the module) plus an optional
-//! message, and does nothing when the condition holds. Unlike `cli.opt`/
-//! `cli.arg`, it is meant to run *after* `cli.parse()`, since it checks parsed
-//! values — but nothing stops an earlier call.
+//! evaluated plus an optional message, and does nothing when the condition
+//! holds. The condition must be a **boolean** (`nil` fails); any other type
+//! raises, so `cli.assert(env(), ...)` with a string is an error rather than a
+//! pass. Unlike `cli.opt`/`cli.arg`, it is meant to run *after* `cli.parse()`,
+//! since it checks parsed values — but nothing stops an earlier call.
+//!
+//! `cli.parse()` takes the script's own `argv`; `cli.parse(list)` parses the
+//! given list of strings instead. A run that printed help or a usage error is
+//! over: a `pcall` that swallows the exit gets the same exit again from every
+//! later `cli.parse`.
 //!
 //! A handle is callable, and `h()` is exactly `h:get()` — the short form is the
 //! one to reach for; the method spelling stays for the cases where a handle is
@@ -75,7 +81,7 @@
 //! | spec | meaning | `get()` | `count()` |
 //! | --- | --- | --- | --- |
 //! | `v/verbose` | flag | `true`/`false` | occurrences (`-vv` → 2) |
-//! | `e/env=` | required value | string, `nil` when absent | 0 or 1 |
+//! | `e/env=` | takes a value | string, `nil` when absent | 0 or 1 |
 //! | `f/file=?` | optional value | string, `true` if bare, `nil` when absent | 0 or 1 |
 //! | `I/include=+` | repeatable value | list of strings, `{}` when absent | elements |
 //!
@@ -91,6 +97,20 @@
 //! one-character *long* option the default cannot reach. A spec with nothing on
 //! either side (`""`, `"/"`) is an error. Absence is always a value, never `nil` for
 //! the collection forms, so `ipairs` and `:count() > 0` work unconditionally.
+//!
+//! A value option never swallows a following token that looks like a flag
+//! (`--env --help` is a missing value; write `--env=--help` to pass one), but a
+//! negative number (`-5`) is a value. `-e=` and `--env=` both mean an empty
+//! value. A single-value option given twice is a usage error, not last-wins.
+//!
+//! # The options table
+//!
+//! The third argument of `cli.opt`/`cli.arg` is either the `details` string or
+//! a table: `{details=, default=, required=, choices=, value_name=}`.
+//! `required` (options only) makes absence a usage error; `default` is what an
+//! absent value reads as (it does not count as an occurrence, and only an
+//! optional argument may have one); `choices` restricts the accepted values;
+//! `value_name` is the `<name>` the help shows. Flags take none of these.
 //!
 //! # Positional specs
 //!
@@ -118,8 +138,8 @@
 //!
 //! Both are *terminal*, which is what lets every binary have this module even
 //! though it writes to stdout: a run that prints help or a usage block unwinds
-//! out of `eval` and so never reaches `emit_returned` (`iq`'s return value) or
-//! `emit_reports`/`flush_writes` (`ied`'s diff and its buffered edits). There is
+//! out of `eval` and so never reaches `emit_reports`/`flush_writes`
+//! (`ied`'s diff and its buffered edits). There is
 //! nothing for the output to interleave with, and nothing is committed.
 
 use std::cell::RefCell;
@@ -164,7 +184,7 @@ pub fn exit_code(e: &mlua::Error) -> Option<i32> {
     }
 }
 
-fn exit_error(code: i32) -> mlua::Error {
+pub(crate) fn exit_error(code: i32) -> mlua::Error {
     mlua::Error::external(CliExit { code })
 }
 
@@ -196,6 +216,121 @@ struct OptSpec {
     details: Option<String>,
     /// How this spec takes part in the auto-registered help, if at all.
     help: Help,
+    /// Default, required, choices and value name (the options-table form).
+    extra: Extra,
+}
+
+/// What the options-table form of `cli.opt`/`cli.arg` adds to a declaration.
+#[derive(Debug, Clone, Default)]
+struct Extra {
+    /// Read when the option/argument is absent.
+    default: Option<String>,
+    /// An option that must appear (`cli.opt` only).
+    required: bool,
+    /// The only values accepted; empty means any.
+    choices: Vec<String>,
+    /// The `<name>` shown for a value in the help (`cli.opt` only).
+    value_name: Option<String>,
+}
+
+impl Extra {
+    /// The bracketed notes appended to a help description.
+    fn notes(&self) -> String {
+        let mut s = String::new();
+        if self.required {
+            s.push_str(" [required]");
+        }
+        if !self.choices.is_empty() {
+            s.push_str(&format!(" [choices: {}]", self.choices.join(", ")));
+        }
+        if let Some(d) = &self.default {
+            s.push_str(&format!(" [default: {d}]"));
+        }
+        s
+    }
+
+    /// Check a supplied value against `choices`.
+    fn check(&self, name: &str, value: &str) -> Result<(), String> {
+        if self.choices.is_empty() || self.choices.iter().any(|c| c == value) {
+            return Ok(());
+        }
+        Err(format!(
+            "invalid value {value:?} for {name} (choices: {})",
+            self.choices.join(", ")
+        ))
+    }
+}
+
+/// `description` followed by the notes, for the help rows and sections.
+fn with_notes(description: Option<&str>, extra: &Extra) -> Option<String> {
+    let notes = extra.notes();
+    match (description, notes.is_empty()) {
+        (None, true) => None,
+        (Some(d), true) => Some(d.to_string()),
+        (Some(d), false) => Some(format!("{d}{notes}")),
+        (None, false) => Some(notes.trim_start().to_string()),
+    }
+}
+
+/// Read the third argument of `cli.opt`/`cli.arg`: a `details` string, or an
+/// options table (`details`, `default`, `required`, `choices`, `value_name`).
+fn read_extras(
+    value: Option<mlua::Value>,
+    what: &str,
+    positional: bool,
+) -> mlua::Result<(Option<String>, Extra)> {
+    let err = |m: String| mlua::Error::runtime(format!("{what}: {m}"));
+    let table = match value {
+        None | Some(mlua::Value::Nil) => return Ok((None, Extra::default())),
+        Some(mlua::Value::String(s)) => {
+            return Ok((Some(s.to_str()?.to_string()), Extra::default()));
+        }
+        Some(mlua::Value::Table(t)) => t,
+        Some(other) => {
+            return Err(err(format!(
+                "expected a details string or an options table, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let mut details = None;
+    let mut extra = Extra::default();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let mlua::Value::String(key) = &key else {
+            return Err(err("the options table takes named keys only".to_string()));
+        };
+        let key = key.to_str()?.to_string();
+        let text = |v: &mlua::Value| -> mlua::Result<String> {
+            match v {
+                mlua::Value::String(s) => Ok(s.to_str()?.to_string()),
+                mlua::Value::Integer(_) | mlua::Value::Number(_) => Ok(v.to_string()?),
+                other => Err(err(format!(
+                    "{key} expects a string, got {}",
+                    other.type_name()
+                ))),
+            }
+        };
+        match (key.as_str(), &value) {
+            ("details", _) => details = Some(text(&value)?),
+            ("default", _) => extra.default = Some(text(&value)?),
+            ("required", mlua::Value::Boolean(b)) if !positional => extra.required = *b,
+            ("required", _) if !positional => {
+                return Err(err("required expects a boolean".to_string()));
+            }
+            ("value_name", _) if !positional => extra.value_name = Some(text(&value)?),
+            ("choices", mlua::Value::Table(list)) => {
+                for v in list.sequence_values::<mlua::Value>() {
+                    extra.choices.push(text(&v?)?);
+                }
+            }
+            ("choices", _) => return Err(err("choices expects a list of strings".to_string())),
+            (other, _) => {
+                return Err(err(format!("unknown key {other:?} in the options table")));
+            }
+        }
+    }
+    Ok((details, extra))
 }
 
 /// A spec's role in the auto-registered `-h`/`--help`.
@@ -236,11 +371,12 @@ impl OptSpec {
             (None, Some(l)) => s.push_str(&format!("    --{l}")),
             (None, None) => unreachable!("a spec with neither half is rejected at parse"),
         }
+        let v = self.extra.value_name.as_deref().unwrap_or("value");
         match self.arity {
             Arity::Flag => {}
-            Arity::Required => s.push_str("=<value>"),
-            Arity::Optional => s.push_str("[=<value>]"),
-            Arity::Many => s.push_str("=<value>..."),
+            Arity::Required => s.push_str(&format!("=<{v}>")),
+            Arity::Optional => s.push_str(&format!("[=<{v}>]")),
+            Arity::Many => s.push_str(&format!("=<{v}>...")),
         }
         s
     }
@@ -354,6 +490,8 @@ struct ArgSpec {
     /// Longer prose, shown only by `--help`, under this argument's own
     /// heading rather than the summary table's row.
     details: Option<String>,
+    /// `default` and `choices` from the options-table form.
+    extra: Extra,
 }
 
 impl ArgSpec {
@@ -410,6 +548,9 @@ enum Value {
     Absent,
     Bare,
     One(String),
+    /// Absent, but the declaration's `default` stands in: reads as that value
+    /// and does not count as an occurrence.
+    Default(String),
     /// A `=+` option's accumulated values, or a `...` positional's.
     List(Vec<String>),
 }
@@ -425,7 +566,7 @@ impl Value {
     fn count(&self) -> u32 {
         match self {
             Value::Flag(n) => *n,
-            Value::Absent => 0,
+            Value::Absent | Value::Default(_) => 0,
             Value::Bare | Value::One(_) => 1,
             Value::List(items) => items.len() as u32,
         }
@@ -438,7 +579,7 @@ impl mlua::IntoLua for Value {
             Value::Flag(n) => Ok(mlua::Value::Boolean(n > 0)),
             Value::Absent => Ok(mlua::Value::Nil),
             Value::Bare => Ok(mlua::Value::Boolean(true)),
-            Value::One(s) => lua.create_string(&s).map(mlua::Value::String),
+            Value::One(s) | Value::Default(s) => lua.create_string(&s).map(mlua::Value::String),
             Value::List(items) => lua.create_sequence_from(items).map(mlua::Value::Table),
         }
     }
@@ -458,6 +599,10 @@ struct Registry {
     opt_values: Vec<Value>,
     arg_values: Vec<Value>,
     parsed: bool,
+    /// Set once `cli.parse`/`cli.assert` has printed and exited, so a `pcall`
+    /// that swallowed the sentinel cannot get a second, different parse: every
+    /// later `cli.parse` re-raises the same exit.
+    exit: Option<i32>,
     /// What the script is for, shown above the usage line; set by `cli.about`.
     /// One line's worth: it heads `-h`, `--help` and a usage error alike.
     summary: Option<String>,
@@ -556,7 +701,7 @@ fn usage(reg: &Registry, detail: Detail) -> String {
     }
 
     let shape: Vec<String> = reg.args.iter().map(ArgSpec::label).collect();
-    out.push_str("Arguments:");
+    out.push_str("Usage:");
     if !reg.opts.is_empty() {
         out.push_str(" [options]");
     }
@@ -587,7 +732,7 @@ fn usage(reg: &Registry, detail: Detail) -> String {
                 };
                 out.push_str(&render_section(
                     &name,
-                    a.description.as_deref(),
+                    with_notes(a.description.as_deref(), &a.extra).as_deref(),
                     a.details.as_deref(),
                 ));
             }
@@ -598,7 +743,7 @@ fn usage(reg: &Registry, detail: Detail) -> String {
             for o in shown() {
                 out.push_str(&render_section(
                     &o.label(),
-                    o.description.as_deref(),
+                    with_notes(o.description.as_deref(), &o.extra).as_deref(),
                     o.details.as_deref(),
                 ));
             }
@@ -630,14 +775,22 @@ fn usage(reg: &Registry, detail: Detail) -> String {
             } else {
                 a.name.clone()
             };
-            out.push_str(&render_row(&name, width, a.description.as_deref()));
+            out.push_str(&render_row(
+                &name,
+                width,
+                with_notes(a.description.as_deref(), &a.extra).as_deref(),
+            ));
         }
     }
 
     if !reg.opts.is_empty() {
         out.push_str("\nOptions:\n");
         for o in shown() {
-            out.push_str(&render_row(&o.label(), width, o.description.as_deref()));
+            out.push_str(&render_row(
+                &o.label(),
+                width,
+                with_notes(o.description.as_deref(), &o.extra).as_deref(),
+            ));
         }
     }
 
@@ -708,11 +861,23 @@ fn record(
             let Some(v) = value else {
                 return Err(format!("{} requires a value", spec.name()));
             };
+            spec.extra.check(&spec.name(), &v)?;
+            // Silently last-wins would make `:count()` undercount and hide a
+            // typo'd command line.
+            if !matches!(values[index], Value::Absent) {
+                return Err(format!("{} given more than once", spec.name()));
+            }
             values[index] = Value::One(v);
         }
         Arity::Optional => {
+            if !matches!(values[index], Value::Absent) {
+                return Err(format!("{} given more than once", spec.name()));
+            }
             values[index] = match value {
-                Some(v) => Value::One(v),
+                Some(v) => {
+                    spec.extra.check(&spec.name(), &v)?;
+                    Value::One(v)
+                }
                 None => Value::Bare,
             };
         }
@@ -720,6 +885,7 @@ fn record(
             let Some(v) = value else {
                 return Err(format!("{} requires a value", spec.name()));
             };
+            spec.extra.check(&spec.name(), &v)?;
             let Value::List(items) = &mut values[index] else {
                 unreachable!("a repeatable option's slot is always a list")
             };
@@ -750,6 +916,12 @@ fn scan_options(reg: &mut Registry) -> Result<Vec<String>, String> {
     let mut positionals: Vec<String> = Vec::new();
     let argv = reg.argv.clone();
     let mut it = argv.into_iter().peekable();
+    // A negative number is a positional unless the script declared a digit as
+    // a short option (`-1`), in which case the option wins.
+    let digit_short = reg
+        .opts
+        .iter()
+        .any(|o| o.short.is_some_and(|c| c.is_ascii_digit()));
     // After `--` every remaining token is positional, however it is spelled.
     let mut only_positional = false;
 
@@ -772,15 +944,19 @@ fn scan_options(reg: &mut Registry) -> Result<Vec<String>, String> {
                 // Quoted, because unlike the messages naming a *declared*
                 // option this echoes what the user typed -- and unquoted, an
                 // empty or space-bearing name would vanish into the sentence.
-                return Err(format!("unknown option \"--{name}\""));
+                return Err(match suggest(&reg.opts, name) {
+                    Some(s) => format!("unknown option \"--{name}\" (did you mean \"--{s}\"?)"),
+                    None => format!("unknown option \"--{name}\""),
+                });
             };
             let spec = spec.clone();
             // A required value may be written `--env=prod` or `--env prod`; only
             // the latter needs to reach forward, and only when nothing was
-            // attached.
+            // attached. It never swallows something that looks like a flag:
+            // `--env --help` is a missing value, `--env=--help` passes it.
             let value = match (inline, spec.arity) {
                 (Some(v), _) => Some(v),
-                (None, Arity::Required | Arity::Many) => it.next(),
+                (None, Arity::Required | Arity::Many) => next_value(&mut it, digit_short),
                 (None, _) => None,
             };
             record(&mut opt_values, &spec, index, value)?;
@@ -789,6 +965,7 @@ fn scan_options(reg: &mut Registry) -> Result<Vec<String>, String> {
 
         // A lone `-` is a conventional stand-in for stdin, so it is a value.
         if token.len() > 1
+            && !(is_negative_number(&token) && !digit_short)
             && let Some(body) = token.strip_prefix('-')
         {
             let mut chars = body.chars().peekable();
@@ -799,20 +976,23 @@ fn scan_options(reg: &mut Registry) -> Result<Vec<String>, String> {
                 let spec = spec.clone();
                 let value = match spec.arity {
                     // The rest of the cluster is the value if there is any
-                    // (`-eprod`, `-e=prod`), else the next argument.
+                    // (`-eprod`, `-e=prod`), else the next argument. `-e=`
+                    // means an empty value, like `--env=`.
                     Arity::Required | Arity::Many => {
                         let rest: String = chars.by_ref().collect();
-                        let rest = rest.strip_prefix('=').map(str::to_string).unwrap_or(rest);
-                        if rest.is_empty() {
-                            it.next()
-                        } else {
-                            Some(rest)
+                        match rest.strip_prefix('=') {
+                            Some(v) => Some(v.to_string()),
+                            None if rest.is_empty() => next_value(&mut it, digit_short),
+                            None => Some(rest),
                         }
                     }
                     Arity::Optional => {
                         let rest: String = chars.by_ref().collect();
-                        let rest = rest.strip_prefix('=').map(str::to_string).unwrap_or(rest);
-                        if rest.is_empty() { None } else { Some(rest) }
+                        match rest.strip_prefix('=') {
+                            Some(v) => Some(v.to_string()),
+                            None if rest.is_empty() => None,
+                            None => Some(rest),
+                        }
                     }
                     Arity::Flag => None,
                 };
@@ -824,9 +1004,64 @@ fn scan_options(reg: &mut Registry) -> Result<Vec<String>, String> {
         positionals.push(token);
     }
 
+    // Absent options: a required one is an error, a defaulted one reads as its
+    // default (without counting as an occurrence).
+    for (spec, value) in reg.opts.iter().zip(opt_values.iter_mut()) {
+        if matches!(value, Value::Absent) {
+            if spec.extra.required {
+                return Err(format!("missing required option {}", spec.name()));
+            }
+            if let Some(d) = &spec.extra.default {
+                *value = Value::Default(d.clone());
+            }
+        }
+    }
+
     // Options are settled; `--help` can be answered from here on.
     reg.opt_values = opt_values;
     Ok(positionals)
+}
+
+/// `-5`, `-1.5`, `-.5`: a negative number, which is a value rather than a flag.
+fn is_negative_number(token: &str) -> bool {
+    token
+        .strip_prefix('-')
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit() || c == '.'))
+        && token.parse::<f64>().is_ok()
+}
+
+/// The token after an option that takes a value, unless it looks like a flag
+/// (so `--env --help` does not eat `--help`).
+fn next_value(
+    it: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+    digit_short: bool,
+) -> Option<String> {
+    let t = it.peek()?;
+    let flag_like = t.starts_with('-') && t.len() > 1 && !(is_negative_number(t) && !digit_short);
+    if flag_like { None } else { it.next() }
+}
+
+/// The declared long option closest to a mistyped `name`, if any is near.
+fn suggest(opts: &[OptSpec], name: &str) -> Option<String> {
+    let distance = |a: &str, b: &str| {
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.chars().enumerate() {
+            let mut cur = vec![i + 1];
+            for (j, cb) in b.iter().enumerate() {
+                let sub = prev[j] + usize::from(ca != *cb);
+                cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+            }
+            prev = cur;
+        }
+        prev[b.len()]
+    };
+    opts.iter()
+        .filter_map(|o| o.long.as_deref())
+        .map(|l| (distance(name, l), l))
+        .filter(|(d, l)| *d <= 2 && *d < l.len().max(2))
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, l)| l.to_string())
 }
 
 /// Assign the leftover tokens to the declared positionals.
@@ -841,16 +1076,32 @@ fn match_positionals(reg: &mut Registry, positionals: Vec<String>) -> Result<(),
     let mut arg_values: Vec<Value> = Vec::with_capacity(reg.args.len());
     let mut rest = positionals.into_iter();
     for spec in &reg.args {
+        let label = format!("<{}>", spec.name);
         match spec.kind {
             ArgKind::Required => match rest.next() {
-                Some(v) => arg_values.push(Value::One(v)),
+                Some(v) => {
+                    spec.extra.check(&label, &v)?;
+                    arg_values.push(Value::One(v));
+                }
                 None => return Err(format!("missing required argument <{}>", spec.name)),
             },
             ArgKind::Optional => arg_values.push(match rest.next() {
-                Some(v) => Value::One(v),
-                None => Value::Absent,
+                Some(v) => {
+                    spec.extra.check(&label, &v)?;
+                    Value::One(v)
+                }
+                None => match &spec.extra.default {
+                    Some(d) => Value::Default(d.clone()),
+                    None => Value::Absent,
+                },
             }),
-            ArgKind::Rest => arg_values.push(Value::List(rest.by_ref().collect())),
+            ArgKind::Rest => {
+                let items: Vec<String> = rest.by_ref().collect();
+                for v in &items {
+                    spec.extra.check(&label, v)?;
+                }
+                arg_values.push(Value::List(items));
+            }
         }
     }
 
@@ -870,6 +1121,38 @@ fn match_positionals(reg: &mut Registry, positionals: Vec<String>) -> Result<(),
     reg.arg_values = arg_values;
     reg.parsed = true;
     Ok(())
+}
+
+/// Report a complaint about the command line, and remember that the run is over.
+///
+/// The usage block, on stderr, exit 2. Straight there rather than through
+/// `tracing`, because this is the program explaining its own interface, not a
+/// log line. Summary only: someone who mistyped a flag wants the complaint next
+/// to the shape that corrects it -- the one-line summary says what the tool is,
+/// but the details would wedge a paragraph between the error and its usage.
+fn reject(r: &mut Registry, message: String) -> mlua::Error {
+    use std::io::Write;
+
+    let text = usage(r, Detail::Summary);
+    // Point at the help the script still has, if any.
+    let hint = r
+        .opts
+        .iter()
+        .find(|o| matches!(o.help, Help::Row | Help::Lone) && o.long.is_some())
+        .map(|_| "--help")
+        .or_else(|| {
+            r.opts
+                .iter()
+                .any(|o| matches!(o.help, Help::Lone | Help::Folded) && o.short == Some('h'))
+                .then_some("-h")
+        })
+        .map(|h| format!("\nFor more information, try '{h}'.\n"))
+        .unwrap_or_default();
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "error: {message}\n\n{text}{hint}");
+    let _ = err.flush();
+    r.exit = Some(2);
+    exit_error(2)
 }
 
 // ---------------------------------------------------------------------------
@@ -895,8 +1178,9 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                 ));
             }
             // Last call wins rather than raising: unlike a duplicate option there
-            // is nothing ambiguous about it, and a `require`d module setting one
-            // should not defeat the entry script. Both halves move together --
+            // is nothing ambiguous about it. (A module `require`d *after* the
+            // entry's own call therefore overrides it; call it last if that
+            // matters.) Both halves move together --
             // a one-argument call clears any details a previous call set, since
             // otherwise the survivor would head prose it was never written for.
             r.summary = Some(summary);
@@ -909,8 +1193,27 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
     module.set(
         "opt",
         lua.create_function(
-            move |_, (spec, description, details): (String, Option<String>, Option<String>)| {
+            move |_, (spec, description, third): (String, Option<String>, Option<mlua::Value>)| {
                 let (short, long, arity) = parse_spec(&spec).map_err(mlua::Error::runtime)?;
+                let (details, extra) = read_extras(third, "cli.opt", false)?;
+                let bad = |m: &str| mlua::Error::runtime(format!("cli.opt {spec:?}: {m}"));
+                if arity == Arity::Flag
+                    && (extra.required || extra.default.is_some() || !extra.choices.is_empty())
+                {
+                    return Err(bad("a flag takes no default, required or choices"));
+                }
+                if arity == Arity::Many && extra.default.is_some() {
+                    return Err(bad("a repeatable option takes no default"));
+                }
+                if extra.required && extra.default.is_some() {
+                    return Err(bad("required and default contradict each other"));
+                }
+                if let Some(d) = &extra.default
+                    && !extra.choices.is_empty()
+                    && !extra.choices.contains(d)
+                {
+                    return Err(bad("the default is not one of the choices"));
+                }
                 let mut r = reg.borrow_mut();
                 if r.parsed {
                     return Err(mlua::Error::runtime(
@@ -940,6 +1243,7 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                     description,
                     details,
                     help: Help::No,
+                    extra,
                 });
                 let index = r.opts.len() - 1;
                 drop(r);
@@ -956,8 +1260,22 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
     module.set(
         "arg",
         lua.create_function(
-            move |_, (name, description, details): (String, Option<String>, Option<String>)| {
+            move |_, (name, description, third): (String, Option<String>, Option<mlua::Value>)| {
                 let (bare, kind) = parse_arg_name(&name).map_err(mlua::Error::runtime)?;
+                let (details, extra) = read_extras(third, "cli.arg", true)?;
+                if extra.default.is_some() && kind != ArgKind::Optional {
+                    return Err(mlua::Error::runtime(format!(
+                        "cli.arg {name:?}: only an optional argument (`{bare}?`) takes a default"
+                    )));
+                }
+                if let Some(d) = &extra.default
+                    && !extra.choices.is_empty()
+                    && !extra.choices.contains(d)
+                {
+                    return Err(mlua::Error::runtime(format!(
+                        "cli.arg {name:?}: the default is not one of the choices"
+                    )));
+                }
                 let mut r = reg.borrow_mut();
                 if r.parsed {
                     return Err(mlua::Error::runtime(
@@ -993,6 +1311,7 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                     kind,
                     description,
                     details,
+                    extra,
                 });
                 let index = r.args.len() - 1;
                 drop(r);
@@ -1008,12 +1327,19 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
     let reg = registry.clone();
     module.set(
         "parse",
-        lua.create_function(move |_, ()| {
-            use std::io::Write;
-
+        // An optional list of tokens to parse instead of the script's `argv`.
+        lua.create_function(move |_, tokens: Option<Vec<String>>| {
             let mut r = reg.borrow_mut();
+            // A `pcall` may have swallowed an earlier exit: re-raise it rather
+            // than parsing a half-consumed registry a second time.
+            if let Some(code) = r.exit {
+                return Err(exit_error(code));
+            }
             if r.parsed {
                 return Err(mlua::Error::runtime("cli.parse() called twice"));
+            }
+            if let Some(tokens) = tokens {
+                r.argv = tokens;
             }
 
             // `-h`/`--help` unless the script wanted those spellings for itself,
@@ -1055,6 +1381,7 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                     // When `--help` is there too it carries the row; alone (the
                     // script claimed `--help` itself) this one is the row.
                     help: if both { Help::Folded } else { Help::Lone },
+                    extra: Extra::default(),
                 });
                 r.opts.len() - 1
             });
@@ -1074,29 +1401,44 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                     details: None,
                     // Only names `-h` in its label when it actually owns it.
                     help: if both { Help::Row } else { Help::Lone },
+                    extra: Extra::default(),
                 });
                 r.opts.len() - 1
             });
 
-            // Reported the same way wherever it came from: the usage block, on
-            // stderr, exit 2. Straight there rather than through `tracing`,
-            // because this is the program explaining its own interface, not a
-            // log line.
-            // Summary only: someone who mistyped a flag wants the complaint next
-            // to the shape that corrects it. The one-line summary earns its
-            // place -- it says what the tool is -- but the details would wedge a
-            // paragraph between the error and the usage it belongs to.
-            let reject = |r: &Registry, message: String| {
-                let text = usage(r, Detail::Summary);
-                let mut err = std::io::stderr().lock();
-                let _ = write!(err, "error: {message}\n\n{text}");
-                let _ = err.flush();
-                exit_error(2)
+            // The help a mistyped command line can still ask for: a usage error
+            // must not hide `--help`, so this looks at the raw tokens.
+            let help_asked = |r: &Registry| {
+                let tokens = r.argv.iter().take_while(|t| t.as_str() != "--");
+                let mut found = None;
+                for t in tokens {
+                    if t == "--help" && long_index.is_some() {
+                        return Some(Detail::Full);
+                    }
+                    if t == "-h" && short_index.is_some() {
+                        found = Some(short_detail);
+                    }
+                }
+                found
+            };
+            let show_help = |r: &mut Registry, detail: Detail| {
+                use std::io::Write;
+                let text = usage(r, detail);
+                let mut out = std::io::stdout().lock();
+                let _ = write!(out, "{text}");
+                let _ = out.flush();
+                r.exit = Some(0);
+                exit_error(0)
             };
 
             let positionals = match scan_options(&mut r) {
                 Ok(rest) => rest,
-                Err(message) => return Err(reject(&r, message)),
+                Err(message) => {
+                    if let Some(detail) = help_asked(&r) {
+                        return Err(show_help(&mut r, detail));
+                    }
+                    return Err(reject(&mut r, message));
+                }
             };
 
             // Before the positionals are matched, so `--help` works on a script
@@ -1113,16 +1455,12 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                 None
             };
             if let Some(detail) = detail {
-                let text = usage(&r, detail);
-                let mut out = std::io::stdout().lock();
-                let _ = write!(out, "{text}");
-                let _ = out.flush();
-                return Err(exit_error(0));
+                return Err(show_help(&mut r, detail));
             }
 
             match match_positionals(&mut r, positionals) {
                 Ok(()) => Ok(()),
-                Err(message) => Err(reject(&r, message)),
+                Err(message) => Err(reject(&mut r, message)),
             }
         })?,
     )?;
@@ -1130,19 +1468,23 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
     let reg = registry.clone();
     module.set(
         "assert",
-        lua.create_function(move |_, (ok, message): (bool, Option<String>)| {
-            use std::io::Write;
-
-            if ok {
-                return Ok(());
+        // Luau decides truthiness, not this function: a condition must be a
+        // boolean (or nil, which fails), so `cli.assert("x", ...)` is a bug
+        // rather than a pass.
+        lua.create_function(move |_, (ok, message): (mlua::Value, Option<String>)| {
+            match ok {
+                mlua::Value::Boolean(true) => return Ok(()),
+                mlua::Value::Boolean(false) | mlua::Value::Nil => {}
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "cli.assert expects a boolean condition, got {}",
+                        other.type_name()
+                    )));
+                }
             }
-            let r = reg.borrow();
+            let mut r = reg.borrow_mut();
             let message = message.unwrap_or_else(|| "assertion failed".to_string());
-            let text = usage(&r, Detail::Summary);
-            let mut err = std::io::stderr().lock();
-            let _ = write!(err, "error: {message}\n\n{text}");
-            let _ = err.flush();
-            Err(exit_error(2))
+            Err(reject(&mut r, message))
         })?,
     )?;
 
@@ -1474,7 +1816,7 @@ mod tests {
             details: Some("d".into()),
             ..Registry::default()
         };
-        assert_eq!(usage(&reg, Detail::Full), "s\n\nd\n\nArguments:\n");
+        assert_eq!(usage(&reg, Detail::Full), "s\n\nd\n\nUsage:\n");
     }
 
     #[test]
@@ -1488,6 +1830,7 @@ mod tests {
             description: Some("show this help".into()),
             details: None,
             help: Help::Lone,
+            extra: Extra::default(),
         };
         assert_eq!(lone.label(), "    --help");
     }
@@ -1551,16 +1894,17 @@ mod tests {
             kind: ArgKind::Required,
             description: None,
             details: None,
+            extra: Extra::default(),
         });
         let text = usage(&reg, Detail::Summary);
         assert_eq!(
             text,
-            "Copy files to a deployment target.\n\nArguments: <host>\n\nPositionals:\n  host\n"
+            "Copy files to a deployment target.\n\nUsage: <host>\n\nPositionals:\n  host\n"
         );
         let text = usage(&reg, Detail::Full);
         assert_eq!(
             text,
-            "Copy files to a deployment target.\n\nArguments: <host>\n\nPositionals:\n\nhost\n"
+            "Copy files to a deployment target.\n\nUsage: <host>\n\nPositionals:\n\nhost\n"
         );
     }
 
@@ -1573,7 +1917,7 @@ mod tests {
             usage(&described(), Detail::Full),
             "Copy files to a deployment target.\n\n\
              Reads a manifest and uploads what changed.\n\n\
-             Arguments:\n"
+             Usage:\n"
         );
     }
 
@@ -1581,7 +1925,7 @@ mod tests {
     fn short_help_keeps_the_summary_and_drops_the_details() {
         assert_eq!(
             usage(&described(), Detail::Summary),
-            "Copy files to a deployment target.\n\nArguments:\n"
+            "Copy files to a deployment target.\n\nUsage:\n"
         );
     }
 
@@ -1594,7 +1938,7 @@ mod tests {
             details: Some("orphaned".into()),
             ..Registry::default()
         };
-        assert_eq!(usage(&reg, Detail::Full), "Arguments:\n");
+        assert_eq!(usage(&reg, Detail::Full), "Usage:\n");
     }
 
     #[test]
@@ -1616,7 +1960,7 @@ mod tests {
     #[test]
     fn usage_without_about_is_unchanged() {
         let reg = Registry::default();
-        assert_eq!(usage(&reg, Detail::Full), "Arguments:\n");
+        assert_eq!(usage(&reg, Detail::Full), "Usage:\n");
     }
 
     #[test]
@@ -1629,6 +1973,7 @@ mod tests {
             description: Some("show a summary (--help for more)".into()),
             details: None,
             help: Help::Folded,
+            extra: Extra::default(),
         });
         reg.opts.push(OptSpec {
             short: None,
@@ -1637,14 +1982,15 @@ mod tests {
             description: Some("show help (-h for a summary)".into()),
             details: None,
             help: Help::Row,
+            extra: Extra::default(),
         });
         assert_eq!(
             usage(&reg, Detail::Summary),
-            "Arguments: [options]\n\nOptions:\n  -h, --help  show help (-h for a summary)\n"
+            "Usage: [options]\n\nOptions:\n  -h, --help  show help (-h for a summary)\n"
         );
         assert_eq!(
             usage(&reg, Detail::Full),
-            "Arguments: [options]\n\nOptions:\n\n-h, --help\n  show help (-h for a summary)\n"
+            "Usage: [options]\n\nOptions:\n\n-h, --help\n  show help (-h for a summary)\n"
         );
     }
 
@@ -1693,5 +2039,148 @@ mod tests {
             .exec()
             .unwrap_err();
         assert_eq!(exit_code(&err), Some(0));
+    }
+
+    fn code(argv: &[&str], src: &str) -> Option<i32> {
+        eval(argv, src).err().and_then(|e| exit_code(&e))
+    }
+
+    #[test]
+    fn a_value_option_does_not_swallow_a_flag() {
+        let src = r#"local e = cli.opt("e/env=") local f = cli.opt("f/flag") cli.parse() return tostring(e())"#;
+        assert_eq!(code(&["--env", "--flag"], src), Some(2));
+        assert_eq!(code(&["-e", "--help"], src), Some(0), "help still answers");
+        assert_eq!(eval(&["--env=--flag"], src).unwrap(), "--flag");
+        assert_eq!(eval(&["-e=--flag"], src).unwrap(), "--flag");
+    }
+
+    #[test]
+    fn negative_numbers_are_values() {
+        let src = r#"local n = cli.arg("n") local e = cli.opt("e/env=") cli.parse() return n() .. "," .. tostring(e())"#;
+        assert_eq!(eval(&["-5"], src).unwrap(), "-5,nil");
+        assert_eq!(eval(&["-e", "-1.5", "-2"], src).unwrap(), "-2,-1.5");
+        // A declared digit option wins over the number reading.
+        let digit = r#"local one = cli.opt("1") cli.parse() return tostring(one())"#;
+        assert_eq!(eval(&["-1"], digit).unwrap(), "true");
+    }
+
+    #[test]
+    fn short_and_long_equals_agree_on_an_empty_value() {
+        let src = r#"local f = cli.opt("f/file=?") cli.parse() return "[" .. tostring(f()) .. "]""#;
+        assert_eq!(eval(&["-f="], src).unwrap(), "[]");
+        assert_eq!(eval(&["--file="], src).unwrap(), "[]");
+        assert_eq!(eval(&["-f"], src).unwrap(), "[true]");
+    }
+
+    #[test]
+    fn a_repeated_single_value_option_is_a_usage_error() {
+        let src = r#"local e = cli.opt("e/env=") cli.parse() return e()"#;
+        assert_eq!(code(&["-e", "a", "-e", "b"], src), Some(2));
+        let many = r#"local e = cli.opt("e/env=+") cli.parse() return #e()"#;
+        assert_eq!(eval(&["-e", "a", "-e", "b"], many).unwrap(), "2");
+    }
+
+    #[test]
+    fn a_pcall_cannot_turn_an_exit_into_a_second_parse() {
+        let src = r#"
+            local e = cli.opt("e/env=")
+            local ok1 = pcall(cli.parse)
+            local ok2, err = pcall(cli.parse)
+            return tostring(ok1) .. tostring(ok2)"#;
+        assert_eq!(eval(&["--nope"], src).unwrap(), "falsefalse");
+    }
+
+    #[test]
+    fn parse_takes_an_explicit_list() {
+        let src = r#"local w = cli.arg("word") cli.parse({"hi"}) return w()"#;
+        assert_eq!(eval(&["ignored", "args"], src).unwrap(), "hi");
+        assert!(eval(&[], r#"cli.parse({1})"#).is_err());
+    }
+
+    #[test]
+    fn help_beats_an_unknown_option() {
+        let src = r#"cli.opt("e/env=") cli.parse() return ''"#;
+        assert_eq!(code(&["--nope", "--help"], src), Some(0));
+        assert_eq!(code(&["--nope"], src), Some(2));
+    }
+
+    #[test]
+    fn a_near_miss_suggests_the_declared_option() {
+        let mut reg = Registry::default();
+        reg.argv = vec!["--evn".into()];
+        reg.opts.push(OptSpec {
+            short: None,
+            long: Some("env".into()),
+            arity: Arity::Required,
+            description: None,
+            details: None,
+            help: Help::No,
+            extra: Extra::default(),
+        });
+        let err = scan_options(&mut reg).unwrap_err();
+        assert!(err.contains("did you mean \"--env\""), "{err}");
+        reg.argv = vec!["--zzzzzz".into()];
+        assert!(!scan_options(&mut reg).unwrap_err().contains("did you mean"));
+    }
+
+    #[test]
+    fn the_options_table_adds_default_required_and_choices() {
+        let src = r#"
+            local env = cli.opt("e/env=", "target", {default = "dev", choices = {"dev", "prod"}})
+            local tag = cli.opt("t/tag=", "tag", {required = true, value_name = "tag"})
+            local pos = cli.arg("mode?", "mode", {default = "fast", choices = {"fast", "slow"}})
+            cli.parse()
+            return env() .. "," .. tag() .. "," .. pos() .. "," .. env:count()"#;
+        assert_eq!(eval(&["-t", "x"], src).unwrap(), "dev,x,fast,0");
+        assert_eq!(eval(&["-t", "x", "-e", "prod", "slow"], src).unwrap(), "prod,x,slow,1");
+        assert_eq!(code(&[], src), Some(2), "a required option is missing");
+        assert_eq!(code(&["-t", "x", "-e", "qa"], src), Some(2), "not a choice");
+        assert_eq!(code(&["-t", "x", "medium"], src), Some(2), "positional not a choice");
+    }
+
+    #[test]
+    fn the_options_table_is_validated_at_the_declaration() {
+        for bad in [
+            r#"cli.opt("v/verbose", "", {default = "x"})"#,
+            r#"cli.opt("e/env=", "", {required = true, default = "x"})"#,
+            r#"cli.opt("e/env=", "", {default = "x", choices = {"a"}})"#,
+            r#"cli.opt("e/env=", "", {bogus = 1})"#,
+            r#"cli.arg("a", "", {default = "x"})"#,
+        ] {
+            assert!(eval(&[], &format!("{bad} return ''")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn help_shows_value_names_and_notes() {
+        let mut reg = Registry::default();
+        reg.opts.push(OptSpec {
+            short: Some('e'),
+            long: Some("env".into()),
+            arity: Arity::Required,
+            description: Some("target".into()),
+            details: None,
+            help: Help::No,
+            extra: Extra {
+                default: Some("dev".into()),
+                choices: vec!["dev".into(), "prod".into()],
+                value_name: Some("target".into()),
+                ..Extra::default()
+            },
+        });
+        let text = usage(&reg, Detail::Summary);
+        assert!(
+            text.contains("-e, --env=<target>  target [choices: dev, prod] [default: dev]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn assert_requires_a_boolean() {
+        assert_eq!(code(&[], r#"cli.parse() cli.assert(false) return ''"#), Some(2));
+        assert_eq!(code(&[], r#"cli.parse() cli.assert(nil) return ''"#), Some(2));
+        let err = eval(&[], r#"cli.parse() cli.assert("yes") return ''"#).unwrap_err();
+        assert!(err.to_string().contains("expects a boolean"), "{err}");
+        assert!(eval(&[], r#"cli.parse() cli.assert(1) return ''"#).is_err());
     }
 }

@@ -194,44 +194,6 @@ fn require_root_is_independent_of_the_fs_root() {
 }
 
 #[test]
-fn exec_resolves_require_against_the_dash_r_root() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
-    fs::write(
-        root.join("lib.lua"),
-        r#"return { hello = function() return "cwd-lib" end }"#,
-    )
-    .unwrap();
-
-    // An inline script has no directory of its own, so `-r` names one.
-    ito()
-        .current_dir(root)
-        .args(["-s", "print(require('./lib').hello())", "-r", "."])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("cwd-lib"));
-}
-
-#[test]
-fn stdin_resolves_require_against_the_dash_r_root() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
-    fs::write(
-        root.join("lib.lua"),
-        r#"return { hello = function() return "cwd-lib" end }"#,
-    )
-    .unwrap();
-
-    ito()
-        .current_dir(root)
-        .args(["-", "-r", "."])
-        .write_stdin("print(require('./lib').hello())")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("cwd-lib"));
-}
-
-#[test]
 fn module_is_evaluated_once_and_cached() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -456,4 +418,85 @@ fn a_symlinked_script_imports_next_to_the_real_file() {
         .assert()
         .success()
         .stdout(predicate::str::contains("from-project"));
+}
+
+#[test]
+fn the_roots_sibling_file_is_not_loadable() {
+    // `<root>.lua` beside the root directory is outside the tree.
+    let outer = TempDir::new().unwrap();
+    let root = outer.path().join("proj");
+    fs::create_dir(&root).unwrap();
+    fs::write(outer.path().join("proj.lua"), "return { leaked = true }").unwrap();
+    fs::write(root.join("s.lua"), "print(require('./.').leaked)").unwrap();
+
+    run(&root, &root.join("s.lua"))
+        .assert()
+        .failure()
+        .code(3)
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+fn a_symlink_out_of_the_root_is_rejected() {
+    let outer = TempDir::new().unwrap();
+    let root = outer.path().join("proj");
+    fs::create_dir(&root).unwrap();
+    fs::write(outer.path().join("secret.lua"), "return { leaked = true }").unwrap();
+    std::os::unix::fs::symlink(outer.path().join("secret.lua"), root.join("link.lua")).unwrap();
+    fs::write(root.join("s.lua"), "print(require('./link').leaked)").unwrap();
+
+    run(&root, &root.join("s.lua"))
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("outside the script root"));
+}
+
+#[test]
+fn a_dotted_name_appends_the_extension() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join("config.prod.luau"), "return { v = 'prod' }").unwrap();
+    fs::write(root.join("config.luau"), "return { v = 'plain' }").unwrap();
+    fs::write(root.join("s.luau"), "print(require('./config.prod').v)").unwrap();
+
+    run(root, &root.join("s.luau"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("prod"));
+}
+
+#[test]
+fn require_dir_and_script_anchors_on_fs() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("pkg")).unwrap();
+    fs::write(root.join("pkg/init.luau"), "return { dir = fs.require_dir() }").unwrap();
+    fs::write(
+        root.join("s.luau"),
+        "print('dir=' .. require('./pkg').dir)\nprint('script=' .. fs.script())\nprint('root=' .. fs.require_root())",
+    )
+    .unwrap();
+
+    run(&root, &root.join("s.luau"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("dir={}", root.join("pkg").display())))
+        .stdout(predicate::str::contains(format!("script={}", root.join("s.luau").display())))
+        .stdout(predicate::str::contains(format!("root={}", root.display())));
+}
+
+#[test]
+fn an_ambiguous_intermediate_name_does_not_block_the_target() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("sub.luau"), "return 1").unwrap();
+    fs::write(root.join("sub/lib.luau"), "return { v = 'ok' }").unwrap();
+    fs::write(root.join("s.luau"), "print(require('./sub/lib').v)").unwrap();
+
+    run(root, &root.join("s.luau"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
 }
