@@ -31,7 +31,7 @@ for TARGET in "${TARGETS[@]}"; do
     # cargo deb expects the binaries at target/<target>/release/<bin>
     RELEASE_DIR="target/$TARGET/release"
     mkdir -p "$RELEASE_DIR"
-    for BIN in ito irun iq ied; do
+    for BIN in ito ied; do
         cp "$DEST/$BIN" "$RELEASE_DIR/$BIN"
     done
 

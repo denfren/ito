@@ -1,7 +1,10 @@
 # redirects — where command output goes
 
 Values accepted by [`proc`](proc.md)'s `:stdout()`/`:stderr()` and, via the
-same values, [`ssh`](ssh.md)'s remote command builder. There is no
+same values, [`ssh`](ssh.md)'s remote command builder. A single response
+body uses them too: the `:send([<target>])` of [`http`](http.md) and
+[`aws.s3`](aws-s3.md) takes `proc.string()`, `proc.buffer()`,
+`proc.file(path)` or `proc.NULL`. There is no
 `redirect` global — these live on the `proc` table because a redirect
 target is only ever an argument to those two methods:
 

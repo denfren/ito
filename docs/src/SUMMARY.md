@@ -29,6 +29,7 @@ The Luau modules provided by `ito`.
 - [proc — running commands](modules/proc.md)
 - [redirects — where command output goes](modules/redirect.md)
 - [ssh — running commands remotely](modules/ssh.md)
+- [http — HTTP requests](modules/http.md)
 - [aws.config — explicit AWS clients](modules/aws-config.md)
 - [aws.ec2 — AWS EC2](modules/aws-ec2.md)
 - [aws.s3 — AWS S3](modules/aws-s3.md)

@@ -590,6 +590,9 @@ impl Engine {
             sl::ito::register_host_pid(&lua)?;
             sl::ssh::register(&lua)?;
             sl::aws::register(&lua)?;
+            // `http`: the network is ambient state, the line `aws` draws. After
+            // `proc` because its bodies and targets are `proc` redirect values.
+            sl::http::register(&lua)?;
             // `ui.prompt`/`ui.progress`: terminal interaction is ambient
             // state a query's return value or an edit preview must not
             // depend on, the same line `proc`/`ssh` draw.
@@ -660,12 +663,25 @@ impl Engine {
         // right stream, and the only thing left is the exit code. Recognised
         // here rather than at each call site so no path can turn it into a
         // spurious "script error".
+        //
+        // A script error is reported as the error itself -- what the script
+        // raised, or what Luau said went wrong -- without the Luau stack
+        // traceback, which is for whoever debugs the script, not whoever runs
+        // it. The traceback goes to the log at debug level (`-v`, or
+        // `ITO_LOG=ito=debug` for a shebang command) together with the script.
         let fail = |e: mlua::Error| match sl::cli::exit_code(&e) {
             Some(code) => RunError {
                 code,
                 message: String::new(),
             },
-            None => RunError::script(format!("script error in {}: {e}", script.label)),
+            None => {
+                let (message, traceback) = describe_script_error(&e);
+                match traceback {
+                    Some(traceback) => tracing::debug!("script error in {}\n{traceback}", script.label),
+                    None => tracing::debug!("script error in {}", script.label),
+                }
+                RunError::script(message)
+            }
         };
 
         let chunk_value: mlua::Value = self
@@ -708,6 +724,72 @@ impl Engine {
     /// this.
     pub fn vfs(&self) -> Option<&Vfs> {
         self.vfs.as_ref()
+    }
+}
+
+/// A script error as (what to tell the user, the Luau stack traceback if any).
+///
+/// mlua wraps an error raised inside a Rust callback in `CallbackError`, whose
+/// cause is the real error, and appends the traceback to a `RuntimeError`'s
+/// text; both are taken apart here so the message reads as the script (or
+/// Luau) phrased it: `error("no terminal to ask", 0)` reports exactly that,
+/// an unprotected bug reports `<file>:<line>: attempt to index nil ...`.
+fn describe_script_error(e: &mlua::Error) -> (String, Option<String>) {
+    match e {
+        mlua::Error::CallbackError { traceback, cause } => {
+            let (message, inner) = describe_script_error(cause);
+            // The innermost traceback is the one closest to the failure.
+            (message, inner.or_else(|| Some(traceback.clone())))
+        }
+        mlua::Error::WithContext { context, cause } => {
+            let (message, traceback) = describe_script_error(cause);
+            (format!("{context}: {message}"), traceback)
+        }
+        mlua::Error::RuntimeError(text) => split_traceback(text),
+        // Syntax errors, conversion errors, ...: their own wording is the message.
+        other => split_traceback(&other.to_string()),
+    }
+}
+
+/// `"<message>\nstack traceback:\n..."` -> (message, traceback).
+fn split_traceback(text: &str) -> (String, Option<String>) {
+    match text.find("\nstack traceback:") {
+        Some(at) => (
+            text[..at].trim_end().to_string(),
+            Some(text[at + 1..].trim_end().to_string()),
+        ),
+        None => (text.trim_end().to_string(), None),
+    }
+}
+
+#[cfg(test)]
+mod script_error_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_error_drops_the_traceback() {
+        let e = mlua::Error::RuntimeError("x.luau:3: boom\nstack traceback:\n\tx.luau:3: in main".into());
+        let (message, traceback) = describe_script_error(&e);
+        assert_eq!(message, "x.luau:3: boom");
+        assert_eq!(traceback.as_deref(), Some("stack traceback:\n\tx.luau:3: in main"));
+    }
+
+    #[test]
+    fn callback_error_reports_its_cause() {
+        let e = mlua::Error::CallbackError {
+            traceback: "stack traceback:\n\t[C]: in ?".into(),
+            cause: std::sync::Arc::new(mlua::Error::RuntimeError("no terminal to ask".into())),
+        };
+        let (message, traceback) = describe_script_error(&e);
+        assert_eq!(message, "no terminal to ask");
+        assert_eq!(traceback.as_deref(), Some("stack traceback:\n\t[C]: in ?"));
+    }
+
+    #[test]
+    fn plain_message_has_no_traceback() {
+        let (message, traceback) = describe_script_error(&mlua::Error::RuntimeError("plain".into()));
+        assert_eq!(message, "plain");
+        assert!(traceback.is_none());
     }
 }
 
@@ -810,7 +892,10 @@ pub fn init_tracing(verbosity: u8) {
                 1 => "debug",
                 _ => "trace",
             };
-            EnvFilter::new(format!("warn,ito={level}"))
+            // The platform verifier logs every rejected certificate at
+            // `error` itself; `http` already raises that same failure, which a
+            // script may `pcall`, so its own line is only a duplicate.
+            EnvFilter::new(format!("warn,rustls_platform_verifier=off,ito={level}"))
         });
     let ansi =
         io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());

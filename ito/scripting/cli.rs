@@ -1131,8 +1131,6 @@ fn match_positionals(reg: &mut Registry, positionals: Vec<String>) -> Result<(),
 /// to the shape that corrects it -- the one-line summary says what the tool is,
 /// but the details would wedge a paragraph between the error and its usage.
 fn reject(r: &mut Registry, message: String) -> mlua::Error {
-    use std::io::Write;
-
     let text = usage(r, Detail::Summary);
     // Point at the help the script still has, if any.
     let hint = r
@@ -1148,9 +1146,10 @@ fn reject(r: &mut Registry, message: String) -> mlua::Error {
         })
         .map(|h| format!("\nFor more information, try '{h}'.\n"))
         .unwrap_or_default();
-    let mut err = std::io::stderr().lock();
-    let _ = write!(err, "error: {message}\n\n{text}{hint}");
-    let _ = err.flush();
+    let _ = super::print::write(
+        super::print::Out::Stderr,
+        format!("error: {message}\n\n{text}{hint}").as_bytes(),
+    );
     r.exit = Some(2);
     exit_error(2)
 }
@@ -1422,11 +1421,8 @@ pub fn register(lua: &Lua, argv: &[String]) -> mlua::Result<()> {
                 found
             };
             let show_help = |r: &mut Registry, detail: Detail| {
-                use std::io::Write;
                 let text = usage(r, detail);
-                let mut out = std::io::stdout().lock();
-                let _ = write!(out, "{text}");
-                let _ = out.flush();
+                let _ = super::print::write(super::print::Out::Stdout, text.as_bytes());
                 r.exit = Some(0);
                 exit_error(0)
             };
@@ -1505,8 +1501,13 @@ mod tests {
     }
 
     /// Evaluate `src` and return what it produced, as a string.
+    ///
+    /// Help and usage errors are written to the process streams; capture them
+    /// so a test never prints above the harness's own lines.
     fn eval(argv: &[&str], src: &str) -> Result<String, mlua::Error> {
-        lua(argv).load(src).eval::<String>()
+        let (result, _out) =
+            crate::scripting::print::capture(|| lua(argv).load(src).eval::<String>());
+        result
     }
 
     #[test]
@@ -1860,9 +1861,8 @@ mod tests {
 
     /// The prose a script's `cli.about` calls left in the registry.
     ///
-    /// The `--help` path writes to the process's own stdout, which a test
-    /// cannot capture, so assertions about *what was set* go through here and
-    /// assertions about *how it renders* go through `usage` directly.
+    /// Assertions about *what was set* go through here; assertions about *how
+    /// it renders* go through `usage` directly.
     fn about_of(lua: &Lua, src: &str) -> (Option<String>, Option<String>) {
         lua.load(src).exec().expect("declare");
         let handle: mlua::AnyUserData = lua

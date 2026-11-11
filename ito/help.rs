@@ -134,6 +134,12 @@ pub static TOPICS: &[Topic] = &[
         body: include_str!("../docs/src/modules/ssh.md"),
     },
     Topic {
+        name: "http",
+        title: "http — HTTP requests",
+        group: Group::Module,
+        body: include_str!("../docs/src/modules/http.md"),
+    },
+    Topic {
         name: "aws.config",
         title: "aws.config — explicit AWS clients",
         group: Group::Module,

@@ -155,6 +155,13 @@ it already contains is not a change: it does not appear in `--diff` or
 layout are rebuilt, not preserved. Use `yaml.edit` / `hcl.edit` to make
 surgical changes that leave the rest of the file byte-identical.
 
+**A script error is one line.** It is logged as `ERROR <message>` -- what
+the script raised (`error("no such host", 0)` reads exactly that) or what
+Luau reports (`<file>:<line>: attempt to index nil ...`) -- and the run exits
+`3`. The stack traceback is logged at debug level: run with `-v`, or set
+`ITO_LOG=ito=debug` when the script is a shebang command (where `-v` after the
+command name belongs to the script).
+
 **Exit codes.** `0` success, `1` success *with* changes (only under
 `-e`/`--exit-code`, like `git diff --exit-code`), `2` a failure that is
 not the script's fault, `3` a failure in the script itself, `141` the

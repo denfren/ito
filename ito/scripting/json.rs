@@ -58,7 +58,8 @@ fn to_json(y: Yaml, path: &str) -> Result<serde_json::Value, String> {
     })
 }
 
-fn encode(lua: &Lua, value: &Value) -> mlua::Result<serde_json::Value> {
+/// A Luau value as JSON, by the shared codec rules (`null`, `table.array`).
+pub(crate) fn encode(lua: &Lua, value: &Value) -> mlua::Result<serde_json::Value> {
     let data = codec::to_data(lua, value, "json serialize error")?;
     to_json(data, "").map_err(mlua::Error::runtime)
 }

@@ -173,6 +173,61 @@ fn not_a_redirect(got: &str) -> mlua::Error {
     ))
 }
 
+/// Pull a single-body target out of a Luau value, for a `:send([target])`
+/// (`aws.s3`, `http`): `nil` means "no target".
+///
+/// The same `Redirect` values `proc` and `ssh` take, minus the ones that cannot
+/// mean anything for one response body: `INHERIT`/`OUT`/`ERR` would write to
+/// this process's streams, which a report owning stdout must not be
+/// interleaved with, and `STDOUT`/`STDERR` have no second stream to alias.
+pub(crate) fn body_target_from_value(value: &Value) -> LuaResult<Option<Redirect>> {
+    const EXPECTED: &str =
+        "expected a body target (proc.string(), proc.buffer(), proc.file(path) or proc.NULL)";
+    let redirect = match value {
+        Value::Nil => return Ok(None),
+        Value::UserData(ud) => match ud.borrow::<Redirect>() {
+            Ok(r) => r.clone(),
+            Err(_) => {
+                return Err(mlua::Error::runtime(format!(
+                    "{EXPECTED}, got a userdata of another kind"
+                )));
+            }
+        },
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{EXPECTED}, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    match redirect {
+        Redirect::Inherit(_) | Redirect::AliasStdout | Redirect::AliasStderr => {
+            Err(mlua::Error::runtime(EXPECTED))
+        }
+        concrete => Ok(Some(concrete)),
+    }
+}
+
+/// Write on the blocking pool: a blocking write on this thread would pin the
+/// runtime's only thread and serialize every concurrent task. The file comes
+/// back so a streamed body can write chunk after chunk through one handle.
+pub(crate) async fn write_all_blocking(
+    mut file: File,
+    bytes: Vec<u8>,
+    path: &Path,
+) -> LuaResult<File> {
+    let display = path.display().to_string();
+    let (file, res) = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let res = file.write_all(&bytes);
+        (file, res)
+    })
+    .await
+    .map_err(|e| mlua::Error::runtime(format!("write task failed: {e}")))?;
+    res.map_err(|e| mlua::Error::runtime(format!("failed to write '{display}': {e}")))?;
+    Ok(file)
+}
+
 /// What a child reads on stdin.
 #[derive(Clone)]
 pub(crate) enum Stdin {

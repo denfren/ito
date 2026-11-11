@@ -64,7 +64,7 @@ pub fn teardown() {
 fn join_multi(pb: ProgressBar) -> ProgressBar {
     let pb = MULTI.with(|cell| {
         cell.borrow_mut()
-            .get_or_insert_with(MultiProgress::new)
+            .get_or_insert_with(new_multi)
             .add(pb)
     });
     LIVE.with(|cell| {
@@ -73,6 +73,19 @@ fn join_multi(pb: ProgressBar) -> ProgressBar {
         live.push(pb.clone());
     });
     pb
+}
+
+/// A fresh multi. Unit tests get a hidden target: their `stderr` is the test
+/// harness's, not a terminal the bars should paint over.
+fn new_multi() -> MultiProgress {
+    #[cfg(test)]
+    {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    }
+    #[cfg(not(test))]
+    {
+        MultiProgress::new()
+    }
 }
 
 /// Erase a bar's line. Only `finish_and_clear` calls this: `finish` and

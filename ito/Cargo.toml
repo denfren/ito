@@ -1,10 +1,9 @@
 [package]
 name = "ito"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Dennis Frenken", "Scopevisio Devops GmbH"]
 description = "A Lua script runner with a small standard library for inspecting and generating config files"
-homepage = "https://github.com/denfren/ito"
 repository = "https://github.com/denfren/ito"
 license = "MIT"
 keywords = ["lua", "luau", "config", "yaml", "toml", "hcl"]
@@ -41,6 +40,9 @@ hmac.workspace = true
 indicatif.workspace = true
 globset.workspace = true
 grep-regex.workspace = true
+reqwest.workspace = true
+form_urlencoded.workspace = true
+mime_guess.workspace = true
 grep-searcher.workspace = true
 hcl-rs.workspace = true
 hex.workspace = true
@@ -70,7 +72,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 yamlito.workspace = true
 serde.workspace = true
-minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
 
 [dev-dependencies]
 insta.workspace = true

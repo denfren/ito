@@ -14,6 +14,7 @@ pub mod finder;
 pub mod fmt;
 pub mod hash;
 pub mod hcl;
+pub mod http;
 pub mod io;
 pub mod ito;
 pub mod j2;

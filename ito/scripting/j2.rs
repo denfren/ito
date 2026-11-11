@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::Rest;
-use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior, value::Value as JinjaValue};
+use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior, value::{Serde, Value as JinjaValue}};
 use mlua::{Function, Lua, LuaSerdeExt, Table, UserData, UserDataMethods, Value};
 
 use crate::scripting::pathmap::PathMapper;
@@ -109,7 +109,7 @@ impl Cb {
             return Ok(JinjaValue::from(()));
         }
         let json: serde_json::Value = self.lua.from_value(ret).map_err(bad)?;
-        Ok(JinjaValue::from_serialize(&json))
+        Ok(JinjaValue::from(Serde(&json)))
     }
 }
 
@@ -334,7 +334,7 @@ impl UserData for J2Engine {
                     let json: serde_json::Value = lua
                         .from_value(other)
                         .map_err(|err| to_err(format!("j2 with_global {name:?}: {err}")))?;
-                    Global::Data(JinjaValue::from_serialize(&json))
+                    Global::Data(JinjaValue::from(Serde(&json)))
                 }
             };
             e.update(|o| o.globals.push((name, g)))
@@ -418,12 +418,12 @@ fn text_arg(func: &str, v: &Value) -> Result<String> {
 /// function, say), raises with the function's name.
 fn context(lua: &Lua, func: &str, data: Value) -> Result<JinjaValue> {
     match data {
-        Value::Nil => Ok(JinjaValue::from_serialize(serde_json::Map::new())),
+        Value::Nil => Ok(JinjaValue::from(Serde(serde_json::Map::new()))),
         Value::Table(_) => {
             let json: serde_json::Value = lua
                 .from_value(data)
                 .map_err(|e| to_err(format!("j2.{func}: data: {e}")))?;
-            Ok(JinjaValue::from_serialize(&json))
+            Ok(JinjaValue::from(Serde(&json)))
         }
         other => Err(to_err(format!(
             "j2.{func}: data must be a table or nil, got {}",
@@ -440,19 +440,24 @@ fn build_env(lua: &Lua, opts: &Options, confine: Option<Confine>) -> Result<Envi
     let mut env = Environment::new();
 
     env.set_undefined_behavior(opts.undefined);
-    env.set_trim_blocks(opts.trim_blocks);
-    env.set_lstrip_blocks(opts.lstrip_blocks);
-    env.set_keep_trailing_newline(opts.keep_trailing_newline);
-    if let Some(s) = &opts.syntax {
-        env.set_syntax(s.clone());
-    }
+    // Whitespace flags live on the syntax config in minijinja 3, so they are
+    // applied on top of the delimiters (custom or default).
+    let base = opts.syntax.clone().unwrap_or_default();
+    let syntax = base
+        .to_builder()
+        .trim_blocks(opts.trim_blocks)
+        .lstrip_blocks(opts.lstrip_blocks)
+        .keep_trailing_newline(opts.keep_trailing_newline)
+        .build()
+        .map_err(|err| to_err(format!("j2: {err}")))?;
+    env.set_syntax(syntax);
 
     let escape = match opts.escape {
         Escape::None => AutoEscape::None,
         Escape::Html => AutoEscape::Html,
         Escape::Json => AutoEscape::Json,
     };
-    env.set_auto_escape_callback(move |_| escape);
+    env.set_auto_escape_callback(move |_| escape.clone());
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     add_builtin_filters(&mut env);
 
@@ -604,7 +609,7 @@ fn add_builtin_filters(env: &mut Environment<'static>) {
                     }
                 }
             }
-            Ok(JinjaValue::from_iter(out))
+            Ok(JinjaValue::from_pairs(out))
         },
     );
 }
@@ -765,7 +770,7 @@ mod tests {
             eval(r#"return j2.template("{% for i in xs %}{% if i == 2 %}{% continue %}{% endif %}{% if i == 4 %}{% break %}{% endif %}{{ i }}{% endfor %}", {xs = {1,2,3,4,5}})"#),
             "13"
         );
-        assert_eq!(eval(r#"return j2.template("{{ d|tojson }}", {d = {a = 1}})"#), r#"{"a":1}"#);
+        assert_eq!(eval(r#"return j2.template("{{ d|tojson }}", {d = {a = 1}})"#), r#"{"a": 1}"#);
         assert_eq!(eval(r#"return j2.template("{{ s|urlencode }}", {s = "a b"})"#), "a%20b");
         assert_eq!(eval(r#"return j2.template("{{ s.upper() }}", {s = "ab"})"#), "AB");
         assert_eq!(

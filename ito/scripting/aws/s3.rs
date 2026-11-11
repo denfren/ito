@@ -97,40 +97,16 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::{BoxError, ClientSource, array, date_to_string, err_in, lua_err};
-use crate::scripting::redirect::{Redirect, capture_to_value, open_shared_file};
+use crate::scripting::redirect::{
+    Redirect, body_target_from_value as target_from_value, capture_to_value, open_shared_file,
+    write_all_blocking,
+};
 
 /// The `{ ok = .. }` envelope every operation returns as its first value.
 fn envelope(lua: &Lua, ok: bool) -> LuaResult<Table> {
     let t = lua.create_table()?;
     t.raw_set("ok", ok)?;
     Ok(t)
-}
-
-/// Pull a body target out of a Luau value.
-///
-/// The same `Redirect` values `proc` and `ssh` take, minus the two that cannot
-/// mean anything for a single response body: `INHERIT` would write to stdout,
-/// which a report owning stdout must not be interleaved with, and `STDOUT`/
-/// `STDERR` have no other stream here to alias.
-fn target_from_value(value: &Value) -> LuaResult<Option<Redirect>> {
-    let redirect = match value {
-        Value::Nil => return Ok(None),
-        Value::UserData(ud) => ud.borrow::<Redirect>()?.clone(),
-        other => {
-            return Err(mlua::Error::runtime(format!(
-                "expected a body target (proc.string(), proc.buffer(), proc.file(path) \
-                 or proc.null()), got {}",
-                other.type_name()
-            )));
-        }
-    };
-    match redirect {
-        Redirect::Inherit(_) | Redirect::AliasStdout | Redirect::AliasStderr => Err(mlua::Error::runtime(
-            "expected a body target (proc.string(), proc.buffer(), proc.file(path) \
-             or proc.null())",
-        )),
-        concrete => Ok(Some(concrete)),
-    }
 }
 
 /// Send `bytes` to a target and return the second return value: the captured
@@ -154,25 +130,6 @@ async fn deliver_bytes(lua: &Lua, target: &Redirect, bytes: &[u8]) -> LuaResult<
             unreachable!("rejected by target_from_value")
         }
     }
-}
-
-/// Write on the blocking pool: a blocking write on this thread would pin the
-/// runtime's only thread and serialize every concurrent task.
-async fn write_all_blocking(
-    mut file: std::fs::File,
-    bytes: Vec<u8>,
-    path: &std::path::Path,
-) -> LuaResult<std::fs::File> {
-    let display = path.display().to_string();
-    let (file, res) = tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let res = file.write_all(&bytes);
-        (file, res)
-    })
-    .await
-    .map_err(|e| mlua::Error::runtime(format!("write task failed: {e}")))?;
-    res.map_err(|e| mlua::Error::runtime(format!("failed to write '{display}': {e}")))?;
-    Ok(file)
 }
 
 /// Serialize a Luau value to compact JSON, for the case where a target asked for

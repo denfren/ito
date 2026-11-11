@@ -213,7 +213,7 @@ fn parse_civil(text: &str, zone: &TimeZone, what: &str) -> LuaResult<f64> {
             ))
         })?;
     let zoned = zone
-        .to_ambiguous_zoned(dt)
+        .to_ambiguous_zoned_datetime(dt)
         .compatible()
         .map_err(|e| mlua::Error::runtime(format!("{what} could not place '{text}': {e}")))?;
     Ok(timestamp_to_secs(zoned.timestamp()))
@@ -439,7 +439,7 @@ fn check_pattern(pattern: &str, what: &str) -> LuaResult<()> {
 /// Render an instant through a strftime pattern in `zone`.
 fn format_pattern(ts: Timestamp, zone: TimeZone, pattern: &str, what: &str) -> LuaResult<String> {
     check_pattern(pattern, what)?;
-    let zoned = ts.to_zoned(zone);
+    let zoned = ts.to_zoned_datetime(zone);
     strtime::format(pattern, &zoned).map_err(|e| {
         mlua::Error::runtime(format!(
             "{what} could not format with '{pattern}': {e}; expected strftime \
@@ -450,7 +450,7 @@ fn format_pattern(ts: Timestamp, zone: TimeZone, pattern: &str, what: &str) -> L
 
 /// Render an instant as RFC 3339 in `zone`.
 fn format_rfc3339_in(ts: Timestamp, zone: TimeZone, what: &str) -> LuaResult<String> {
-    let zoned = ts.to_zoned(zone);
+    let zoned = ts.to_zoned_datetime(zone);
     // `%.f` keeps sub-second precision and prints nothing for a whole second.
     let text = strtime::format("%Y-%m-%dT%H:%M:%S%.f%:z", &zoned)
         .map_err(|e| mlua::Error::runtime(format!("{what} could not format: {e}")))?;
@@ -462,7 +462,7 @@ fn format_rfc3339_in(ts: Timestamp, zone: TimeZone, what: &str) -> LuaResult<Str
 
 /// Render an instant as a civil (offset-less) date-time in `zone`.
 fn format_civil_in(ts: Timestamp, zone: TimeZone, what: &str) -> LuaResult<String> {
-    let zoned = ts.to_zoned(zone);
+    let zoned = ts.to_zoned_datetime(zone);
     strtime::format("%Y-%m-%dT%H:%M:%S%.f", &zoned)
         .map_err(|e| mlua::Error::runtime(format!("{what} could not format: {e}")))
 }
@@ -875,7 +875,7 @@ fn parse_fmt(text: &str, pattern: &str, zone: TimeZone, what: &str) -> LuaResult
         })
     })?;
     let zoned = zone
-        .to_ambiguous_zoned(dt)
+        .to_ambiguous_zoned_datetime(dt)
         .compatible()
         .map_err(|e| mlua::Error::runtime(format!("{what} could not place '{text}': {e}")))?;
     Ok(timestamp_to_secs(zoned.timestamp()))
@@ -918,7 +918,7 @@ fn shift(secs: f64, delta: &Value, zone: TimeZone, negate: bool, what: &str) -> 
         let span = Span::new()
             .try_months(if negate { -months } else { months })
             .map_err(|e| mlua::Error::runtime(format!("{what}: {months} months: {e}")))?;
-        let zoned = secs_to_timestamp(secs, what)?.to_zoned(zone);
+        let zoned = secs_to_timestamp(secs, what)?.to_zoned_datetime(zone);
         let shifted = zoned
             .checked_add(span)
             .map_err(|e| mlua::Error::runtime(format!("{what} could not shift: {e}")))?;

@@ -246,7 +246,7 @@ so `if fs.write then` is a usable feature test:
 | `fs.write`/`fs.remove` | buffered | direct |
 | `fs.finder():grep()`/`:grep_files()` | — | ✓ |
 | preview writes (`-d`/`-l`/`-e`), commit (`-w`) | ✓ | — |
-| `proc`/`ssh`/`aws.ec2`/`task`, `os.getenv` | — | ✓ |
+| `proc`/`ssh`/`http`/`aws.ec2`/`task`, `os.getenv` | — | ✓ |
 | `fs.cwd`, `fs.script`, `fs.require_root`/`require_dir`, `proc.pid`, `ito.slug` | — | ✓ |
 | `hash` values, `encoding`, `ansible.vault.decrypt`/`is_vault` | ✓ | ✓ |
 | `hash.*_file`, `ansible.vault.encrypt`/`load_password_file` | — | ✓ |
@@ -374,7 +374,7 @@ of its own (see below). The
 per-module doc comment at the top of each file is the authoritative
 surface description; consult it rather than duplicating it here.
 
-Globals: `fs`, `path`, `time`, `json`, `toml`, `yaml`, `hcl`, `j2`, `re`,
+Globals: `fs`, `path`, `time`, `json`, `toml`, `yaml`, `hcl`, `j2`, `re`, `http`,
 `hash`, `encoding`, `ansible` (holding `ansible.vault`), `fmt` (holding
 `fmt.table`), `log`, `io`, `ito`, `proc`, `ssh`, `aws` (holding `aws.config`,
 `aws.ec2`, `aws.s3`, `aws.autoscaling`, `aws.cloudtrail`, `aws.cloudwatch`),
@@ -392,7 +392,21 @@ Two structural notes:
   it lives beside the commands that take it. `ssh` consumes the *same*
   `Redirect` values through the same `redirect_from_value`, which is what
   makes `proc.string()` configure a remote command as well as a local
-  one — so `proc` must be registered before `ssh`.
+  one — so `proc` must be registered before `ssh`. A single response
+  body (`aws.s3`, `http`) takes them through `body_target_from_value`,
+  which rejects the stream-only values (`INHERIT`/`OUT`/`ERR`/aliases).
+- **`http` (`http.rs`) is reqwest over the rustls/aws-lc-rs stack the AWS
+  SDK already pulls in** — no native-tls. The client builder copies (like
+  `aws.config`), the request builder mutates. Client default headers are
+  merged per request by `build_request`, *not* via reqwest's
+  `default_headers` (which `insert`s and so drops a repeated header); a
+  request header replaces the default of the same name. A status is an
+  answer, never an error, except outside `:expect(...)`; and a non-2xx body
+  never reaches a `proc.file` target unless `:keep_failure_body()` — a failed
+  download must not leave a plausible file. No body deserialization: bytes
+  go through the redirect targets and the script composes `json.parse`.
+  Retries rebuild the request from stored state each attempt (so a file
+  body is reopened) and only for idempotent methods.
 - `task` is the odd one out — its `register` returns a `Tasks` drain
   handle the host has to await (see below).
 - **`ui` is a directory (`ui/mod.rs`, `ui/prompt.rs`, `ui/progress.rs`), a

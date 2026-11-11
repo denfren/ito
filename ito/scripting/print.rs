@@ -10,6 +10,7 @@
 //! pipe (`| head`) into a quiet exit `141` (128 + SIGPIPE): the run was cut
 //! short, and whoever reads the exit code should be able to tell.
 
+#[cfg(not(test))]
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,22 +45,107 @@ pub(crate) enum Out {
 /// unwinds the run quietly with exit [`SIGPIPE_EXIT`] (the `cli` exit sentinel,
 /// so tasks still drain and `ied` skips its flush); any other error is raised.
 pub(crate) fn emit(stream: Out, bytes: &[u8]) -> mlua::Result<()> {
-    let r = super::ui::progress::suspended(|| match stream {
-        Out::Stdout => {
-            let mut o = std::io::stdout().lock();
-            o.write_all(bytes).and_then(|_| o.flush())
-        }
-        Out::Stderr => {
-            let mut o = std::io::stderr().lock();
-            o.write_all(bytes).and_then(|_| o.flush())
-        }
-    });
+    let r = super::ui::progress::suspended(|| write(stream, bytes));
     match r {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
             PIPE_BROKEN.store(true, Ordering::Relaxed);
             Err(super::cli::exit_error(SIGPIPE_EXIT))
         }
         r => r.map_err(mlua::Error::external),
+    }
+}
+
+/// Write `bytes` to one of the process streams, bypassing the test harness's
+/// capture (which only covers Rust's own `print!` macros).
+///
+/// In tests the bytes go to a thread-local sink instead, so a unit test never
+/// scatters output across the harness's progress lines. [`capture`] turns that
+/// sink into an assertion; without it the bytes are discarded.
+pub(crate) fn write(stream: Out, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        test_sink::write(stream, bytes);
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    {
+        match stream {
+            Out::Stdout => {
+                let mut o = std::io::stdout().lock();
+                o.write_all(bytes).and_then(|_| o.flush())
+            }
+            Out::Stderr => {
+                let mut o = std::io::stderr().lock();
+                o.write_all(bytes).and_then(|_| o.flush())
+            }
+        }
+    }
+}
+
+/// A run's stdout and stderr, as captured by [`capture`].
+#[cfg(test)]
+pub(crate) struct Captured {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Run `f` with process-stream writes collected instead of emitted.
+#[cfg(test)]
+pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, Captured) {
+    test_sink::start();
+    let guard = test_sink::Active;
+    let result = f();
+    let captured = test_sink::finish();
+    drop(guard);
+    (result, captured)
+}
+
+#[cfg(test)]
+mod test_sink {
+    use super::{Captured, Out};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SINK: RefCell<Option<Captured>> = const { RefCell::new(None) };
+    }
+
+    /// A guard clearing the sink even when the captured closure panics.
+    pub(super) struct Active;
+
+    impl Drop for Active {
+        fn drop(&mut self) {
+            SINK.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn start() {
+        SINK.with(|s| {
+            assert!(s.borrow().is_none(), "output capture is not re-entrant");
+            *s.borrow_mut() = Some(Captured {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        });
+    }
+
+    pub(super) fn finish() -> Captured {
+        SINK.with(|s| s.borrow_mut().take())
+            .unwrap_or(Captured {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+    }
+
+    pub(super) fn write(stream: Out, bytes: &[u8]) {
+        SINK.with(|s| {
+            if let Some(captured) = s.borrow_mut().as_mut() {
+                match stream {
+                    Out::Stdout => captured.stdout.extend_from_slice(bytes),
+                    Out::Stderr => captured.stderr.extend_from_slice(bytes),
+                }
+            }
+        });
     }
 }
 
@@ -104,12 +190,16 @@ mod tests {
     fn print_is_callable_and_honours_tostring() {
         let lua = Lua::new();
         register(&lua, true).unwrap();
-        lua.load(
-            r#"print("a", 1, true, nil)
-               print(setmetatable({}, {__tostring = function() return "x" end}))"#,
-        )
-        .exec()
-        .unwrap();
+        let ((), out) = capture(|| {
+            lua.load(
+                r#"print("a", 1, true, nil)
+                   print(setmetatable({}, {__tostring = function() return "x" end}))"#,
+            )
+            .exec()
+            .unwrap();
+        });
+        assert_eq!(out.stdout, b"a\t1\ttrue\tnil\nx\n");
+        assert!(out.stderr.is_empty());
     }
 
     #[test]

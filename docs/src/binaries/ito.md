@@ -233,6 +233,7 @@ for line in io.lines() do print(line) end
 | [`time`](../modules/time.md) | timestamps, duration deltas, and the clock |
 | [`proc`](../modules/proc.md) | run local commands, and the [redirect targets](../modules/redirect.md) for their output |
 | [`ssh`](../modules/ssh.md) | run commands on another machine |
+| [`http`](../modules/http.md) | send HTTP/HTTPS requests: client and request builders, streamed uploads and downloads |
 | [`aws.config`](../modules/aws-config.md) | build an AWS client for an explicit region, profile or endpoint |
 | [`aws.ec2`](../modules/aws-ec2.md) | query AWS EC2, and start, stop or terminate instances |
 | [`aws.s3`](../modules/aws-s3.md) | read buckets and objects from AWS S3 |
@@ -308,6 +309,13 @@ without ever being awaited is logged and fails the run.
 **A leading `/` is the host root.** `fs.write("/config.toml")` writes to
 the filesystem root, not to `<workdir>/config.toml`. Write the path
 without the leading slash for one relative to the working directory.
+
+**A script error is one line.** It is logged as `ERROR <message>` -- what
+the script raised (`error("no such host", 0)` reads exactly that) or what
+Luau reports (`<file>:<line>: attempt to index nil ...`) -- and the run exits
+`3`. The stack traceback is logged at debug level: run with `-v`, or set
+`ITO_LOG=ito=debug` when the script is a shebang command (where `-v` after the
+command name belongs to the script).
 
 **Exit codes.** `0` success, `2` a failure that is not the script's fault
 (usage, environment), `3` a failure in the script itself (a parse or

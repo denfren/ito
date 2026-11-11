@@ -100,6 +100,11 @@ Modules provided
   `decrypt`/`is_vault`), and load a vault password the way `ansible-vault
   --vault-password-file` does (`ansible.vault.load_password_file`; `encrypt`
   and `load_password_file` are absent under `ied`)
+- send HTTP/HTTPS requests with a client builder (base URL, default headers
+  and auth, timeouts, retries, custom CA / client certificate, proxy) and a
+  request builder (query, JSON/form/multipart/file bodies); the response body
+  streams to the same `proc` targets, so a download goes straight to disk
+  (`http`; absent under `ied`)
 - query AWS EC2 and act on instances (`aws.ec2`), read from S3 including object
   versions and delete markers (`aws.s3`),
   drive Auto Scaling groups (`aws.autoscaling`), look up CloudTrail's API

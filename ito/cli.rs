@@ -46,7 +46,7 @@ pub struct CommonArgs {
         long = "verbose",
         action = clap::ArgAction::Count,
         global = true,
-        help = "Increase log verbosity (-v debug, -vv trace; default: info). Logs go to stderr; ITO_LOG/RUST_LOG override.",
+        help = "Increase log verbosity (-v debug, -vv trace; default: info). Logs go to stderr; ITO_LOG/RUST_LOG override. -v also logs the stack traceback of a script error.",
     )]
     pub verbose: u8,
 

@@ -40,7 +40,7 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, KeyInit, Mac};
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 
 const HEADER: &str = "$ANSIBLE_VAULT;1.1;AES256";

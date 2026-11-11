@@ -248,15 +248,19 @@ mod tests {
 
     #[test]
     fn writes_chain_and_take_strings_and_numbers() {
-        lua()
-            .load(
-                r#"io.stdout:write("a", 1, 2.5):write("\n")
-                   io.stderr:write("e\n"):flush()
-                   io.write("w\n")
-                   io.flush()"#,
-            )
-            .exec()
-            .unwrap();
+        let ((), out) = crate::scripting::print::capture(|| {
+            lua()
+                .load(
+                    r#"io.stdout:write("a", 1, 2.5):write("\n")
+                       io.stderr:write("e\n"):flush()
+                       io.write("w\n")
+                       io.flush()"#,
+                )
+                .exec()
+                .unwrap();
+        });
+        assert_eq!(out.stdout, b"a12.5\nw\n");
+        assert_eq!(out.stderr, b"e\n");
     }
 
     #[test]

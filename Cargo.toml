@@ -18,7 +18,7 @@ ctr = "0.10"
 hmac = "0.13"
 pbkdf2 = "0.13"
 # The vault salt's randomness.
-rand = "0.9"
+rand = "0.10"
 clap = { version = "4.6.5", features = ["derive"] }
 clap_complete = "4.6"
 # `tablefmt`'s renderer. Default features (`tty`) bring in `crossterm` for
@@ -49,7 +49,7 @@ globset = "0.4"
 # means, and both crates were already in the tree under `ignore`.
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
-hcl-rs = "0.19"
+hcl-rs = "0.20"
 # `hash`'s digests, from the RustCrypto family so all four share one `Digest`
 # trait and the module is one generic function per input shape rather than four
 # near-copies. `hex` renders them: the encoding is the whole of what a hash is
@@ -59,7 +59,7 @@ md-5 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 humantime = "2.4"
 ignore = "0.4.33"
 # `proc`'s `Child:signal()` and `ito.pid()`. tokio's `Child` exposes only
@@ -73,19 +73,23 @@ libc = "0.2"
 # in `ied`. The cost is ~310KB and rules frozen at build time, which a
 # release refreshes. `tz-system` is separate -- it reports the host's own
 # *offset*, for the ito-only local readers.
-jiff = { version = "0.2", default-features = false, features = [
+jiff = { version = "1", default-features = false, features = [
     "std",
     "perf-inline",
     "tz-system",
     "tzdb-bundle-always",
 ] }
-minijinja = { version = "2", features = ["custom_syntax", "loader", "json", "urlencode", "loop_controls"] }
+minijinja = { version = "3", features = ["serde", "json", "urlencode", "loop_controls"] }
 # `ito.slug()`'s word generator -- an adjective-noun pair, e.g. "rusty-nail".
 # Random, so host-only like `math.random`/`os.getenv`.
 names = { version = "0.14.0", default-features = false }
 num_enum = "0.7"
 openssh = "0.11.6"
 regex = "1"
+# `http`: rustls on aws-lc-rs (already in the tree via the AWS SDK), no native-tls.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "multipart", "stream"] }
+form_urlencoded = "1"
+mime_guess = "2"
 mlua = { version = "0.12.0", features = ["luau", "vendored", "serde", "async"] }
 rowan = "0.17"
 semver = "1"
@@ -103,6 +107,8 @@ tokio = { version = "1.53.1", features = [
     "process",
     "net",
     "io-util",
+    # `http` streams a request body from a file (`tokio::fs::File` as a body).
+    "fs",
     # `enable_all` already starts the signal driver (tokio::process needs it),
     # which is what takes SIGINT off its default disposition in the first place.
     # "signal" is what lets us handle the signal we thereby started swallowing.

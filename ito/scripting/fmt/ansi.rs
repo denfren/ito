@@ -127,6 +127,17 @@ pub fn enabled_stderr() -> bool {
 /// 3. `CLICOLOR` set to `0` — off.
 /// 4. Otherwise: on iff the chosen stream (stdout, or stderr) is a terminal.
 fn detect(stderr: bool) -> bool {
+    let tty = if stderr {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    };
+    detect_with(tty)
+}
+
+/// [`detect`] with the terminal-ness answer injected, so the precedence rules
+/// can be tested without depending on what the test runner's stdout is.
+fn detect_with(tty: bool) -> bool {
     if let Some(v) = std::env::var_os("CLICOLOR_FORCE") {
         if v != "0" {
             return true;
@@ -138,11 +149,7 @@ fn detect(stderr: bool) -> bool {
     if std::env::var_os("CLICOLOR").is_some_and(|v| v == "0") {
         return false;
     }
-    if stderr {
-        std::io::stderr().is_terminal()
-    } else {
-        std::io::stdout().is_terminal()
-    }
+    tty
 }
 
 // ---------------------------------------------------------------------------
@@ -529,27 +536,35 @@ mod tests {
             }
         };
 
+        // The fallthrough, with nothing set, is the tty answer.
         clear();
-        unsafe { std::env::set_var("NO_COLOR", "1") };
-        assert!(!detect(false), "NO_COLOR disables");
+        assert!(detect_with(true));
+        assert!(!detect_with(false));
 
-        // CLICOLOR_FORCE outranks NO_COLOR and the TTY check both.
+        // NO_COLOR (non-empty) disables even when the stream is a tty.
+        unsafe { std::env::set_var("NO_COLOR", "1") };
+        assert!(!detect_with(true), "NO_COLOR disables");
+
+        // CLICOLOR_FORCE outranks NO_COLOR, whatever the tty answer is.
         unsafe { std::env::set_var("CLICOLOR_FORCE", "1") };
-        assert!(detect(false) && detect(true), "CLICOLOR_FORCE forces on");
+        assert!(detect_with(false), "CLICOLOR_FORCE outranks NO_COLOR");
 
         clear();
         unsafe { std::env::set_var("CLICOLOR", "0") };
-        assert!(!detect(false), "CLICOLOR=0 disables");
+        assert!(!detect_with(true), "CLICOLOR=0 disables");
 
+        // `0` is not a force: it falls through to the tty answer, in both
+        // directions, rather than turning colour on.
         clear();
         unsafe { std::env::set_var("CLICOLOR_FORCE", "0") };
-        assert!(!detect(false), "CLICOLOR_FORCE=0 does not force");
+        assert!(detect_with(true), "CLICOLOR_FORCE=0 does not disable");
+        assert!(!detect_with(false), "CLICOLOR_FORCE=0 does not force");
 
-        // An empty NO_COLOR does not disable: CLICOLOR_FORCE still wins, and
-        // with nothing else set it falls through to the tty check.
+        // An empty NO_COLOR does not disable: it falls through to the tty.
         clear();
         unsafe { std::env::set_var("NO_COLOR", "") };
-        assert!(!detect(false), "no tty under cargo test");
+        assert!(detect_with(true), "empty NO_COLOR does not disable");
+        assert!(!detect_with(false), "empty NO_COLOR still falls through");
 
         clear();
         for (k, v) in saved {

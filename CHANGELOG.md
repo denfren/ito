@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.8.0] - 2026-11-16
+
+### Breaking
+
+- Dependencies updated to new major versions, which changes input and output
+  slightly for `j2` and `hcl`:
+  - `j2` (minijinja 2 → 3): `tojson` prints Jinja2-style separators
+    (`{"a": 1}`, was `{"a":1}`) and fails on values it cannot represent
+    instead of emitting `null`; a collection printed with `{{ }}` uses
+    Python-style quoting; division by zero is an error; `//` and `%` follow
+    Jinja2 semantics for negative operands; `round` rounds half to even;
+    `-foo.bar` negates `foo.bar`; macros and variables starting with `_` are
+    private to their template and not exported by `import`; `title`, `trim`,
+    `min`/`max`/`sort` (case-insensitive by default) and the filters on `none`
+    or undefined values follow Jinja2 more closely.
+  - `hcl` (hcl-rs 0.19 → 0.20): the parser rejects the `\b`, `\f` and `\/`
+    string escapes, which were previously accepted; keyword object keys are
+    quoted when formatting.
+  - Also updated, without script-visible change: `jiff` 1.0, `rand` 0.10,
+    `base64` 0.23.
+
+### Added
+
+- `http` (`ito` only): an HTTP/HTTPS client modelled on reqwest.
+  `http.client()` is a copy-on-set builder (`:base_url`, default
+  `:header`/`:headers`, `:basic_auth`/`:bearer_auth`, `:user_agent`,
+  `:timeout`/`:connect_timeout`, `:retries`, `:redirect`, `:proxy`/
+  `:no_proxy`, `:ca_cert`, `:identity` for mTLS, `:insecure`) finalized by
+  `:build()`; `client:get(url)`/`post`/`put`/`patch`/`delete`/`head`/
+  `request(method, url)` start a mutable request builder (`:header`,
+  `:query`, `:body` incl. a streamed `proc.file`, `:json`, `:form`,
+  `:multipart`, `:timeout`, `:retries`, `:expect`) whose async
+  `:send([target])` returns `(envelope, body)`. `http.get(url)` etc. use a
+  default client. A non-2xx status is returned (`r.ok == false`), not raised,
+  unless outside `:expect(...)`; the body is delivered through the `proc`
+  redirect targets (string by default, `proc.buffer()`, `proc.file(path)`
+  streamed to disk, `proc.NULL`), and a non-2xx body is not written to a file
+  target unless `:keep_failure_body()`. Retries (opt-in) cover idempotent
+  methods on connection errors, timeouts and 429/502/503/504, honouring
+  `Retry-After`.
+
+### Changed
+
+- A rejected TLS certificate is no longer also logged as a separate `ERROR`
+  line by the certificate verifier; the failure is reported once, by the call
+  that hit it (and stays silent under `pcall`).
+- A script error is reported as one `ERROR <message>` line: what the script
+  raised (`error("...", 0)` verbatim) or what Luau said went wrong
+  (`<file>:<line>: ...`), without the `script error in ...: runtime error:`
+  prefix, the `callback error` wrapper and the stack traceback. The traceback
+  is logged at debug level (`-v`, or `ITO_LOG=ito=debug` for a shebang
+  command). Exit code `3` is unchanged.
+
+### Fixed
+
+- `aws.s3`'s "expected a body target" error named `proc.null()`, which does
+  not exist; it now names `proc.NULL`.
+
+
 ## [0.7.0] - 2026-11-10
 
 ### Added
